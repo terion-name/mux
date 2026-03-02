@@ -31,6 +31,7 @@ function normalizeCapturedKeybind(e: KeyboardEvent): Keybind | null {
 
   return {
     key: e.key,
+    code: e.code || undefined,
     ctrl: ctrl ? true : undefined,
     alt: e.altKey ? true : undefined,
     shift: e.shiftKey ? true : undefined,
@@ -38,25 +39,81 @@ function normalizeCapturedKeybind(e: KeyboardEvent): Keybind | null {
   };
 }
 
+function collectKeybindEventCandidates(keybind: Keybind): Array<{ key: string; code?: string }> {
+  const candidates: Array<{ key: string; code?: string }> = [];
+  const seen = new Set<string>();
+
+  const pushCandidate = (key: string, code: string | undefined) => {
+    const token = `${key}::${code ?? ""}`;
+    if (seen.has(token)) {
+      return;
+    }
+    seen.add(token);
+    candidates.push(code ? { key, code } : { key });
+  };
+
+  pushCandidate(keybind.key, keybind.code);
+
+  return candidates;
+}
+
+function isLegacyShiftedSymbolKeybind(keybind: Keybind): boolean {
+  return (
+    keybind.code == null &&
+    keybind.shift === true &&
+    keybind.key.length === 1 &&
+    /[^a-z0-9]/i.test(keybind.key)
+  );
+}
+
 function keybindConflicts(a: Keybind, b: Keybind): boolean {
-  if (a.key.toLowerCase() !== b.key.toLowerCase()) {
-    return false;
+  const candidateMap = new Map<string, { key: string; code?: string }>();
+  const addCandidate = (key: string, code: string | undefined) => {
+    const token = `${key}::${code ?? ""}`;
+    candidateMap.set(token, code ? { key, code } : { key });
+  };
+
+  for (const candidate of [
+    ...collectKeybindEventCandidates(a),
+    ...collectKeybindEventCandidates(b),
+  ]) {
+    addCandidate(candidate.key, candidate.code);
   }
 
-  for (const ctrlKey of [false, true]) {
-    for (const altKey of [false, true]) {
-      for (const shiftKey of [false, true]) {
-        for (const metaKey of [false, true]) {
-          const ev = new KeyboardEvent("keydown", {
-            key: a.key,
-            ctrlKey,
-            altKey,
-            shiftKey,
-            metaKey,
-          });
+  const addLegacyBridgeCandidate = (legacy: Keybind, coded: Keybind) => {
+    if (!isLegacyShiftedSymbolKeybind(legacy) || coded.code == null) {
+      return;
+    }
+    // Legacy (pre-code) shifted symbol bindings are still persisted for some users.
+    // Include a bridged candidate so key-only legacy bindings can still conflict
+    // with newer code-based shortcuts that share the same physical key event.
+    addCandidate(legacy.key, coded.code);
+  };
 
-          if (matchesKeybind(ev, a) && matchesKeybind(ev, b)) {
-            return true;
+  addLegacyBridgeCandidate(a, b);
+  addLegacyBridgeCandidate(b, a);
+
+  for (const candidate of candidateMap.values()) {
+    for (const ctrlKey of [false, true]) {
+      for (const altKey of [false, true]) {
+        for (const shiftKey of [false, true]) {
+          for (const metaKey of [false, true]) {
+            const eventInit: KeyboardEventInit = {
+              key: candidate.key,
+              ctrlKey,
+              altKey,
+              shiftKey,
+              metaKey,
+            };
+            if (candidate.code != null) {
+              eventInit.code = candidate.code;
+            }
+
+            const ev = new KeyboardEvent("keydown", eventInit);
+
+            if (matchesKeybind(ev, a) && matchesKeybind(ev, b)) {
+              return true;
+            }
           }
         }
       }
