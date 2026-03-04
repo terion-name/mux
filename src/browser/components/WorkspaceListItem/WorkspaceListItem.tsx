@@ -155,7 +155,11 @@ function StatusDot(props: { state: VisualState; isDraft?: boolean }) {
   );
 
   return (
-    <div className="relative mt-1 flex h-4 w-4 shrink-0 items-center justify-center">{dot}</div>
+    // Keep the dot centered relative to the full row height so multi-line rows
+    // (for example while streaming) do not pin the icon to the title line.
+    <div className="relative flex h-4 w-4 shrink-0 items-center justify-center self-center">
+      {dot}
+    </div>
   );
 }
 
