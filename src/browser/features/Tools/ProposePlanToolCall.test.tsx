@@ -10,6 +10,7 @@ import {
   AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
   getModelKey,
+  getPlanContentKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
@@ -64,6 +65,8 @@ let startHereCalls: Array<{
   options: { deletePlanFile?: boolean; sourceAgentId?: string } | undefined;
 }> = [];
 
+let selectableDiffRendererCalls: Array<{ filePath?: string }> = [];
+
 const useStartHereMock = mock(
   (
     workspaceId: string | undefined,
@@ -103,6 +106,53 @@ void mock.module("@/browser/contexts/WorkspaceContext", () => ({
 
 void mock.module("@/browser/contexts/TelemetryEnabledContext", () => ({
   useLinkSharingEnabled: () => true,
+}));
+
+void mock.module("@/browser/hooks/useReviews", () => ({
+  useReviews: () => ({
+    reviews: [],
+    pendingCount: 0,
+    attachedCount: 0,
+    checkedCount: 0,
+    attachedReviews: [],
+    addReview: (data: unknown) => ({
+      id: "test-review",
+      data,
+      status: "attached" as const,
+      createdAt: Date.now(),
+    }),
+    attachReview: () => undefined,
+    detachReview: () => undefined,
+    attachAllPending: () => undefined,
+    detachAllAttached: () => undefined,
+    checkReview: () => undefined,
+    uncheckReview: () => undefined,
+    removeReview: () => undefined,
+    updateReviewNote: () => undefined,
+    clearChecked: () => undefined,
+    clearAll: () => undefined,
+    getReview: () => undefined,
+  }),
+}));
+
+void mock.module("@/browser/features/Shared/DiffRenderer", () => ({
+  SelectableDiffRenderer: (props: { filePath?: string }) => {
+    selectableDiffRendererCalls.push({ filePath: props.filePath });
+    return <div data-testid="selectable-diff-renderer" data-filepath={props.filePath ?? ""} />;
+  },
+}));
+
+void mock.module("@/common/types/review", () => ({
+  isPlanFilePath: (filePath: string) => /[/\\]plans[/\\]/.test(filePath),
+  normalizePlanFilePath: (filePath: string) => {
+    const normalizedPath = filePath.replace(/\\/g, "/");
+    const tildeMuxMatch = /^~\/\.mux\/plans\/(.+)$/.exec(normalizedPath);
+    if (tildeMuxMatch?.[1]) {
+      return `.mux/plans/${tildeMuxMatch[1]}`;
+    }
+
+    return normalizedPath;
+  },
 }));
 
 const TEST_AGENTS: AgentDefinitionDescriptor[] = [
@@ -176,6 +226,7 @@ describe("ProposePlanToolCall", () => {
 
   beforeEach(() => {
     startHereCalls = [];
+    selectableDiffRendererCalls = [];
     mockApi = null;
     // Save original globals
     originalWindow = globalThis.window;
@@ -240,6 +291,192 @@ describe("ProposePlanToolCall", () => {
     expect(startHereCalls[0]?.content).toContain("*Plan file preserved at:*");
     expect(startHereCalls[0]?.content).toContain("Note: This chat already contains the full plan");
     expect(startHereCalls[0]?.content).toContain(planPath);
+  });
+
+  test("shows Annotate button for latest completed plan with workspaceId", () => {
+    const planPath = "~/.mux/plans/demo/ws-123.md";
+
+    const view = renderToolCall(
+      <ProposePlanToolCall
+        args={{}}
+        status="completed"
+        result={{
+          success: true,
+          planPath,
+          planContent: "# My Plan\n\nDo the thing.",
+        }}
+        workspaceId="ws-123"
+        isLatest={true}
+      />
+    );
+
+    expect(view.getByRole("button", { name: "Annotate" })).toBeDefined();
+  });
+
+  test("hides Annotate button for non-latest plans", () => {
+    const planPath = "~/.mux/plans/demo/ws-123.md";
+
+    const view = renderToolCall(
+      <ProposePlanToolCall
+        args={{}}
+        status="completed"
+        result={{
+          success: true,
+          planPath,
+          planContent: "# My Plan\n\nDo the thing.",
+        }}
+        workspaceId="ws-123"
+        isLatest={false}
+      />
+    );
+
+    expect(view.queryByRole("button", { name: "Annotate" })).toBeNull();
+  });
+
+  test("hides Annotate button while latest plan call is still executing", async () => {
+    const workspaceId = "ws-123";
+    const planPath = "~/.mux/plans/demo/ws-123.md";
+    let getPlanContentCalls = 0;
+
+    mockApi = {
+      config: {
+        getConfig: () =>
+          Promise.resolve({
+            taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
+            agentAiDefaults: {},
+            subagentAiDefaults: {},
+          }),
+      },
+      workspace: {
+        getPlanContent: () => {
+          getPlanContentCalls += 1;
+          return Promise.resolve({
+            success: true,
+            data: { content: "# My Plan\n\nDo the thing.", path: planPath },
+          });
+        },
+        replaceChatHistory: (_args) => Promise.resolve({ success: true, data: undefined }),
+        sendMessage: (_args) => Promise.resolve({ success: true, data: undefined }),
+      },
+    };
+
+    const view = renderToolCall(
+      <ProposePlanToolCall args={{}} status="executing" workspaceId={workspaceId} isLatest={true} />
+    );
+
+    await waitFor(() => expect(getPlanContentCalls).toBe(1));
+    expect(view.queryByRole("button", { name: "Annotate" })).toBeNull();
+  });
+
+  test("passes normalized plan path to annotation view", () => {
+    const rawPlanPath = "~/.mux/plans/demo/ws-123.md";
+
+    const view = renderToolCall(
+      <ProposePlanToolCall
+        args={{}}
+        status="completed"
+        result={{
+          success: true,
+          planPath: rawPlanPath,
+          planContent: "# My Plan\n\nDo the thing.",
+        }}
+        workspaceId="ws-123"
+        isLatest={true}
+      />
+    );
+
+    fireEvent.click(view.getByRole("button", { name: "Annotate" }));
+
+    const renderer = view.getByTestId("selectable-diff-renderer");
+    expect(renderer.getAttribute("data-filepath")).toBe(".mux/plans/demo/ws-123.md");
+    expect(selectableDiffRendererCalls[selectableDiffRendererCalls.length - 1]?.filePath).toBe(
+      ".mux/plans/demo/ws-123.md"
+    );
+  });
+
+  test("hides Annotate button when completed propose_plan result is an error", () => {
+    const workspaceId = "ws-123";
+    const planPath = "~/.mux/plans/demo/ws-123.md";
+
+    updatePersistedState(getPlanContentKey(workspaceId), {
+      content: "# Cached Plan\n\nDo the thing.",
+      path: planPath,
+    });
+
+    const view = renderToolCall(
+      <ProposePlanToolCall
+        args={{}}
+        status="completed"
+        result={{ success: false, error: "failed to generate plan" }}
+        workspaceId={workspaceId}
+        isLatest={true}
+      />
+    );
+
+    expect(view.queryByRole("button", { name: "Annotate" })).toBeNull();
+  });
+
+  test("annotate mode and raw mode are mutually exclusive", () => {
+    const planPath = "~/.mux/plans/demo/ws-123.md";
+
+    const view = renderToolCall(
+      <ProposePlanToolCall
+        args={{}}
+        status="completed"
+        result={{
+          success: true,
+          planPath,
+          planContent: "# My Plan\n\nDo the thing.",
+        }}
+        workspaceId="ws-123"
+        isLatest={true}
+      />
+    );
+
+    fireEvent.click(view.getByRole("button", { name: "Annotate" }));
+    expect(view.getByRole("button", { name: "Exit Annotate" })).toBeDefined();
+    expect(view.getByTestId("plan-annotation-view")).toBeDefined();
+
+    fireEvent.click(view.getByRole("button", { name: "Show Text" }));
+    expect(view.queryByTestId("plan-annotation-view")).toBeNull();
+    expect(view.container.querySelector("pre")).not.toBeNull();
+
+    fireEvent.click(view.getByRole("button", { name: "Annotate" }));
+    expect(view.getByRole("button", { name: "Exit Annotate" })).toBeDefined();
+    expect(view.getByTestId("plan-annotation-view")).toBeDefined();
+    expect(view.container.querySelector("pre")).toBeNull();
+  });
+
+  test("does not toggle annotate mode with Shift+A in ephemeral previews", () => {
+    const planPath = "~/.mux/plans/demo/ws-123.md";
+
+    const view = renderToolCall(
+      <>
+        <ProposePlanToolCall
+          args={{}}
+          status="completed"
+          content="# My Plan\n\nDo the thing."
+          path={planPath}
+          workspaceId="ws-123"
+          isEphemeralPreview={true}
+        />
+        <ProposePlanToolCall
+          args={{}}
+          status="completed"
+          content="# Another Plan\n\nDo the other thing."
+          path={planPath}
+          workspaceId="ws-123"
+          isEphemeralPreview={true}
+        />
+      </>
+    );
+
+    expect(view.getAllByRole("button", { name: "Annotate" }).length).toBe(2);
+
+    fireEvent.keyDown(document, { key: "a", shiftKey: true });
+
+    expect(view.queryByRole("button", { name: "Exit Annotate" })).toBeNull();
+    expect(view.getAllByRole("button", { name: "Annotate" }).length).toBe(2);
   });
 
   test("switches to exec and sends a message when clicking Implement", async () => {
