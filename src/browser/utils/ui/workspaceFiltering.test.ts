@@ -467,6 +467,130 @@ describe("buildSortedWorkspacesByProject", () => {
     ]);
   });
 
+  it("keeps reachable descendants visible even for deep parent chains", () => {
+    const depth = 40;
+    const workspaces = Array.from({ length: depth + 1 }, (_, index) => ({
+      path: `/a/ws-${index}`,
+      id: `ws-${index}`,
+    }));
+    const projects = new Map<string, ProjectConfig>([["/project/a", { workspaces }]]);
+    const metadata = new Map<string, FrontendWorkspaceMetadata>(
+      Array.from({ length: depth + 1 }, (_, index) => {
+        const parentWorkspaceId = index === 0 ? undefined : `ws-${index - 1}`;
+        return [
+          `ws-${index}`,
+          createWorkspace(`ws-${index}`, "/project/a", undefined, parentWorkspaceId),
+        ] as const;
+      })
+    );
+
+    const result = buildSortedWorkspacesByProject(projects, metadata, {});
+
+    expect(result.get("/project/a")?.map((workspace) => workspace.id)).toEqual(
+      Array.from({ length: depth + 1 }, (_, index) => `ws-${index}`)
+    );
+  });
+
+  it("hides orphaned children whose parent is missing from active metadata", () => {
+    const projects = new Map<string, ProjectConfig>([
+      [
+        "/project/a",
+        {
+          workspaces: [
+            { path: "/a/root", id: "root" },
+            { path: "/a/child", id: "child" },
+          ],
+        },
+      ],
+    ]);
+    const metadata = new Map<string, FrontendWorkspaceMetadata>([
+      ["child", createWorkspace("child", "/project/a", undefined, "root")],
+    ]);
+
+    const result = buildSortedWorkspacesByProject(projects, metadata, {});
+
+    expect(result.get("/project/a")).toEqual([]);
+  });
+
+  it("hides transitive descendants when an ancestor is missing from active metadata", () => {
+    const projects = new Map<string, ProjectConfig>([
+      [
+        "/project/a",
+        {
+          workspaces: [
+            { path: "/a/root", id: "root" },
+            { path: "/a/child", id: "child" },
+            { path: "/a/grand", id: "grand" },
+          ],
+        },
+      ],
+    ]);
+    const metadata = new Map<string, FrontendWorkspaceMetadata>([
+      ["child", createWorkspace("child", "/project/a", undefined, "root")],
+      ["grand", createWorkspace("grand", "/project/a", undefined, "child")],
+    ]);
+
+    const result = buildSortedWorkspacesByProject(projects, metadata, {});
+
+    expect(result.get("/project/a")).toEqual([]);
+  });
+
+  it("keeps unrelated roots visible while hiding orphaned descendants", () => {
+    const projects = new Map<string, ProjectConfig>([
+      [
+        "/project/a",
+        {
+          workspaces: [
+            { path: "/a/root", id: "root" },
+            { path: "/a/orphan", id: "orphan" },
+            { path: "/a/standalone", id: "standalone" },
+          ],
+        },
+      ],
+    ]);
+    const metadata = new Map<string, FrontendWorkspaceMetadata>([
+      ["orphan", createWorkspace("orphan", "/project/a", undefined, "root")],
+      ["standalone", createWorkspace("standalone", "/project/a")],
+    ]);
+
+    const result = buildSortedWorkspacesByProject(projects, metadata, {});
+
+    expect(result.get("/project/a")?.map((w) => w.id)).toEqual(["standalone"]);
+  });
+
+  it("reattaches hidden descendants when their parent returns to active metadata", () => {
+    const projects = new Map<string, ProjectConfig>([
+      [
+        "/project/a",
+        {
+          workspaces: [
+            { path: "/a/root", id: "root" },
+            { path: "/a/child", id: "child" },
+          ],
+        },
+      ],
+    ]);
+    const child = createWorkspace("child", "/project/a", undefined, "root");
+
+    const withoutParent = buildSortedWorkspacesByProject(
+      projects,
+      new Map<string, FrontendWorkspaceMetadata>([["child", child]]),
+      {}
+    );
+    expect(withoutParent.get("/project/a")).toEqual([]);
+
+    const withParent = buildSortedWorkspacesByProject(
+      projects,
+      new Map<string, FrontendWorkspaceMetadata>([
+        ["root", createWorkspace("root", "/project/a")],
+        ["child", child],
+      ]),
+      {}
+    );
+
+    expect(withParent.get("/project/a")?.map((w) => w.id)).toEqual(["root", "child"]);
+  });
+
   it("should not duplicate workspaces that exist in both config and have creating status", () => {
     // Edge case: workspace was saved to config but still reports isInitializing
     // (this shouldn't happen in practice but tests defensive coding)
