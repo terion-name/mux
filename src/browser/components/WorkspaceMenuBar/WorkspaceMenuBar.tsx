@@ -18,10 +18,12 @@ import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { Popover, PopoverTrigger, PopoverContent } from "../Popover/Popover";
 import { Checkbox } from "../Checkbox/Checkbox";
 import { formatKeybind, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import { getDevcontainerStatusChip } from "@/browser/utils/runtimeUi";
 import { useGitStatus } from "@/browser/stores/GitStatusStore";
+import { useRuntimeStatus, useRuntimeStatusStoreRaw } from "@/browser/stores/RuntimeStatusStore";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import { Button } from "@/browser/components/Button/Button";
-import type { RuntimeConfig } from "@/common/types/runtime";
+import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import { useLinkSharingEnabled } from "@/browser/contexts/TelemetryEnabledContext";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
 
@@ -81,6 +83,8 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const openTerminalPopout = useOpenTerminal();
   const openInEditor = useOpenInEditor();
   const gitStatus = useGitStatus(workspaceId);
+  const runtimeStatus = useRuntimeStatus(workspaceId);
+  const runtimeStatusStore = useRuntimeStatusStoreRaw();
   const { canInterrupt, isStarting, awaitingUserQuestion, loadedSkills, skillLoadErrors } =
     useWorkspaceSidebarState(workspaceId);
   const isWorking = (canInterrupt || isStarting) && !awaitingUserQuestion;
@@ -91,6 +95,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const [availableSkills, setAvailableSkills] = useState<AgentSkillDescriptor[]>([]);
   const [invalidSkills, setInvalidSkills] = useState<AgentSkillIssue[]>([]);
   const isSkillsMountedRef = useRef(true);
+  const moreActionsButtonRef = useRef<HTMLButtonElement | null>(null);
 
   const skillsRequestIdRef = useRef(0);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
@@ -99,6 +104,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const [isArchiving, setIsArchiving] = useState(false);
   const archiveError = usePopoverError();
   const forkError = usePopoverError();
+  const stopRuntimeError = usePopoverError();
 
   const [rightSidebarCollapsed] = usePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false, {
     // This state is toggled from RightSidebar, so we need cross-component updates.
@@ -134,6 +140,24 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const isTouchMobileScreen =
     typeof window !== "undefined" &&
     window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
+
+  const isDevcontainerWorkspace = isDevcontainerRuntime(runtimeConfig);
+  const isRuntimeRunning = isDevcontainerWorkspace && runtimeStatus === "running";
+  const devcontainerChip = isDevcontainerWorkspace
+    ? getDevcontainerStatusChip(runtimeStatus)
+    : null;
+
+  const getMoreMenuAnchor = useCallback(() => {
+    const rect = moreActionsButtonRef.current?.getBoundingClientRect();
+    if (!rect) {
+      return undefined;
+    }
+
+    return {
+      top: rect.top + window.scrollY,
+      left: rect.right + 10,
+    };
+  }, []);
 
   const handleOpenTouchFullscreenReview = useCallback(() => {
     window.dispatchEvent(
@@ -209,6 +233,31 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     },
     [api, forkError, workspaceId]
   );
+
+  const handleStopRuntime = useCallback(async () => {
+    if (!api) {
+      stopRuntimeError.showError(workspaceId, "Not connected to server", getMoreMenuAnchor());
+      return;
+    }
+
+    try {
+      const result = await api.workspace.stopRuntime({ workspaceId });
+      if (!result.success) {
+        stopRuntimeError.showError(
+          workspaceId,
+          result.error ?? "Failed to stop container",
+          getMoreMenuAnchor()
+        );
+        return;
+      }
+
+      // Clear the cached running state immediately so both menu entry points converge
+      // on a fresh backend read after the container stop succeeds.
+      runtimeStatusStore.invalidateWorkspace(workspaceId);
+    } catch (error) {
+      stopRuntimeError.showError(workspaceId, getErrorMessage(error), getMoreMenuAnchor());
+    }
+  }, [api, getMoreMenuAnchor, runtimeStatusStore, stopRuntimeError, workspaceId]);
 
   const loadSkills = useCallback(async () => {
     const requestId = ++skillsRequestIdRef.current;
@@ -377,6 +426,16 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         <span className="min-w-0 truncate font-mono text-xs">{projectName}</span>
         <div className="flex items-center gap-1">
           <BranchSelector workspaceId={workspaceId} workspaceName={workspaceName} />
+          {devcontainerChip && (
+            <span
+              className={cn(
+                "shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-tight font-medium",
+                devcontainerChip.className
+              )}
+            >
+              {devcontainerChip.label}
+            </span>
+          )}
           <GitStatusIndicator
             gitStatus={gitStatus}
             workspaceId={workspaceId}
@@ -537,6 +596,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             <TooltipTrigger asChild>
               <PopoverTrigger asChild>
                 <Button
+                  ref={moreActionsButtonRef}
                   variant="ghost"
                   size="icon"
                   className="text-muted hover:text-foreground ml-1 h-6 w-6 shrink-0"
@@ -568,6 +628,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                 isTouchMobileScreen ? handleOpenTouchFullscreenReview : null
               }
               onEnterImmersiveReview={isTouchMobileScreen ? null : handleEnterImmersiveReview}
+              onStopRuntime={isRuntimeRunning ? () => void handleStopRuntime() : null}
               onForkChat={(anchorEl) => {
                 void handleForkChat(anchorEl);
               }}
@@ -622,6 +683,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           void handleArchiveChat();
         }}
         onCancel={() => setArchiveConfirmOpen(false)}
+      />
+      <PopoverError
+        error={stopRuntimeError.error}
+        prefix="Failed to stop container"
+        onDismiss={stopRuntimeError.clearError}
       />
       <PopoverError
         error={forkError.error}

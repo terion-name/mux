@@ -20,7 +20,13 @@ import type {
   GitHubPRLinkWithStatus,
   MergeQueueEntry,
 } from "@/common/types/links";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { createLRUCache } from "@/browser/utils/lruCache";
+import {
+  canRunPassiveRuntimeCommand,
+  onPassiveRuntimeEligible,
+  type PassiveRuntimeDeps,
+} from "@/browser/utils/runtimeExecutionPolicy";
 /**
  * Parse a GitHub PR URL to extract owner, repo, and number.
  * Returns null if the URL is not a valid GitHub PR URL.
@@ -34,6 +40,10 @@ import { MapStore } from "./MapStore";
 import { RefreshController } from "@/browser/utils/RefreshController";
 import { repoRootBashOptions } from "@/browser/utils/executeBash";
 import { useSyncExternalStore } from "react";
+import {
+  useRuntimeStatusStoreRaw as getRuntimeStatusStore,
+  type RuntimeStatusStore,
+} from "./RuntimeStatusStore";
 
 // Cache TTL: PR status is refreshed at most every 5 seconds
 const STATUS_CACHE_TTL_MS = 5 * 1000;
@@ -159,6 +169,7 @@ export class PRStatusStore {
   // Workspace-based PR detection (keyed by workspaceId)
   private workspacePRSubscriptions = new MapStore<string, WorkspacePRCacheEntry>();
   private workspacePRCache = new Map<string, WorkspacePRCacheEntry>();
+  private runtimeRetryUnsubscribers = new Map<string, () => void>();
 
   // Track active subscriptions per workspace so we only refresh workspaces that are actually visible.
   private workspaceSubscriptionCounts = new Map<string, number>();
@@ -171,8 +182,23 @@ export class PRStatusStore {
 
   // Like GitStatusStore: batch immediate refreshes triggered by subscriptions.
   private immediateUpdateQueued = false;
+  private workspaceMetadata = new Map<string, FrontendWorkspaceMetadata>();
+  private readonly runtimeStatusStore: PassiveRuntimeDeps;
 
-  constructor() {
+  constructor(runtimeStatusStore?: PassiveRuntimeDeps);
+  constructor(runtimeStatusStore?: Pick<RuntimeStatusStore, "getStatus">);
+  constructor(
+    runtimeStatusStore:
+      | PassiveRuntimeDeps
+      | Pick<RuntimeStatusStore, "getStatus"> = getRuntimeStatusStore()
+  ) {
+    this.runtimeStatusStore = {
+      getStatus: (workspaceId) => runtimeStatusStore.getStatus(workspaceId),
+      subscribeKey:
+        "subscribeKey" in runtimeStatusStore
+          ? (workspaceId, listener) => runtimeStatusStore.subscribeKey(workspaceId, listener)
+          : () => () => undefined,
+    };
     this.refreshController = new RefreshController({
       onRefresh: () => this.refreshAll(),
       onRefreshError: (failure) => {
@@ -195,6 +221,22 @@ export class PRStatusStore {
     if (this.workspaceSubscriptionCounts.size > 0) {
       this.refreshController.requestImmediate();
     }
+  }
+
+  syncWorkspaces(metadata: Map<string, FrontendWorkspaceMetadata>): void {
+    if (!this.isActive && metadata.size > 0) {
+      this.isActive = true;
+    }
+
+    this.workspaceMetadata = metadata;
+    for (const [id, unsubscribe] of this.runtimeRetryUnsubscribers) {
+      if (!metadata.has(id)) {
+        unsubscribe();
+        this.runtimeRetryUnsubscribers.delete(id);
+      }
+    }
+    this.refreshController.bindListeners();
+    this.refreshController.requestImmediate();
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -232,6 +274,8 @@ export class PRStatusStore {
       const next = (this.workspaceSubscriptionCounts.get(workspaceId) ?? 1) - 1;
       if (next <= 0) {
         this.workspaceSubscriptionCounts.delete(workspaceId);
+        this.runtimeRetryUnsubscribers.get(workspaceId)?.();
+        this.runtimeRetryUnsubscribers.delete(workspaceId);
       } else {
         this.workspaceSubscriptionCounts.set(workspaceId, next);
       }
@@ -286,14 +330,18 @@ export class PRStatusStore {
       const result = await this.client.workspace.executeBash({
         workspaceId,
         script: `gh pr view --json number,url,state,mergeable,mergeStateStatus,title,isDraft,headRefName,baseRefName,statusCheckRollup 2>/dev/null || echo '{"no_pr":true}'`,
+        // gh requires the runtime environment for devcontainer workspaces where
+        // the CLI / auth may only exist inside the container.
         options: repoRootBashOptions(15),
       });
 
       if (!this.isActive) return;
 
       if (!result.success || !result.data.success) {
+        const existing = this.workspacePRCache.get(workspaceId);
         this.workspacePRCache.set(workspaceId, {
-          prLink: null,
+          prLink: existing?.prLink ?? null,
+          status: existing?.status,
           error: "Failed to run gh CLI",
           loading: false,
           fetchedAt: Date.now(),
@@ -366,8 +414,10 @@ export class PRStatusStore {
           }
         }
       } else {
+        const existing = this.workspacePRCache.get(workspaceId);
         this.workspacePRCache.set(workspaceId, {
-          prLink: null,
+          prLink: existing?.prLink ?? null,
+          status: existing?.status,
           error: "Empty response from gh CLI",
           loading: false,
           fetchedAt: Date.now(),
@@ -378,8 +428,10 @@ export class PRStatusStore {
     } catch (err) {
       if (!this.isActive) return;
 
+      const existing = this.workspacePRCache.get(workspaceId);
       this.workspacePRCache.set(workspaceId, {
-        prLink: null,
+        prLink: existing?.prLink ?? null,
+        status: existing?.status,
         error: err instanceof Error ? err.message : "Unknown error",
         loading: false,
         fetchedAt: Date.now(),
@@ -490,6 +542,8 @@ export class PRStatusStore {
           `-F number=${prLink.number}`,
           "2>/dev/null",
         ].join(" "),
+        // gh requires the runtime environment for devcontainer workspaces where
+        // the CLI / auth may only exist inside the container.
         options: repoRootBashOptions(10),
       });
 
@@ -554,6 +608,39 @@ export class PRStatusStore {
     for (const workspaceId of workspaceIds) {
       const cached = this.workspacePRCache.get(workspaceId);
       if (this.shouldFetchWorkspace(cached, now)) {
+        // Skip passive PR refresh for devcontainer workspaces whose runtime is
+        // not already running, to avoid waking stopped containers.
+        const metadata = this.workspaceMetadata.get(workspaceId);
+        if (
+          metadata &&
+          !canRunPassiveRuntimeCommand(
+            metadata.runtimeConfig,
+            this.runtimeStatusStore.getStatus(workspaceId)
+          )
+        ) {
+          // Arm a one-shot retry so the workspace gets a PR refresh once the
+          // runtime becomes passively runnable again.
+          if (!this.runtimeRetryUnsubscribers.has(workspaceId)) {
+            let firedSynchronously = false;
+            const unsubscribe = onPassiveRuntimeEligible(
+              workspaceId,
+              metadata.runtimeConfig,
+              this.runtimeStatusStore,
+              () => {
+                firedSynchronously = true;
+                this.runtimeRetryUnsubscribers.delete(workspaceId);
+                // Clear PR cache so TTL doesn't suppress the deferred retry.
+                this.workspacePRCache.delete(workspaceId);
+                this.refreshController.requestImmediate();
+              }
+            );
+            if (!firedSynchronously) {
+              this.runtimeRetryUnsubscribers.set(workspaceId, unsubscribe);
+            }
+          }
+          continue;
+        }
+
         refreshes.push(this.detectWorkspacePR(workspaceId));
       }
     }
@@ -568,6 +655,10 @@ export class PRStatusStore {
     this.isActive = false;
     this.mergeQueueRefreshPending.clear();
     this.mergeQueueRefreshInFlight.clear();
+    for (const unsubscribe of this.runtimeRetryUnsubscribers.values()) {
+      unsubscribe();
+    }
+    this.runtimeRetryUnsubscribers.clear();
     this.refreshController.dispose();
   }
 }
