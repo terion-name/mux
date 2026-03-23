@@ -104,6 +104,7 @@ import {
 } from "@/common/utils/ai/models";
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
+import { normalizeAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import type {
   StreamStartEvent,
@@ -4111,10 +4112,7 @@ export class WorkspaceService extends EventEmitter {
   private normalizeSendMessageAgentId(options: SendMessageOptions): SendMessageOptions {
     // agentId is required by the schema, so this just normalizes the value.
     const rawAgentId = options.agentId;
-    const normalizedAgentId =
-      typeof rawAgentId === "string" && rawAgentId.trim().length > 0
-        ? rawAgentId.trim().toLowerCase()
-        : WORKSPACE_DEFAULTS.agentId;
+    const normalizedAgentId = normalizeAgentId(rawAgentId, WORKSPACE_DEFAULTS.agentId);
 
     if (normalizedAgentId === options.agentId) {
       return options;
@@ -4169,10 +4167,7 @@ export class WorkspaceService extends EventEmitter {
     if (!extractedSettings) return;
 
     const rawAgentId = options?.agentId;
-    const agentId =
-      typeof rawAgentId === "string" && rawAgentId.trim().length > 0
-        ? rawAgentId.trim().toLowerCase()
-        : WORKSPACE_DEFAULTS.agentId;
+    const agentId = normalizeAgentId(rawAgentId, WORKSPACE_DEFAULTS.agentId);
 
     const persistResult = await this.persistWorkspaceAISettingsForAgent(
       workspaceId,
@@ -4180,6 +4175,7 @@ export class WorkspaceService extends EventEmitter {
       extractedSettings,
       {
         emitMetadata: false,
+        ...(options?.disableWorkspaceAgents === true ? { disableWorkspaceAgents: true } : {}),
       }
     );
     if (!persistResult.success) {
@@ -4194,7 +4190,7 @@ export class WorkspaceService extends EventEmitter {
     workspaceId: string,
     agentId: string,
     aiSettings: WorkspaceAISettings,
-    options?: { emitMetadata?: boolean }
+    options?: { emitMetadata?: boolean; disableWorkspaceAgents?: boolean }
   ): Promise<Result<boolean, string>> {
     const found = this.config.findWorkspace(workspaceId);
     if (!found) {
@@ -4216,10 +4212,14 @@ export class WorkspaceService extends EventEmitter {
       return Err("Workspace not found");
     }
 
-    const normalizedAgentId = agentId.trim().toLowerCase();
+    const normalizedAgentId = normalizeAgentId(agentId, "");
     if (!normalizedAgentId) {
       return Err("Agent ID is required");
     }
+
+    // Removing the built-in Ask agent should not force writes into Auto's
+    // settings bucket. Persist whatever agent ID the caller chose so legacy Ask
+    // settings can fade out naturally instead of being mixed into Auto.
 
     const prev = workspaceEntryWithFallback.aiSettingsByAgent?.[normalizedAgentId];
     const changed =
