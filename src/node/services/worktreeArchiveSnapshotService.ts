@@ -135,9 +135,90 @@ export class WorktreeArchiveSnapshotService {
     }
   }
 
+  /**
+   * Collect all unsupported untracked file paths across every project repo in the workspace.
+   * Returns a flat sorted array of relative paths (each prefixed with the project name for
+   * multi-project workspaces). Does not throw on untracked files — callers decide the policy.
+   *
+   * Other blockers (missing workspace, wrong runtime, dirty submodules) still produce `Err()`.
+   */
+  async getUnsupportedUntrackedPaths(args: {
+    workspaceId: string;
+    workspaceMetadata: WorkspaceMetadata;
+  }): Promise<Result<string[]>> {
+    assert(
+      args.workspaceId.trim().length > 0,
+      "getUnsupportedUntrackedPaths: workspaceId must be non-empty"
+    );
+
+    if (!isWorktreeRuntime(args.workspaceMetadata.runtimeConfig)) {
+      return Err("Archive snapshots are only supported for worktree runtimes");
+    }
+
+    const configSnapshot = this.config.loadConfigOrDefault();
+    const workspaceEntry = findWorkspaceEntryByIdOrPath(
+      this.config,
+      configSnapshot,
+      args.workspaceId
+    );
+    if (!workspaceEntry) {
+      return Err("Workspace not found in config");
+    }
+
+    const workspaceName = getPersistedWorkspaceName(workspaceEntry.workspace);
+    if (!workspaceName) {
+      return Err("Workspace is missing its persisted branch name");
+    }
+
+    const projectRepos = getWorkspaceProjectRepos({
+      workspaceId: args.workspaceId,
+      workspaceName,
+      workspacePath: workspaceEntry.workspace.path,
+      runtimeConfig: args.workspaceMetadata.runtimeConfig,
+      projectPath: args.workspaceMetadata.projectPath,
+      projectName: args.workspaceMetadata.projectName,
+      projects: workspaceEntry.workspace.projects,
+    });
+    assert(
+      projectRepos.length > 0,
+      "getUnsupportedUntrackedPaths: expected at least one project repo"
+    );
+
+    try {
+      // Dirty submodules are still a hard blocker — check them first.
+      for (const projectRepo of projectRepos) {
+        await this.ensureNoDirtySubmodules(projectRepo.repoCwd);
+      }
+
+      const allUntrackedPaths: string[] = [];
+      for (const projectRepo of projectRepos) {
+        const paths = await this.listUnsupportedUntrackedFiles(projectRepo.repoCwd);
+        if (projectRepos.length > 1) {
+          // Prefix with project name for disambiguation in multi-project workspaces.
+          for (const p of paths) {
+            allUntrackedPaths.push(`${projectRepo.projectName}/${p}`);
+          }
+        } else {
+          allUntrackedPaths.push(...paths);
+        }
+      }
+
+      return Ok(allUntrackedPaths.sort());
+    } catch (error) {
+      return Err(`Failed to check archive readiness: ${getErrorMessage(error)}`);
+    }
+  }
+
   async captureSnapshotForArchive(args: {
     workspaceId: string;
     workspaceMetadata: WorkspaceMetadata;
+    /**
+     * When provided, the capture re-verifies the current untracked-file set against these
+     * acknowledged paths instead of throwing unconditionally. If the sets still match,
+     * capture proceeds (lossy). If they diverge, capture fails safely.
+     * When omitted, any untracked files cause the default strict failure.
+     */
+    acknowledgedUntrackedPaths?: string[];
   }): Promise<Result<WorktreeArchiveSnapshot>> {
     assert(
       args.workspaceId.trim().length > 0,
@@ -197,7 +278,24 @@ export class WorktreeArchiveSnapshotService {
 
       const projectSnapshots: WorktreeArchiveSnapshotProject[] = [];
       for (const projectRepo of projectRepos) {
-        await this.ensureNoUnsupportedUntrackedFiles(projectRepo.repoCwd);
+        if (args.acknowledgedUntrackedPaths != null) {
+          // Re-verify untracked files at capture time to close the race window between
+          // the preflight check and actual snapshot capture. Any files created after the
+          // user reviewed the dialog are caught here.
+          const currentUntracked = await this.listUnsupportedUntrackedFiles(projectRepo.repoCwd);
+          // Paths the user acknowledged but that no longer exist are harmless — only
+          // new (unacknowledged) paths are dangerous.
+          const acknowledgedSet = new Set(args.acknowledgedUntrackedPaths);
+          const newPaths = currentUntracked.filter((p) => !acknowledgedSet.has(p));
+          if (newPaths.length > 0) {
+            throw new Error(
+              "Untracked files changed since you reviewed them. " +
+                `New files: ${newPaths.join(", ")}. Please try again.`
+            );
+          }
+        } else {
+          await this.ensureNoUnsupportedUntrackedFiles(projectRepo.repoCwd);
+        }
         await this.ensureNoDirtySubmodules(projectRepo.repoCwd);
 
         const trunkBranch = await this.resolveTrunkBranch({
@@ -545,17 +643,26 @@ export class WorktreeArchiveSnapshotService {
     return detectDefaultTrunkBranch(args.projectPath);
   }
 
-  private async ensureNoUnsupportedUntrackedFiles(repoCwd: string): Promise<void> {
+  /**
+   * List untracked files/directories in a repo that archive snapshots cannot preserve.
+   * Returns a sorted, normalized array of relative paths.
+   */
+  private async listUnsupportedUntrackedFiles(repoCwd: string): Promise<string[]> {
     const untrackedOutput = await this.gitStdout(repoCwd, [
       "ls-files",
       "--others",
       "--exclude-standard",
       "--directory",
     ]);
-    const untrackedPaths = untrackedOutput
+    return untrackedOutput
       .split("\n")
       .map((line) => line.trim())
-      .filter((line) => line.length > 0);
+      .filter((line) => line.length > 0)
+      .sort();
+  }
+
+  private async ensureNoUnsupportedUntrackedFiles(repoCwd: string): Promise<void> {
+    const untrackedPaths = await this.listUnsupportedUntrackedFiles(repoCwd);
     if (untrackedPaths.length > 0) {
       throw new Error(
         `Archive snapshot does not yet support untracked files: ${untrackedPaths.join(", ")}`

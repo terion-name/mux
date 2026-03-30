@@ -12,6 +12,7 @@ import {
 } from "react";
 import { useLocation } from "react-router-dom";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { ArchivePreflightResult } from "@/common/orpc/schemas/api";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { WorkspaceSelection } from "@/browser/components/ProjectSidebar/ProjectSidebar";
 import type { RuntimeConfig } from "@/common/types/runtime";
@@ -439,7 +440,13 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
     workspaceId: string,
     newTitle: string
   ) => Promise<{ success: boolean; error?: string }>;
-  archiveWorkspace: (workspaceId: string) => Promise<{ success: boolean; error?: string }>;
+  preflightArchiveWorkspace: (
+    workspaceId: string
+  ) => Promise<{ success: boolean; error?: string; data?: ArchivePreflightResult }>;
+  archiveWorkspace: (
+    workspaceId: string,
+    options?: { acknowledgedUntrackedPaths?: string[] }
+  ) => Promise<{ success: boolean; error?: string }>;
   unarchiveWorkspace: (workspaceId: string) => Promise<{ success: boolean; error?: string }>;
   refreshWorkspaceMetadata: () => Promise<void>;
   setWorkspaceMetadata: React.Dispatch<
@@ -1290,12 +1297,37 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     [api]
   );
 
-  const archiveWorkspace = useCallback(
-    async (workspaceId: string): Promise<{ success: boolean; error?: string }> => {
+  const preflightArchiveWorkspace = useCallback(
+    async (
+      workspaceId: string
+    ): Promise<{ success: boolean; error?: string; data?: ArchivePreflightResult }> => {
       if (!api) return { success: false, error: "API not connected" };
 
       try {
-        const result = await api.workspace.archive({ workspaceId });
+        const result = await api.workspace.preflightArchive({ workspaceId });
+        if (result.success) {
+          return { success: true, data: result.data };
+        }
+        return { success: false, error: result.error };
+      } catch (error) {
+        return { success: false, error: getErrorMessage(error) };
+      }
+    },
+    [api]
+  );
+
+  const archiveWorkspace = useCallback(
+    async (
+      workspaceId: string,
+      options?: { acknowledgedUntrackedPaths?: string[] }
+    ): Promise<{ success: boolean; error?: string }> => {
+      if (!api) return { success: false, error: "API not connected" };
+
+      try {
+        const result = await api.workspace.archive({
+          workspaceId,
+          acknowledgedUntrackedPaths: options?.acknowledgedUntrackedPaths,
+        });
         if (result.success) {
           // Terminal PTYs are killed on archive; clear persisted terminal tabs so
           // unarchive doesn't briefly flash dead terminal tabs.
@@ -1625,6 +1657,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       createWorkspace,
       removeWorkspace,
       updateWorkspaceTitle,
+      preflightArchiveWorkspace,
       archiveWorkspace,
       unarchiveWorkspace,
       refreshWorkspaceMetadata,
@@ -1648,6 +1681,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       createWorkspace,
       removeWorkspace,
       updateWorkspaceTitle,
+      preflightArchiveWorkspace,
       archiveWorkspace,
       unarchiveWorkspace,
       refreshWorkspaceMetadata,

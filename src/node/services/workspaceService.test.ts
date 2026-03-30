@@ -29,6 +29,7 @@ import type { TaskService } from "./taskService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import type { BashToolResult } from "@/common/types/tools";
 import { createMuxMessage } from "@/common/types/message";
 import { MUX_HELP_CHAT_WORKSPACE_ID } from "@/common/constants/muxChat";
@@ -3857,6 +3858,7 @@ describe("WorkspaceService archive snapshots", () => {
       preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
       captureSnapshotForArchive,
       restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("skipped" as const))),
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
     });
 
     const result = await workspaceService.archive(workspaceId);
@@ -3868,6 +3870,7 @@ describe("WorkspaceService archive snapshots", () => {
     expect(captureSnapshotForArchive).toHaveBeenCalledWith({
       workspaceId,
       workspaceMetadata,
+      acknowledgedUntrackedPaths: undefined,
     });
   });
 
@@ -3888,6 +3891,7 @@ describe("WorkspaceService archive snapshots", () => {
       preflightSnapshotForArchive,
       captureSnapshotForArchive,
       restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("skipped" as const))),
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
     });
 
     const result = await workspaceService.archive(workspaceId);
@@ -3904,6 +3908,7 @@ describe("WorkspaceService archive snapshots", () => {
       preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
       captureSnapshotForArchive,
       restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("skipped" as const))),
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
     });
 
     const multiProjectMetadata = {
@@ -3930,6 +3935,7 @@ describe("WorkspaceService archive snapshots", () => {
       preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
       captureSnapshotForArchive,
       restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("skipped" as const))),
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
     });
 
     const result = await workspaceService.archive(workspaceId);
@@ -3942,6 +3948,223 @@ describe("WorkspaceService archive snapshots", () => {
     expect(entry?.archivedAt).toBeUndefined();
     expect(entry?.worktreeArchiveSnapshot).toBeUndefined();
     expect(editConfigSpy).toHaveBeenCalledTimes(0);
+  });
+});
+
+describe("WorkspaceService preflightArchive and acknowledged archive", () => {
+  const workspaceId = "ws-preflight-archive";
+  const projectPath = "/tmp/project-preflight";
+  const workspacePath = "/tmp/project-preflight/ws-preflight-archive";
+
+  let historyService: HistoryService;
+  let cleanupHistory: () => Promise<void>;
+  let workspaceService: WorkspaceService;
+
+  const workspaceMetadata: WorkspaceMetadata = {
+    id: workspaceId,
+    name: "ws-preflight-archive",
+    projectName: "proj",
+    projectPath,
+    runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
+  };
+
+  beforeEach(async () => {
+    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
+
+    const configState: ProjectsConfig = {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              {
+                path: workspacePath,
+                id: workspaceId,
+                name: "ws-preflight-archive",
+                runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
+              },
+            ],
+          },
+        ],
+      ]),
+      worktreeArchiveBehavior: "snapshot",
+    };
+
+    const mockConfig: Partial<Config> = {
+      srcDir: "/tmp/src",
+      getSessionDir: mock(() => "/tmp/test/sessions"),
+      generateStableId: mock(() => "test-id"),
+      findWorkspace: mock((id: string) => {
+        if (id !== workspaceId) return null;
+        return { projectPath, workspacePath };
+      }),
+      editConfig: mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
+        fn(configState);
+        return Promise.resolve();
+      }),
+      getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
+      loadConfigOrDefault: mock(() => configState),
+    };
+    const aiService: AIService = {
+      isStreaming: mock(() => false),
+      getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
+      on: mock(() => undefined),
+      off: mock(() => undefined),
+    } as unknown as AIService;
+
+    workspaceService = new WorkspaceService(
+      mockConfig as Config,
+      historyService,
+      aiService,
+      mockInitStateManager as InitStateManager,
+      mockExtensionMetadataService as ExtensionMetadataService,
+      mockBackgroundProcessManager as BackgroundProcessManager
+    );
+  });
+
+  afterEach(async () => {
+    await cleanupHistory();
+  });
+
+  test("preflightArchive returns ready when no untracked files", async () => {
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive: mock(() => Promise.resolve(Err("unused"))),
+      restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("skipped" as const))),
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
+    });
+
+    const result = await workspaceService.preflightArchive(workspaceId);
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data).toEqual({ kind: "ready" });
+    }
+  });
+
+  test("preflightArchive returns confirm-lossy-untracked-files with paths", async () => {
+    const untrackedPaths = [".ruff_cache/", "tmp/scratch.txt"];
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive: mock(() => Promise.resolve(Err("unused"))),
+      restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("skipped" as const))),
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok(untrackedPaths))),
+    });
+
+    const result = await workspaceService.preflightArchive(workspaceId);
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data).toEqual({
+        kind: "confirm-lossy-untracked-files",
+        paths: untrackedPaths,
+      });
+    }
+  });
+
+  test("preflightArchive returns error when getUnsupportedUntrackedPaths fails", async () => {
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive: mock(() => Promise.resolve(Err("unused"))),
+      restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("skipped" as const))),
+      getUnsupportedUntrackedPaths: mock(() =>
+        Promise.resolve(Err("Failed to check: dirty submodule"))
+      ),
+    });
+
+    const result = await workspaceService.preflightArchive(workspaceId);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("dirty submodule");
+    }
+  });
+
+  test("archive with matching acknowledgedUntrackedPaths succeeds", async () => {
+    const untrackedPaths = [".cache/", "temp.txt"];
+    const snapshot: WorktreeArchiveSnapshot = {
+      version: 1,
+      capturedAt: new Date().toISOString(),
+      stateDirPath: "archive-state",
+      projects: [
+        {
+          projectPath,
+          projectName: "proj",
+          storageKey: "proj",
+          branchName: "ws-preflight-archive",
+          headSha: "abc123",
+          baseSha: "def456",
+          trunkBranch: "main",
+        },
+      ],
+    };
+    const captureSnapshotForArchive = mock(() => Promise.resolve(Ok(snapshot)));
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive,
+      restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("skipped" as const))),
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok(untrackedPaths))),
+    });
+
+    const result = await workspaceService.archive(workspaceId, untrackedPaths);
+
+    expect(result).toEqual(Ok(undefined));
+    // The capture should have been called with acknowledgedUntrackedPaths.
+    expect(captureSnapshotForArchive).toHaveBeenCalledWith({
+      workspaceId,
+      workspaceMetadata,
+      acknowledgedUntrackedPaths: untrackedPaths,
+    });
+  });
+
+  test("archive fails safely when acknowledged paths diverge from current", async () => {
+    // Capture itself re-verifies untracked files and detects the mismatch.
+    const captureSnapshotForArchive = mock(() =>
+      Promise.resolve(
+        Err(
+          "Failed to capture archive snapshot: Untracked files changed since you reviewed them. " +
+            "New files: new-file.txt. Please try again."
+        )
+      )
+    );
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive,
+      restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("skipped" as const))),
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
+    });
+
+    // User only acknowledged two files, but a third appeared at capture time.
+    const result = await workspaceService.archive(workspaceId, [".cache/", "temp.txt"]);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("changed since you reviewed");
+    }
+    // Capture was called with the acknowledged paths so it can re-verify.
+    expect(captureSnapshotForArchive).toHaveBeenCalledWith({
+      workspaceId,
+      workspaceMetadata,
+      acknowledgedUntrackedPaths: [".cache/", "temp.txt"],
+    });
+  });
+
+  test("archive without acknowledgedUntrackedPaths fails on untracked files via preflight", async () => {
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() =>
+        Promise.resolve(Err("Failed to capture archive snapshot: untracked files: .cache/"))
+      ),
+      captureSnapshotForArchive: mock(() => Promise.resolve(Err("should not run"))),
+      restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("skipped" as const))),
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([".cache/"]))),
+    });
+
+    const result = await workspaceService.archive(workspaceId);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("untracked files");
+    }
   });
 });
 
@@ -4047,6 +4270,7 @@ describe("WorkspaceService unarchive snapshot restore", () => {
       preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
       captureSnapshotForArchive: mock(() => Promise.resolve(Err("unused"))),
       restoreSnapshotAfterUnarchive,
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
     });
 
     const result = await workspaceService.unarchive(workspaceId);
@@ -4060,6 +4284,7 @@ describe("WorkspaceService unarchive snapshot restore", () => {
       preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
       captureSnapshotForArchive: mock(() => Promise.resolve(Err("unused"))),
       restoreSnapshotAfterUnarchive,
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
     });
 
     const result = await workspaceService.unarchive(workspaceId);
@@ -4073,6 +4298,7 @@ describe("WorkspaceService unarchive snapshot restore", () => {
       preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
       captureSnapshotForArchive: mock(() => Promise.resolve(Err("unused"))),
       restoreSnapshotAfterUnarchive,
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
     });
 
     const config = workspaceService as unknown as { config: Config };
@@ -4096,6 +4322,7 @@ describe("WorkspaceService unarchive snapshot restore", () => {
       preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
       captureSnapshotForArchive: mock(() => Promise.resolve(Err("unused"))),
       restoreSnapshotAfterUnarchive,
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
     });
 
     const result = await workspaceService.unarchive(workspaceId);

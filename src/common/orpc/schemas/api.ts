@@ -958,8 +958,24 @@ export const workspace = {
     }),
     output: ResultSchema(z.void(), z.string()),
   },
-  archive: {
+  preflightArchive: {
     input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(
+      z.discriminatedUnion("kind", [
+        z.object({ kind: z.literal("ready") }),
+        z.object({
+          kind: z.literal("confirm-lossy-untracked-files"),
+          paths: z.array(z.string()),
+        }),
+      ]),
+      z.string()
+    ),
+  },
+  archive: {
+    input: z.object({
+      workspaceId: z.string(),
+      acknowledgedUntrackedPaths: z.array(z.string()).nullish(),
+    }),
     output: ResultSchema(z.void(), z.string()),
   },
   unarchive: {
@@ -1381,6 +1397,9 @@ export const workspace = {
 };
 
 export type WorkspaceSendMessageOutput = z.infer<typeof workspace.sendMessage.output>;
+export type ArchivePreflightResult =
+  | { kind: "ready" }
+  | { kind: "confirm-lossy-untracked-files"; paths: string[] };
 
 // Tasks (agent sub-workspaces)
 export const tasks = {

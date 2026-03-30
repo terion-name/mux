@@ -121,6 +121,7 @@ import type {
 import type { TerminalService } from "@/node/services/terminalService";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { WorkspaceAISettingsSchema } from "@/common/orpc/schemas";
+import type { ArchivePreflightResult } from "@/common/orpc/schemas/api";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
@@ -173,7 +174,10 @@ const MAX_WORKSPACE_NAME_COLLISION_RETRIES = 3;
 type WorkspaceAISettings = z.infer<typeof WorkspaceAISettingsSchema>;
 type WorktreeArchiveSnapshotLifecycleService = Pick<
   WorktreeArchiveSnapshotService,
-  "preflightSnapshotForArchive" | "captureSnapshotForArchive" | "restoreSnapshotAfterUnarchive"
+  | "preflightSnapshotForArchive"
+  | "captureSnapshotForArchive"
+  | "restoreSnapshotAfterUnarchive"
+  | "getUnsupportedUntrackedPaths"
 >;
 interface WorkspaceAgentStatus {
   emoji: string;
@@ -3600,13 +3604,75 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
+   * Check whether archiving a workspace requires user acknowledgement (e.g. untracked files
+   * that snapshot cannot preserve). Returns a discriminated union the frontend uses to decide
+   * whether to show a destructive confirmation dialog.
+   */
+  async preflightArchive(workspaceId: string): Promise<Result<ArchivePreflightResult>> {
+    if (workspaceId === MUX_HELP_CHAT_WORKSPACE_ID) {
+      // No special preflight needed for the help chat — archive will reject it later.
+      return Ok({ kind: "ready" as const });
+    }
+
+    try {
+      const workspace = this.config.findWorkspace(workspaceId);
+      if (!workspace) {
+        return Err("Workspace not found");
+      }
+
+      const worktreeArchiveBehavior = this.getWorktreeArchiveBehavior();
+      const snapshotBehaviorEnabled =
+        worktreeArchiveBehavior === "snapshot" && this.worktreeArchiveSnapshotService != null;
+
+      if (!snapshotBehaviorEnabled) {
+        return Ok({ kind: "ready" as const });
+      }
+
+      const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
+      if (!metadataResult.success) {
+        return Err(metadataResult.error);
+      }
+      const metadata = metadataResult.data;
+
+      if (!isWorktreeRuntime(metadata.runtimeConfig)) {
+        return Ok({ kind: "ready" as const });
+      }
+
+      // Multi-project workspaces skip snapshot capture entirely.
+      if (Array.isArray(metadata.projects) && metadata.projects.length > 1) {
+        return Ok({ kind: "ready" as const });
+      }
+
+      const untrackedResult =
+        await this.worktreeArchiveSnapshotService!.getUnsupportedUntrackedPaths({
+          workspaceId,
+          workspaceMetadata: metadata,
+        });
+      if (!untrackedResult.success) {
+        return Err(untrackedResult.error);
+      }
+
+      if (untrackedResult.data.length > 0) {
+        return Ok({
+          kind: "confirm-lossy-untracked-files" as const,
+          paths: untrackedResult.data,
+        });
+      }
+
+      return Ok({ kind: "ready" as const });
+    } catch (error) {
+      return Err(`Failed to preflight archive: ${getErrorMessage(error)}`);
+    }
+  }
+
+  /**
    * Archive a workspace. Archived workspaces are hidden from the main sidebar
    * but can be viewed on the project page.
    *
    * If init is still running, we abort it before archiving so we don't leave
    * orphaned post-create work running in the background.
    */
-  async archive(workspaceId: string): Promise<Result<void>> {
+  async archive(workspaceId: string, acknowledgedUntrackedPaths?: string[]): Promise<Result<void>> {
     if (workspaceId === MUX_HELP_CHAT_WORKSPACE_ID) {
       return Err("Cannot archive the Chat with Mux system workspace");
     }
@@ -3697,20 +3763,32 @@ export class WorkspaceService extends EventEmitter {
         beforeArchiveMetadata &&
         isWorktreeRuntime(beforeArchiveMetadata.runtimeConfig)
       ) {
-        const preflightResult =
-          await this.worktreeArchiveSnapshotService!.preflightSnapshotForArchive({
+        // When the caller has NOT acknowledged untracked files, run the strict preflight
+        // that rejects any untracked files outright.
+        if (acknowledgedUntrackedPaths == null) {
+          const preflightResult =
+            await this.worktreeArchiveSnapshotService!.preflightSnapshotForArchive({
+              workspaceId,
+              workspaceMetadata: beforeArchiveMetadata,
+            });
+          if (!preflightResult.success) {
+            return Err(preflightResult.error);
+          }
+        } else {
+          log.info("Archive proceeding with acknowledged lossy untracked files", {
             workspaceId,
-            workspaceMetadata: beforeArchiveMetadata,
+            acknowledgedPaths: acknowledgedUntrackedPaths,
           });
-        if (!preflightResult.success) {
-          return Err(preflightResult.error);
         }
 
         await this.stopLiveWorkspaceActivityForArchive(workspaceId);
 
+        // Pass acknowledgedUntrackedPaths to capture so it re-verifies at capture time,
+        // closing the race window between the user's dialog and actual snapshot capture.
         const captureResult = await this.worktreeArchiveSnapshotService!.captureSnapshotForArchive({
           workspaceId,
           workspaceMetadata: beforeArchiveMetadata,
+          acknowledgedUntrackedPaths,
         });
         if (!captureResult.success) {
           return Err(captureResult.error);

@@ -3067,11 +3067,20 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) => {
           return context.workspaceService.regenerateTitle(input.workspaceId);
         }),
+      preflightArchive: t
+        .input(schemas.workspace.preflightArchive.input)
+        .output(schemas.workspace.preflightArchive.output)
+        .handler(async ({ context, input }) => {
+          return context.workspaceService.preflightArchive(input.workspaceId);
+        }),
       archive: t
         .input(schemas.workspace.archive.input)
         .output(schemas.workspace.archive.output)
         .handler(async ({ context, input }) => {
-          return context.workspaceService.archive(input.workspaceId);
+          return context.workspaceService.archive(
+            input.workspaceId,
+            input.acknowledgedUntrackedPaths ?? undefined
+          );
         }),
       unarchive: t
         .input(schemas.workspace.unarchive.input)
