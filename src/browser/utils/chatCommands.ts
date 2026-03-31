@@ -21,17 +21,20 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { RUNTIME_MODE, parseRuntimeModeAndHost } from "@/common/types/runtime";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import {
-  WORKSPACE_ONLY_COMMAND_KEYS,
-  WORKSPACE_ONLY_COMMAND_TYPES,
-} from "@/constants/slashCommands";
+import { isExperimentEnabled } from "@/browser/hooks/useExperiments";
 import type { Toast } from "@/browser/features/ChatInput/ChatInputToast";
-import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
 import {
   formatCompactionCommandLine,
   getFollowUpContentText,
 } from "@/browser/utils/compaction/format";
+import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
+import { HEARTBEAT_DEFAULT_INTERVAL_MS } from "@/constants/heartbeat";
+import {
+  WORKSPACE_ONLY_COMMAND_KEYS,
+  WORKSPACE_ONLY_COMMAND_TYPES,
+} from "@/constants/slashCommands";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
 import { resolveCompactionModel } from "@/browser/utils/messages/compactionModelPreference";
 import { normalizeModelInput } from "@/browser/utils/models/normalizeModelInput";
@@ -317,6 +320,86 @@ export async function processSlashCommand(
       return { clearInput: false, toastShown: true };
     }
   }
+
+  if (parsed.type === "heartbeat-set") {
+    const activeClient = requireClient();
+    if (!activeClient) {
+      return { clearInput: false, toastShown: true };
+    }
+
+    // Manual /heartbeat invocations stay gated until the experiment is explicitly enabled.
+    // Guard the experiment check so non-browser test environments treat it as disabled safely.
+    let heartbeatExperimentEnabled: boolean | undefined;
+    try {
+      heartbeatExperimentEnabled = isExperimentEnabled(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
+    } catch {
+      heartbeatExperimentEnabled = false;
+    }
+    if (!heartbeatExperimentEnabled) {
+      setToast({
+        id: Date.now().toString(),
+        type: "error",
+        message:
+          "Heartbeat configuration requires the Workspace Heartbeats experiment to be enabled",
+      });
+      return { clearInput: false, toastShown: true };
+    }
+
+    if (!context.workspaceId) {
+      setToast({
+        id: Date.now().toString(),
+        type: "error",
+        message: "No workspace selected",
+      });
+      return { clearInput: false, toastShown: true };
+    }
+
+    setInput("");
+
+    try {
+      const currentHeartbeatSettings =
+        parsed.minutes === null
+          ? await activeClient.workspace.heartbeat.get({ workspaceId: context.workspaceId })
+          : null;
+      // Preserve the stored cadence when toggling heartbeats off so re-enabling restores it.
+      const intervalMs =
+        parsed.minutes === null
+          ? (currentHeartbeatSettings?.intervalMs ?? HEARTBEAT_DEFAULT_INTERVAL_MS)
+          : parsed.minutes * 60 * 1000;
+      const result = await activeClient.workspace.heartbeat.set({
+        workspaceId: context.workspaceId,
+        enabled: parsed.minutes !== null,
+        intervalMs,
+      });
+
+      if (!result.success) {
+        setToast({
+          id: Date.now().toString(),
+          type: "error",
+          message: result.error ?? "Failed to update setting",
+        });
+        return { clearInput: false, toastShown: true };
+      }
+
+      setToast({
+        id: Date.now().toString(),
+        type: "success",
+        message:
+          parsed.minutes === null
+            ? "Heartbeat disabled"
+            : `Heartbeat set to every ${parsed.minutes} minutes`,
+      });
+      return { clearInput: true, toastShown: true };
+    } catch (error) {
+      setToast({
+        id: Date.now().toString(),
+        type: "error",
+        message: error instanceof Error ? error.message : "Failed to update setting",
+      });
+      return { clearInput: false, toastShown: true };
+    }
+  }
+
   if (parsed.type === "vim-toggle") {
     setInput("");
     setVimEnabled((prev) => !prev);
