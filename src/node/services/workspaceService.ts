@@ -113,7 +113,9 @@ import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import {
   HEARTBEAT_DEFAULT_INTERVAL_MS,
+  HEARTBEAT_DEFAULT_MESSAGE_BODY,
   HEARTBEAT_MAX_INTERVAL_MS,
+  HEARTBEAT_MAX_MESSAGE_LENGTH,
   HEARTBEAT_MIN_INTERVAL_MS,
 } from "@/constants/heartbeat";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
@@ -192,6 +194,39 @@ type WorktreeArchiveSnapshotLifecycleService = Pick<
   | "restoreSnapshotAfterUnarchive"
   | "getUnsupportedUntrackedPaths"
 >;
+function normalizeHeartbeatMessageInput(message: string | undefined): string | undefined {
+  if (message == null) {
+    return undefined;
+  }
+
+  assert(typeof message === "string", "Heartbeat message must be a string when provided");
+  const trimmedMessage = message.trim();
+  if (trimmedMessage.length === 0) {
+    return undefined;
+  }
+
+  assert(
+    trimmedMessage.length <= HEARTBEAT_MAX_MESSAGE_LENGTH,
+    `Heartbeat message must be at most ${HEARTBEAT_MAX_MESSAGE_LENGTH} characters`
+  );
+  return trimmedMessage;
+}
+
+// Persisted workspace config can outlive earlier validation rules; trim and bound the
+// message on read so an invalid override never bricks heartbeat execution.
+function sanitizeHeartbeatMessage(message: unknown): string | undefined {
+  if (typeof message !== "string") {
+    return undefined;
+  }
+
+  const trimmedMessage = message.trim();
+  if (trimmedMessage.length === 0) {
+    return undefined;
+  }
+
+  return trimmedMessage.slice(0, HEARTBEAT_MAX_MESSAGE_LENGTH);
+}
+
 interface WorkspaceAgentStatus {
   emoji: string;
   message: string;
@@ -3229,8 +3264,21 @@ export class WorkspaceService extends EventEmitter {
     const workspaceEntry =
       projectConfig?.workspaces.find((workspace) => workspace.id === normalizedWorkspaceId) ??
       projectConfig?.workspaces.find((workspace) => workspace.path === found.workspacePath);
+    if (!workspaceEntry?.heartbeat) {
+      return null;
+    }
 
-    return workspaceEntry?.heartbeat ? { ...workspaceEntry.heartbeat } : null;
+    const message = sanitizeHeartbeatMessage(workspaceEntry.heartbeat.message);
+    return message == null
+      ? {
+          enabled: workspaceEntry.heartbeat.enabled,
+          intervalMs: workspaceEntry.heartbeat.intervalMs,
+        }
+      : {
+          enabled: workspaceEntry.heartbeat.enabled,
+          intervalMs: workspaceEntry.heartbeat.intervalMs,
+          message,
+        };
   }
 
   async setHeartbeatSettings(
@@ -3249,6 +3297,11 @@ export class WorkspaceService extends EventEmitter {
         settings.intervalMs >= HEARTBEAT_MIN_INTERVAL_MS &&
           settings.intervalMs <= HEARTBEAT_MAX_INTERVAL_MS,
         `Heartbeat interval must be between ${HEARTBEAT_MIN_INTERVAL_MS} and ${HEARTBEAT_MAX_INTERVAL_MS} ms`
+      );
+      const hasMessageUpdate = Object.prototype.hasOwnProperty.call(settings, "message");
+      assert(
+        !hasMessageUpdate || settings.message == null || typeof settings.message === "string",
+        "Heartbeat message must be a string when provided"
       );
 
       const found = this.config.findWorkspace(normalizedWorkspaceId);
@@ -3270,15 +3323,27 @@ export class WorkspaceService extends EventEmitter {
         return Err("Workspace not found");
       }
 
-      const nextSettings = {
-        enabled: settings.enabled,
-        // Keep the interval on disk even when disabled so re-enabling restores the user's choice.
-        intervalMs: settings.intervalMs,
-      } satisfies WorkspaceHeartbeatSettings;
+      const nextMessage = hasMessageUpdate
+        ? normalizeHeartbeatMessageInput(settings.message)
+        : sanitizeHeartbeatMessage(workspaceEntry.heartbeat?.message);
+      const nextSettings: WorkspaceHeartbeatSettings =
+        nextMessage == null
+          ? {
+              enabled: settings.enabled,
+              // Keep the interval on disk even when disabled so re-enabling restores the user's choice.
+              intervalMs: settings.intervalMs,
+            }
+          : {
+              enabled: settings.enabled,
+              // Keep the interval on disk even when disabled so re-enabling restores the user's choice.
+              intervalMs: settings.intervalMs,
+              message: nextMessage,
+            };
 
       const changed =
         workspaceEntry.heartbeat?.enabled !== nextSettings.enabled ||
-        workspaceEntry.heartbeat?.intervalMs !== nextSettings.intervalMs;
+        workspaceEntry.heartbeat?.intervalMs !== nextSettings.intervalMs ||
+        workspaceEntry.heartbeat?.message !== nextSettings.message;
       if (!changed) {
         return Ok(undefined);
       }
@@ -6974,7 +7039,7 @@ export class WorkspaceService extends EventEmitter {
   async executeHeartbeat(workspaceId: string): Promise<void> {
     assert(workspaceId.trim().length > 0, "executeHeartbeat requires a non-empty workspaceId");
 
-    const sendOptions = await this.buildHeartbeatSendOptions(workspaceId);
+    const { sendOptions, heartbeatMessage } = await this.buildHeartbeatSendOptions(workspaceId);
 
     const activity = await this.extensionMetadata.getSnapshot(workspaceId);
     const idleMs =
@@ -6982,7 +7047,9 @@ export class WorkspaceService extends EventEmitter {
         ? Math.max(0, Date.now() - activity.recency)
         : HEARTBEAT_DEFAULT_INTERVAL_MS;
     const idleDuration = this.formatIdleDuration(idleMs);
-    const heartbeatPrompt = `[Heartbeat] This workspace has been idle for approximately ${idleDuration}. Check in on the current state of this workspace — review any pending work, check for stale context, and determine if any action is needed. If everything looks good, briefly confirm the workspace status.`;
+    const heartbeatLead = `[Heartbeat] This workspace has been idle for approximately ${idleDuration}.`;
+    const heartbeatBody = heartbeatMessage ?? HEARTBEAT_DEFAULT_MESSAGE_BODY;
+    const heartbeatPrompt = `${heartbeatLead} ${heartbeatBody}`;
 
     const muxMetadata = {
       type: "heartbeat-request" as const,
@@ -7031,7 +7098,10 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
-  private async buildHeartbeatSendOptions(workspaceId: string): Promise<SendMessageOptions> {
+  private async buildHeartbeatSendOptions(workspaceId: string): Promise<{
+    sendOptions: SendMessageOptions;
+    heartbeatMessage: string | undefined;
+  }> {
     const config = this.config.loadConfigOrDefault();
     const workspaceMatch = this.config.findWorkspace(workspaceId);
 
@@ -7115,12 +7185,15 @@ export class WorkspaceService extends EventEmitter {
       coerceThinkingLevel(requestedThinking) ?? WORKSPACE_DEFAULTS.thinkingLevel;
 
     return {
-      model,
-      agentId,
-      thinkingLevel: enforceThinkingPolicy(model, normalizedThinkingLevel),
-      maxOutputTokens: undefined,
-      // Heartbeats should not mutate persisted workspace AI defaults.
-      skipAiSettingsPersistence: true,
+      sendOptions: {
+        model,
+        agentId,
+        thinkingLevel: enforceThinkingPolicy(model, normalizedThinkingLevel),
+        maxOutputTokens: undefined,
+        // Heartbeats should not mutate persisted workspace AI defaults.
+        skipAiSettingsPersistence: true,
+      },
+      heartbeatMessage: sanitizeHeartbeatMessage(workspaceEntry?.heartbeat?.message),
     };
   }
 

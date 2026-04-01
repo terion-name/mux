@@ -282,12 +282,20 @@ describe("processSlashCommand - heartbeat-set", () => {
     );
   });
 
-  test("enables workspace heartbeats with the requested interval", async () => {
+  test("enables workspace heartbeats with the requested interval without clearing the saved message", async () => {
+    const heartbeatGet = mock(() =>
+      Promise.resolve({
+        enabled: true as const,
+        intervalMs: 45 * 60 * 1000,
+        message: "Review the workspace status before taking action.",
+      })
+    );
     const heartbeatSet = mock(() => Promise.resolve({ success: true, data: undefined }));
     const context = createSlashCommandContext({
       api: {
         workspace: {
           heartbeat: {
+            get: heartbeatGet,
             set: heartbeatSet,
           },
         },
@@ -301,6 +309,42 @@ describe("processSlashCommand - heartbeat-set", () => {
 
     expect(result).toEqual({ clearInput: true, toastShown: true });
     expect(context.setInput).toHaveBeenCalledWith("");
+    expect(heartbeatGet).toHaveBeenCalledWith({ workspaceId: "test-ws" });
+    expect(heartbeatSet).toHaveBeenCalledWith({
+      workspaceId: "test-ws",
+      enabled: true,
+      intervalMs: 30 * 60 * 1000,
+      message: "Review the workspace status before taking action.",
+    });
+    expect(context.setToast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "success",
+        message: "Heartbeat set to every 30 minutes",
+      })
+    );
+  });
+
+  test("still updates the interval when reading current heartbeat settings fails", async () => {
+    const heartbeatGet = mock(() => Promise.reject(new Error("Corrupted heartbeat settings")));
+    const heartbeatSet = mock(() => Promise.resolve({ success: true, data: undefined }));
+    const context = createSlashCommandContext({
+      api: {
+        workspace: {
+          heartbeat: {
+            get: heartbeatGet,
+            set: heartbeatSet,
+          },
+        },
+      } as unknown as SlashCommandContext["api"],
+      workspaceId: "test-ws",
+    });
+
+    setHeartbeatExperiment(true);
+
+    const result = await processSlashCommand({ type: "heartbeat-set", minutes: 30 }, context);
+
+    expect(result).toEqual({ clearInput: true, toastShown: true });
+    expect(heartbeatGet).toHaveBeenCalledWith({ workspaceId: "test-ws" });
     expect(heartbeatSet).toHaveBeenCalledWith({
       workspaceId: "test-ws",
       enabled: true,
@@ -314,9 +358,13 @@ describe("processSlashCommand - heartbeat-set", () => {
     );
   });
 
-  test("preserves the configured interval when disabling workspace heartbeats", async () => {
+  test("preserves the configured interval and message when disabling workspace heartbeats", async () => {
     const heartbeatGet = mock(() =>
-      Promise.resolve({ enabled: true as const, intervalMs: 45 * 60 * 1000 })
+      Promise.resolve({
+        enabled: true as const,
+        intervalMs: 45 * 60 * 1000,
+        message: "Review the workspace status before taking action.",
+      })
     );
     const heartbeatSet = mock(() => Promise.resolve({ success: true, data: undefined }));
     const context = createSlashCommandContext({
@@ -341,6 +389,7 @@ describe("processSlashCommand - heartbeat-set", () => {
       workspaceId: "test-ws",
       enabled: false,
       intervalMs: 45 * 60 * 1000,
+      message: "Review the workspace status before taking action.",
     });
     expect(context.setToast).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -379,6 +428,13 @@ describe("processSlashCommand - heartbeat-set", () => {
   });
 
   test("surfaces backend heartbeat update failures", async () => {
+    const heartbeatGet = mock(() =>
+      Promise.resolve({
+        enabled: true as const,
+        intervalMs: 45 * 60 * 1000,
+        message: "Review the workspace status before taking action.",
+      })
+    );
     const heartbeatSet = mock(() =>
       Promise.resolve({ success: false as const, error: "Heartbeat update failed" })
     );
@@ -386,6 +442,7 @@ describe("processSlashCommand - heartbeat-set", () => {
       api: {
         workspace: {
           heartbeat: {
+            get: heartbeatGet,
             set: heartbeatSet,
           },
         },
@@ -402,6 +459,7 @@ describe("processSlashCommand - heartbeat-set", () => {
       workspaceId: "test-ws",
       enabled: true,
       intervalMs: 30 * 60 * 1000,
+      message: "Review the workspace status before taking action.",
     });
     expect(context.setToast).toHaveBeenCalledWith(
       expect.objectContaining({

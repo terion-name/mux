@@ -33,7 +33,13 @@ function normalizeHeartbeatSettings(
     return getDefaultHeartbeatSettings();
   }
 
-  return { ...heartbeat };
+  const trimmedMessage = heartbeat.message?.trim();
+  return trimmedMessage
+    ? { ...heartbeat, message: trimmedMessage }
+    : {
+        enabled: heartbeat.enabled,
+        intervalMs: heartbeat.intervalMs,
+      };
 }
 
 function getHeartbeatErrorMessage(error: unknown, fallbackMessage: string): string {
@@ -134,7 +140,7 @@ export function useWorkspaceHeartbeat(
           return true;
         }
 
-        setSettings({ ...next });
+        setSettings(normalizeHeartbeatSettings(next));
         setIsSaving(false);
         return true;
       } catch (saveError) {
