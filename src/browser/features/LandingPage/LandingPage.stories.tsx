@@ -7,16 +7,22 @@
 
 import type { APIClient } from "@/browser/contexts/API";
 import type { Summary } from "@/browser/hooks/useAnalytics";
+import { createPRStatusExecutor } from "@/browser/stories/helpers/git";
+import { collapseLeftSidebar, expandProjects } from "@/browser/stories/helpers/uiState";
+import {
+  CHROMATIC_SMOKE_MODES,
+  appMeta,
+  AppWithMocks,
+  type AppStory,
+} from "@/browser/stories/meta.js";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
-import { CHROMATIC_SMOKE_MODES, appMeta, AppWithMocks, type AppStory } from "./meta.js";
-import { createWorkspace, groupWorkspacesByProject } from "./mocks/workspaces";
-import { createPRStatusExecutor } from "./helpers/git";
-import { expandProjects } from "./helpers/uiState";
+import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 import { LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
 
+// Integration: stories render full app to test landing page layout with sidebar, analytics, and workspace cards.
 export default {
   ...appMeta,
-  title: "App/LandingPage",
+  title: "Features/LandingPage",
 };
 
 // ─── Shared fixtures ─────────────────────────────────────────────────────────
@@ -111,6 +117,7 @@ export const Default: AppStory = {
   render: () => (
     <AppWithMocks
       setup={() => {
+        collapseLeftSidebar();
         expandProjects([PROJECT_PATH]);
         const client = createMockORPCClient({
           projects: groupWorkspacesByProject(WORKSPACES),
@@ -127,6 +134,7 @@ export const RecentWorkspacePRBadge: AppStory = {
   render: () => (
     <AppWithMocks
       setup={() => {
+        collapseLeftSidebar();
         expandProjects([PROJECT_PATH]);
         const client = createMockORPCClient({
           projects: groupWorkspacesByProject(WORKSPACES_WITH_PR_BADGE),
@@ -144,6 +152,7 @@ export const EmptyState: AppStory = {
   render: () => (
     <AppWithMocks
       setup={() => {
+        collapseLeftSidebar();
         const client = createMockORPCClient({
           projects: new Map(),
           workspaces: [],
@@ -166,6 +175,24 @@ export const SidebarCollapsed: AppStory = {
           workspaces: WORKSPACES,
         });
         return withAnalytics(client);
+      }}
+    />
+  ),
+};
+
+/** Chat with Mux - the default boot state (no user projects) */
+export const ChatWithMux: AppStory = {
+  parameters: {
+    chromatic: { modes: CHROMATIC_SMOKE_MODES },
+  },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        return createMockORPCClient({
+          projects: new Map(),
+          workspaces: [],
+        });
       }}
     />
   ),
