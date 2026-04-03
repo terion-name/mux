@@ -938,6 +938,51 @@ export const TOOL_DEFINITIONS = {
       })
     ),
   },
+  lsp_query: {
+    description:
+      "Query the built-in language server for code intelligence. " +
+      "Use this for hover, definitions, references, implementations, and symbol lookup. " +
+      "Provide line and column using 1-based positions for hover/definition/reference/implementation. " +
+      "For workspace_symbols, provide a representative file path to select the correct language server plus a non-empty query.",
+    schema: z.preprocess(
+      normalizeFilePath,
+      z
+        .object({
+          operation: z.enum([
+            "hover",
+            "definition",
+            "references",
+            "implementation",
+            "document_symbols",
+            "workspace_symbols",
+          ]),
+          path: FILE_TOOL_PATH.describe(
+            "Path to the file being queried (absolute or relative to the current workspace)"
+          ),
+          line: z
+            .number()
+            .int()
+            .positive()
+            .nullish()
+            .describe("1-based line number for position-based queries"),
+          column: z
+            .number()
+            .int()
+            .positive()
+            .nullish()
+            .describe("1-based column number for position-based queries"),
+          query: z
+            .string()
+            .nullish()
+            .describe("Required for workspace_symbols; ignored by other operations"),
+          includeDeclaration: z
+            .boolean()
+            .nullish()
+            .describe("For references only: whether declarations should be included"),
+        })
+        .strict()
+    ),
+  },
   attach_file: {
     description:
       "Attach a supported file from the filesystem so later model steps receive it as a real attachment instead of a huge base64 JSON blob. " +
@@ -1840,6 +1885,69 @@ export const FileReadToolResultSchema = z.union([
   }),
 ]);
 
+const LspQueryResultRangeSchema = z
+  .object({
+    start: z.object({
+      line: z.number().int().positive(),
+      character: z.number().int().positive(),
+    }),
+    end: z.object({
+      line: z.number().int().positive(),
+      character: z.number().int().positive(),
+    }),
+  })
+  .strict();
+
+const LspQueryLocationSchema = z
+  .object({
+    path: z.string(),
+    uri: z.string(),
+    range: LspQueryResultRangeSchema,
+    preview: z.string().optional(),
+  })
+  .strict();
+
+const LspQuerySymbolSchema = z
+  .object({
+    name: z.string(),
+    kind: z.number().int(),
+    detail: z.string().optional(),
+    containerName: z.string().optional(),
+    path: z.string(),
+    range: LspQueryResultRangeSchema,
+    preview: z.string().optional(),
+  })
+  .strict();
+
+export const LspQueryToolResultSchema = z.union([
+  z
+    .object({
+      success: z.literal(true),
+      operation: z.enum([
+        "hover",
+        "definition",
+        "references",
+        "implementation",
+        "document_symbols",
+        "workspace_symbols",
+      ]),
+      serverId: z.string(),
+      rootUri: z.string(),
+      hover: z.string().optional(),
+      locations: z.array(LspQueryLocationSchema).optional(),
+      symbols: z.array(LspQuerySymbolSchema).optional(),
+      warning: z.string().optional(),
+    })
+    .strict(),
+  z
+    .object({
+      success: z.literal(false),
+      error: z.string(),
+      warning: z.string().optional(),
+    })
+    .strict(),
+]);
+
 const AttachFileToolTextPartSchema = z
   .object({
     type: z.literal("text"),
@@ -1963,6 +2071,7 @@ export type BridgeableToolName =
   | "bash_background_list"
   | "bash_background_terminate"
   | "file_read"
+  | "lsp_query"
   | "attach_file"
   | "agent_skill_read"
   | "agent_skill_read_file"
@@ -1990,6 +2099,7 @@ export const RESULT_SCHEMAS: Record<BridgeableToolName, z.ZodType> = {
   bash_background_list: BashBackgroundListResultSchema,
   bash_background_terminate: BashBackgroundTerminateResultSchema,
   file_read: FileReadToolResultSchema,
+  lsp_query: LspQueryToolResultSchema,
   attach_file: AttachFileToolResultSchema,
   agent_skill_read: AgentSkillReadToolResultSchema,
   agent_skill_read_file: AgentSkillReadFileToolResultSchema,
@@ -2033,6 +2143,7 @@ export function getAvailableTools(
   options?: {
     enableAgentReport?: boolean;
     enableAnalyticsQuery?: boolean;
+    enableLspQuery?: boolean;
     /** @deprecated Mux global tools are always included. */
     enableMuxGlobalAgentsTools?: boolean;
   }
@@ -2040,6 +2151,7 @@ export function getAvailableTools(
   const [provider] = modelString.split(":");
   const enableAgentReport = options?.enableAgentReport ?? true;
   const enableAnalyticsQuery = options?.enableAnalyticsQuery ?? true;
+  const enableLspQuery = options?.enableLspQuery ?? false;
 
   // Base tools available for all models
   // Note: Tool availability is controlled by agent tool policy (allowlist), not mode checks here.
@@ -2066,6 +2178,7 @@ export function getAvailableTools(
     "agent_skill_read",
     "agent_skill_read_file",
     "file_edit_replace_string",
+    ...(enableLspQuery ? ["lsp_query"] : []),
     // "file_edit_replace_lines", // DISABLED: causes models to break repo state
     "file_edit_insert",
     "ask_user_question",

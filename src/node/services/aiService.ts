@@ -99,6 +99,7 @@ import {
 import { applyToolPolicyAndExperiments, captureMcpToolTelemetry } from "./toolAssembly";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isProjectTrusted } from "@/node/utils/projectTrust";
+import type { LspManager } from "@/node/services/lsp/lspManager";
 
 const STREAM_STARTUP_DIAGNOSTIC_THRESHOLD_MS = 1_000;
 
@@ -211,6 +212,7 @@ export class AIService extends EventEmitter {
   private readonly config: Config;
   private readonly workspaceMcpOverridesService: WorkspaceMcpOverridesService;
   private mcpServerManager?: MCPServerManager;
+  private lspManager?: LspManager;
   private readonly policyService?: PolicyService;
   private readonly telemetryService?: TelemetryService;
   private readonly opResolver?: ExternalSecretResolver;
@@ -310,6 +312,10 @@ export class AIService extends EventEmitter {
   setMCPServerManager(manager: MCPServerManager): void {
     this.mcpServerManager = manager;
     this.streamManager.setMCPServerManager(manager);
+  }
+
+  setLspManager(manager: LspManager): void {
+    this.lspManager = manager;
   }
 
   setTaskService(taskService: TaskService): void {
@@ -1106,6 +1112,8 @@ export class AIService extends EventEmitter {
             };
 
       const desktopSessionManager = this.desktopSessionManager;
+      const lspQueryEnabled =
+        this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.LSP_QUERY) ?? false;
       let desktopCapabilityPromise: ReturnType<DesktopSessionManager["getCapability"]> | undefined;
       const loadDesktopCapability =
         desktopSessionManager == null
@@ -1204,7 +1212,10 @@ export class AIService extends EventEmitter {
         runtime,
         workspacePath,
         modelString,
-        agentSystemPrompt
+        agentSystemPrompt,
+        {
+          enableLspQuery: lspQueryEnabled,
+        }
       );
       recordStartupPhaseTiming("readToolInstructionsMs", readToolInstructionsStartedAt);
 
@@ -1273,6 +1284,8 @@ export class AIService extends EventEmitter {
           taskService: this.taskService,
           analyticsService: this.analyticsService,
           desktopSessionManager: this.desktopSessionManager,
+          lspManager: this.lspManager,
+          lspQueryEnabled,
           // PTC experiments for inheritance to subagents
           experiments,
           // Dynamic context for tool descriptions (moved from system prompt for better model attention)
