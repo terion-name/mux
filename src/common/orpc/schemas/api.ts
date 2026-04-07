@@ -3,6 +3,7 @@ import { UIModeSchema } from "../../types/mode";
 import { z } from "zod";
 import { CODER_ARCHIVE_BEHAVIORS } from "@/common/config/coderArchiveBehavior";
 import { WORKTREE_ARCHIVE_BEHAVIORS } from "@/common/config/worktreeArchiveBehavior";
+import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { ChatStatsSchema, SessionUsageFileSchema } from "./chatStats";
 import {
@@ -1762,6 +1763,8 @@ export const config = {
       muxGovernorUrl: z.string().nullable(),
       muxGovernorEnrolled: z.boolean(),
       llmDebugLogs: z.boolean(),
+      heartbeatDefaultPrompt: z.string().optional(),
+      heartbeatDefaultIntervalMs: z.number().optional(),
       onePasswordAccountName: z.string().nullish(),
     }),
   },
@@ -1837,6 +1840,27 @@ export const config = {
     input: z
       .object({
         enabled: z.boolean(),
+      })
+      .strict(),
+    output: z.void(),
+  },
+  updateHeartbeatDefaultPrompt: {
+    input: z
+      .object({
+        defaultPrompt: z.string().nullish(),
+      })
+      .strict(),
+    output: z.void(),
+  },
+  updateHeartbeatDefaultIntervalMs: {
+    input: z
+      .object({
+        intervalMs: z
+          .number()
+          .int()
+          .min(HEARTBEAT_MIN_INTERVAL_MS)
+          .max(HEARTBEAT_MAX_INTERVAL_MS)
+          .nullish(),
       })
       .strict(),
     output: z.void(),

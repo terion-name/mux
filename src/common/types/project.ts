@@ -87,6 +87,10 @@ export interface ProjectsConfig {
   muxGatewayEnabled?: boolean;
   /** Enable recording AI SDK devtools logs to ~/.mux/sessions/<workspace>/devtools.jsonl */
   llmDebugLogs?: boolean;
+  /** Default heartbeat prompt used when a workspace heartbeat does not set its own message. */
+  heartbeatDefaultPrompt?: string;
+  /** Default heartbeat interval used when a workspace heartbeat does not set its own cadence. */
+  heartbeatDefaultIntervalMs?: number;
   muxGatewayModels?: string[];
   routePriority?: string[];
   routeOverrides?: Record<string, string>;

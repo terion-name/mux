@@ -51,6 +51,7 @@ import {
   type WorktreeArchiveBehavior,
 } from "@/common/config/worktreeArchiveBehavior";
 import { PlatformPaths } from "@/common/utils/paths";
+import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
 import {
   isValidModelFormat,
   normalizeSelectedModel,
@@ -303,6 +304,18 @@ function parseOptionalPort(value: unknown): number | undefined {
   }
 
   if (value < 0 || value > 65535) {
+    return undefined;
+  }
+
+  return value;
+}
+
+function parseOptionalHeartbeatIntervalMs(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
+    return undefined;
+  }
+
+  if (value < HEARTBEAT_MIN_INTERVAL_MS || value > HEARTBEAT_MAX_INTERVAL_MS) {
     return undefined;
   }
 
@@ -705,6 +718,10 @@ export class Config {
           taskSettings,
           muxGatewayEnabled,
           llmDebugLogs: parseOptionalBoolean(parsed.llmDebugLogs),
+          heartbeatDefaultPrompt: parseOptionalNonEmptyString(parsed.heartbeatDefaultPrompt),
+          heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs(
+            parsed.heartbeatDefaultIntervalMs
+          ),
           muxGatewayModels,
           routePriority,
           routeOverrides,
@@ -769,6 +786,18 @@ export class Config {
       const llmDebugLogs = parseOptionalBoolean(config.llmDebugLogs);
       if (llmDebugLogs !== undefined) {
         data.llmDebugLogs = llmDebugLogs;
+      }
+
+      const heartbeatDefaultPrompt = parseOptionalNonEmptyString(config.heartbeatDefaultPrompt);
+      if (heartbeatDefaultPrompt) {
+        data.heartbeatDefaultPrompt = heartbeatDefaultPrompt;
+      }
+
+      const heartbeatDefaultIntervalMs = parseOptionalHeartbeatIntervalMs(
+        config.heartbeatDefaultIntervalMs
+      );
+      if (heartbeatDefaultIntervalMs !== undefined) {
+        data.heartbeatDefaultIntervalMs = heartbeatDefaultIntervalMs;
       }
 
       const muxGatewayModels = parseOptionalStringArray(config.muxGatewayModels);

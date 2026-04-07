@@ -44,6 +44,7 @@ interface HeartbeatServiceInternals {
   checkInterval: ReturnType<typeof setInterval> | null;
   stopped: boolean;
   nextEligibleAtByWorkspaceId: Map<string, number>;
+  trackedIntervalMsByWorkspaceId: Map<string, number>;
   activeWorkspaceIds: Set<string>;
   queuedWorkspaceIds: Set<string>;
   isProcessingQueue: boolean;
@@ -91,7 +92,7 @@ describe("HeartbeatService", () => {
       parentWorkspaceId: string;
       heartbeat: {
         enabled: boolean;
-        intervalMs: number;
+        intervalMs?: number;
         message?: string;
         contextMode?: "normal" | "compact" | "reset";
       };
@@ -650,21 +651,95 @@ describe("HeartbeatService", () => {
       expect(dispatchOptions?.skipAutoResumeReset).toBe(true);
     });
 
-    test("uses the saved custom heartbeat message when executing a heartbeat", async () => {
+    test("uses the global default heartbeat message when the workspace does not override it", async () => {
       const heartbeatIntervalMs = HEARTBEAT_MIN_INTERVAL_MS;
       const idleDurationMs = 5 * 60_000;
       const idleRecency = Date.now() - idleDurationMs;
+      const globalDefaultPrompt =
+        "Review the workspace state and suggest the next concrete action.";
+
+      currentProjectsConfig = {
+        ...makeProjectsConfig([
+          makeWorkspaceEntry({
+            heartbeat: {
+              enabled: true,
+              intervalMs: heartbeatIntervalMs,
+            },
+          }),
+        ]),
+        heartbeatDefaultPrompt: globalDefaultPrompt,
+      };
+      getSnapshotMock.mockImplementation(() =>
+        Promise.resolve(
+          makeSnapshot({
+            recency: idleRecency,
+            streaming: false,
+          })
+        )
+      );
+
+      const sendMessageMock = mock(() => Promise.resolve(Ok(undefined)));
+      const getOrCreateSessionMock = mock(
+        () =>
+          ({
+            isBusy: () => false,
+            hasQueuedMessages: () => false,
+          }) as unknown as AgentSession
+      );
+
+      const realWorkspaceService = new WorkspaceService(
+        mockConfig,
+        {} as HistoryService,
+        new EventEmitter() as unknown as AIService,
+        new EventEmitter() as unknown as InitStateManager,
+        mockExtensionMetadata,
+        {} as BackgroundProcessManager
+      );
+      const workspaceServiceOverrides = realWorkspaceService as unknown as {
+        getOrCreateSession: typeof getOrCreateSessionMock;
+        sendMessage: typeof sendMessageMock;
+      };
+      workspaceServiceOverrides.getOrCreateSession = getOrCreateSessionMock;
+      workspaceServiceOverrides.sendMessage = sendMessageMock;
+
+      await realWorkspaceService.executeHeartbeat(testWorkspaceId);
+
+      expect(sendMessageMock).toHaveBeenCalledTimes(1);
+      const firstSendMessageCall = sendMessageMock.mock.calls.at(0) as
+        | [
+            Parameters<WorkspaceService["sendMessage"]>[0],
+            Parameters<WorkspaceService["sendMessage"]>[1],
+          ]
+        | undefined;
+      expect(firstSendMessageCall).toBeDefined();
+      if (!firstSendMessageCall) {
+        throw new Error("Expected heartbeat sendMessage to be called exactly once");
+      }
+      const [, heartbeatPrompt] = firstSendMessageCall;
+      expect(heartbeatPrompt).toContain(globalDefaultPrompt);
+      expect(heartbeatPrompt).not.toContain(HEARTBEAT_DEFAULT_MESSAGE_BODY);
+    });
+
+    test("prefers the workspace heartbeat message over the global default", async () => {
+      const heartbeatIntervalMs = HEARTBEAT_MIN_INTERVAL_MS;
+      const idleDurationMs = 5 * 60_000;
+      const idleRecency = Date.now() - idleDurationMs;
+      const globalDefaultPrompt =
+        "Review the workspace state and suggest the next concrete action.";
       const customMessage = "Re-check open work, refresh stale context, and summarize next steps.";
 
-      currentProjectsConfig = makeProjectsConfig([
-        makeWorkspaceEntry({
-          heartbeat: {
-            enabled: true,
-            intervalMs: heartbeatIntervalMs,
-            message: customMessage,
-          },
-        }),
-      ]);
+      currentProjectsConfig = {
+        ...makeProjectsConfig([
+          makeWorkspaceEntry({
+            heartbeat: {
+              enabled: true,
+              intervalMs: heartbeatIntervalMs,
+              message: customMessage,
+            },
+          }),
+        ]),
+        heartbeatDefaultPrompt: globalDefaultPrompt,
+      };
       getSnapshotMock.mockImplementation(() =>
         Promise.resolve(
           makeSnapshot({
@@ -713,6 +788,7 @@ describe("HeartbeatService", () => {
       }
       const [, heartbeatPrompt] = firstSendMessageCall;
       expect(heartbeatPrompt).toContain(customMessage);
+      expect(heartbeatPrompt).not.toContain(globalDefaultPrompt);
       expect(heartbeatPrompt).not.toContain(HEARTBEAT_DEFAULT_MESSAGE_BODY);
     });
     test("dispatches a real compaction request before heartbeat when context mode is compact", async () => {
@@ -1118,6 +1194,29 @@ describe("HeartbeatService", () => {
 
       expect(internals.nextEligibleAtByWorkspaceId.get(testWorkspaceId)).toBe(
         1 + updatedIntervalMs
+      );
+    });
+
+    test("uses the global default heartbeat interval when a workspace does not set one", async () => {
+      const internals = getInternals();
+      const globalDefaultIntervalMs = HEARTBEAT_MIN_INTERVAL_MS;
+      currentProjectsConfig = {
+        ...makeProjectsConfig([
+          makeWorkspaceEntry({
+            heartbeat: { enabled: true },
+          }),
+        ]),
+        heartbeatDefaultIntervalMs: globalDefaultIntervalMs,
+      };
+
+      const beforeResync = Date.now();
+      await internals.resyncFromConfig(beforeResync);
+
+      expect(internals.trackedIntervalMsByWorkspaceId.get(testWorkspaceId)).toBe(
+        globalDefaultIntervalMs
+      );
+      expect(internals.nextEligibleAtByWorkspaceId.get(testWorkspaceId)).toBeGreaterThanOrEqual(
+        beforeResync + globalDefaultIntervalMs
       );
     });
 

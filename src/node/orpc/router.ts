@@ -592,6 +592,8 @@ export const router = (authToken?: string) => {
             muxGovernorUrl,
             muxGovernorEnrolled,
             llmDebugLogs: config.llmDebugLogs === true,
+            heartbeatDefaultPrompt: config.heartbeatDefaultPrompt ?? undefined,
+            heartbeatDefaultIntervalMs: config.heartbeatDefaultIntervalMs ?? undefined,
             onePasswordAccountName: config.onePasswordAccountName ?? null,
           };
         }),
@@ -957,6 +959,33 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) => {
           await context.config.editConfig((config) => {
             config.llmDebugLogs = input.enabled;
+            return config;
+          });
+        }),
+      updateHeartbeatDefaultPrompt: t
+        .input(schemas.config.updateHeartbeatDefaultPrompt.input)
+        .output(schemas.config.updateHeartbeatDefaultPrompt.output)
+        .handler(async ({ context, input }) => {
+          await context.config.editConfig((config) => {
+            const trimmed = input.defaultPrompt?.trim();
+            if (trimmed && trimmed.length > 0) {
+              config.heartbeatDefaultPrompt = trimmed;
+            } else {
+              delete config.heartbeatDefaultPrompt;
+            }
+            return config;
+          });
+        }),
+      updateHeartbeatDefaultIntervalMs: t
+        .input(schemas.config.updateHeartbeatDefaultIntervalMs.input)
+        .output(schemas.config.updateHeartbeatDefaultIntervalMs.output)
+        .handler(async ({ context, input }) => {
+          await context.config.editConfig((config) => {
+            if (input.intervalMs != null) {
+              config.heartbeatDefaultIntervalMs = input.intervalMs;
+            } else {
+              delete config.heartbeatDefaultIntervalMs;
+            }
             return config;
           });
         }),
