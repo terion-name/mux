@@ -6,6 +6,7 @@ import { execSync } from "node:child_process";
 
 import type { ToolExecutionOptions } from "ai";
 
+import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
 import { createTaskApplyGitPatchTool } from "@/node/services/tools/task_apply_git_patch";
 import {
   getSubagentGitPatchArtifactsFilePath,
@@ -20,6 +21,51 @@ const mockToolCallOptions: ToolExecutionOptions = {
   toolCallId: "test-call-id",
   messages: [],
 };
+
+function createTextStream(content: string): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(content));
+      controller.close();
+    },
+  });
+}
+
+function createExecStream(stdout = "", stderr = "", exitCode = 0): ExecStream {
+  return {
+    stdout: createTextStream(stdout),
+    stderr: createTextStream(stderr),
+    stdin: new WritableStream<Uint8Array>({
+      write() {
+        return Promise.resolve();
+      },
+      close() {
+        return Promise.resolve();
+      },
+    }),
+    exitCode: Promise.resolve(exitCode),
+    duration: Promise.resolve(0),
+  };
+}
+
+function createRuntimeThatFailsNthDiffTree(
+  baseRuntime: Runtime,
+  failOnCall: number,
+  state: { diffTreeCalls: number }
+): Runtime {
+  const runtime = Object.create(baseRuntime) as Runtime;
+  runtime.exec = async (command: string, options: ExecOptions) => {
+    if (command.startsWith("git diff-tree --root --no-commit-id --name-only -z -r ")) {
+      state.diffTreeCalls += 1;
+      if (state.diffTreeCalls === failOnCall) {
+        return createExecStream("", "diff-tree failed", 1);
+      }
+    }
+
+    return await baseRuntime.exec(command, options);
+  };
+  return runtime;
+}
 
 function initGitRepo(repoPath: string): void {
   execSync("git init -b main", { cwd: repoPath, stdio: "ignore" });
@@ -845,6 +891,96 @@ describe("task_apply_git_patch tool", () => {
         ],
       },
     ]);
+  }, 20_000);
+
+  it("fails closed for post-apply diagnostics when changed-file discovery fails mid-series", async () => {
+    const childRepo = path.join(rootDir, "diff-tree-child");
+    const targetRepo = path.join(rootDir, "diff-tree-target");
+    for (const repo of [childRepo, targetRepo]) {
+      await fsPromises.mkdir(repo, { recursive: true });
+      initGitRepo(repo);
+    }
+
+    await commitFile(childRepo, "README.md", "hello\n", "base");
+    await commitFile(targetRepo, "README.md", "hello\n", "base");
+    const baseSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+
+    await commitFile(childRepo, "README.md", "hello\nfirst\n", "first change");
+    await commitFile(childRepo, "docs/second.md", "second\n", "second change");
+    const headSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+
+    const muxRoot = path.join(rootDir, "diff-tree-mux");
+    const workspaceId = "diff-tree-workspace";
+    const sessionDir = path.join(muxRoot, "sessions", workspaceId);
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    await writeWorkspaceConfig({
+      muxRoot,
+      workspaceId,
+      workspaceName: "diff-tree",
+      primaryProjectPath: targetRepo,
+      projects: [{ projectPath: targetRepo, projectName: "diff-tree" }],
+    });
+
+    const childTaskId = "diff-tree-task";
+    await writePatchArtifact({
+      sessionDir,
+      workspaceId,
+      childTaskId,
+      projectArtifacts: [
+        await buildReadyProjectArtifact({
+          sessionDir,
+          childTaskId,
+          storageKey: "diff-tree",
+          projectPath: targetRepo,
+          projectName: "diff-tree",
+          childRepo,
+          baseSha,
+          headSha,
+          commitCount: 2,
+        }),
+      ],
+    });
+
+    const runtimeState = { diffTreeCalls: 0 };
+    const runtime = createRuntimeThatFailsNthDiffTree(
+      createRuntime({ type: "local", srcBaseDir: "/tmp" }),
+      2,
+      runtimeState
+    );
+    const mutationCalls: Array<{ filePaths: string[] }> = [];
+    const tool = createTaskApplyGitPatchTool({
+      ...getTestDeps(),
+      workspaceId,
+      cwd: targetRepo,
+      runtime,
+      runtimeTempDir: "/tmp",
+      workspaceSessionDir: sessionDir,
+      onFilesMutated: async (params) => {
+        mutationCalls.push(params);
+        return "should not run";
+      },
+    });
+
+    const result = (await tool.execute!({ task_id: childTaskId }, mockToolCallOptions)) as {
+      success: boolean;
+      note?: string;
+      appliedCommits?: Array<{ subject: string }>;
+    };
+
+    expect(result.success).toBe(true);
+    expect(result.appliedCommits?.map((commit) => commit.subject)).toEqual([
+      "first change",
+      "second change",
+    ]);
+    expect(runtimeState.diffTreeCalls).toBe(2);
+    expect(mutationCalls).toEqual([]);
+    expect(result.note ?? "").not.toContain("should not run");
+    expect(await fsPromises.readFile(path.join(targetRepo, "README.md"), "utf-8")).toBe(
+      "hello\nfirst\n"
+    );
+    expect(await fsPromises.readFile(path.join(targetRepo, "docs", "second.md"), "utf-8")).toBe(
+      "second\n"
+    );
   }, 20_000);
 
   it("appends post-apply diagnostics notes for real applies", async () => {

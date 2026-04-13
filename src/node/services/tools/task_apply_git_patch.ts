@@ -190,6 +190,7 @@ async function getChangedFilesForAppliedCommits(params: {
   appliedCommits: AppliedCommit[];
 }): Promise<string[]> {
   const changedFiles = new Set<string>();
+  let discoveryFailed = false;
 
   for (const commit of params.appliedCommits) {
     if (!commit.sha) {
@@ -213,7 +214,8 @@ async function getChangedFilesForAppliedCommits(params: {
           stderr: result.stderr.trim(),
           stdout: result.stdout.trim(),
         });
-        continue;
+        discoveryFailed = true;
+        break;
       }
 
       for (const relativePath of result.stdout.split("\u0000").filter((line) => line.length > 0)) {
@@ -225,7 +227,15 @@ async function getChangedFilesForAppliedCommits(params: {
         commitSha: commit.sha,
         error,
       });
+      discoveryFailed = true;
+      break;
     }
+  }
+
+  if (discoveryFailed) {
+    // Post-apply diagnostics must fail closed here because a partial path list could hide
+    // diagnostics from later commits in the applied series.
+    return [];
   }
 
   return [...changedFiles];
