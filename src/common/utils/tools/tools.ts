@@ -98,6 +98,8 @@ export interface ToolConfiguration {
   muxScope?: MuxToolScope;
   /** Callback to record file state for external edit detection (plan files) */
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
+  /** Optional callback for file-mutation follow-up work (for example, post-edit diagnostics). */
+  onFilesMutated?: (params: { filePaths: string[] }) => Promise<string | undefined>;
   /** Callback to notify that provider/config was written (triggers hot-reload). */
   onConfigChanged?: () => void;
   /** Task orchestration for sub-agent tasks */

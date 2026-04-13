@@ -171,6 +171,61 @@ async function getAppliedCommits(params: {
   return [];
 }
 
+function selectPathModule(filePath: string): typeof path.posix {
+  if (/^[A-Za-z]:[\\/]/.test(filePath) || filePath.includes("\\")) {
+    return path.win32;
+  }
+  return path.posix;
+}
+
+function joinRepoRelativePath(repoCwd: string, relativePath: string): string {
+  const pathModule = selectPathModule(repoCwd);
+  const normalizedSegments = relativePath.split("/").filter((segment) => segment.length > 0);
+  return pathModule.join(repoCwd, ...normalizedSegments);
+}
+
+async function getChangedFilesForAppliedRange(params: {
+  runtime: ToolConfiguration["runtime"];
+  cwd: string;
+  beforeHeadSha: string | undefined;
+}): Promise<string[]> {
+  const diffCommand = params.beforeHeadSha
+    ? `git diff --name-only ${params.beforeHeadSha}..HEAD --`
+    : "git diff-tree --no-commit-id --name-only -r HEAD";
+
+  try {
+    const result = await execBuffered(params.runtime, diffCommand, {
+      cwd: params.cwd,
+      timeout: 30,
+    });
+    if (result.exitCode !== 0) {
+      log.debug("task_apply_git_patch: git diff --name-only failed", {
+        cwd: params.cwd,
+        exitCode: result.exitCode,
+        stderr: result.stderr.trim(),
+        stdout: result.stdout.trim(),
+      });
+      return [];
+    }
+
+    return Array.from(
+      new Set(
+        result.stdout
+          .split("\n")
+          .map((line) => line.replace(/\r$/, "").trim())
+          .filter((line) => line.length > 0)
+          .map((line) => joinRepoRelativePath(params.cwd, line))
+      )
+    );
+  } catch (error) {
+    log.debug("task_apply_git_patch: git diff --name-only threw", {
+      cwd: params.cwd,
+      error,
+    });
+    return [];
+  }
+}
+
 const MAX_PARENT_WORKSPACE_DEPTH = 32;
 
 function inferMuxRootFromWorkspaceSessionDir(workspaceSessionDir: string): string | undefined {
@@ -569,6 +624,7 @@ async function applyProjectPatch(params: {
   threeWay: boolean;
   force: boolean;
   isReplay: boolean;
+  onFilesMutated?: (params: { filePaths: string[] }) => Promise<string | undefined>;
   abortSignal?: AbortSignal;
 }): Promise<{ success: boolean; projectResult: TaskApplyGitPatchProjectResult }> {
   const patchResolution = await resolvePatchPath({
@@ -865,6 +921,27 @@ async function applyProjectPatch(params: {
     includeSha: true,
   });
 
+  let postMutationNote: string | undefined;
+  if (params.onFilesMutated) {
+    const changedFiles = await getChangedFilesForAppliedRange({
+      runtime: params.runtime,
+      cwd: params.repoCwd,
+      beforeHeadSha,
+    });
+    if (changedFiles.length > 0) {
+      try {
+        postMutationNote = await params.onFilesMutated({ filePaths: changedFiles });
+      } catch (error) {
+        log.debug("task_apply_git_patch: failed to collect post-apply warnings", {
+          taskId: params.taskId,
+          workspaceId: params.workspaceId,
+          cwd: params.repoCwd,
+          error,
+        });
+      }
+    }
+  }
+
   if (!params.isReplay) {
     await markSubagentGitPatchArtifactApplied({
       workspaceId: params.artifactWorkspaceId,
@@ -883,7 +960,7 @@ async function applyProjectPatch(params: {
       status: "applied",
       appliedCommits,
       headCommitSha,
-      note: patchResolution.note,
+      note: mergeNotes(patchResolution.note, postMutationNote),
     },
   };
 }
@@ -1071,6 +1148,7 @@ export const createTaskApplyGitPatchTool: ToolFactory = (config: ToolConfigurati
           threeWay,
           force,
           isReplay,
+          onFilesMutated: config.onFilesMutated,
           abortSignal,
         });
         projectResults.push(applyResult.projectResult);

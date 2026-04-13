@@ -149,6 +149,60 @@ async function writeWorkspaceConfig(params: {
   );
 }
 
+async function setupSingleProjectPatchFixture(rootDir: string, name: string) {
+  const childRepo = path.join(rootDir, `${name}-child`);
+  const targetRepo = path.join(rootDir, `${name}-target`);
+  for (const repo of [childRepo, targetRepo]) {
+    await fsPromises.mkdir(repo, { recursive: true });
+    initGitRepo(repo);
+  }
+
+  await commitFile(childRepo, "README.md", "hello", "base");
+  await commitFile(targetRepo, "README.md", "hello", "base");
+  const baseSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+
+  await commitFile(childRepo, "README.md", "hello\nupdated", "child change");
+  const headSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+
+  const muxRoot = path.join(rootDir, `${name}-mux`);
+  const workspaceId = `${name}-workspace`;
+  const sessionDir = path.join(muxRoot, "sessions", workspaceId);
+  await fsPromises.mkdir(sessionDir, { recursive: true });
+  await writeWorkspaceConfig({
+    muxRoot,
+    workspaceId,
+    workspaceName: name,
+    primaryProjectPath: targetRepo,
+    projects: [{ projectPath: targetRepo, projectName: name }],
+  });
+
+  const childTaskId = `${name}-task`;
+  await writePatchArtifact({
+    sessionDir,
+    workspaceId,
+    childTaskId,
+    projectArtifacts: [
+      await buildReadyProjectArtifact({
+        sessionDir,
+        childTaskId,
+        storageKey: name,
+        projectPath: targetRepo,
+        projectName: name,
+        childRepo,
+        baseSha,
+        headSha,
+      }),
+    ],
+  });
+
+  return {
+    childTaskId,
+    sessionDir,
+    targetRepo,
+    workspaceId,
+  };
+}
+
 describe("task_apply_git_patch tool", () => {
   let rootDir: string;
 
@@ -710,5 +764,60 @@ describe("task_apply_git_patch tool", () => {
     const artifact = await readSubagentGitPatchArtifact(ancestorSessionDir, childTaskId);
     expect(artifact?.projectArtifacts[0]?.appliedAtMs).toBe(appliedAtMs);
     expect(await readSubagentGitPatchArtifact(currentSessionDir, childTaskId)).toBeNull();
+  }, 20_000);
+
+  it("appends post-apply diagnostics notes for real applies", async () => {
+    const fixture = await setupSingleProjectPatchFixture(rootDir, "diagnostics");
+    const mutationCalls: Array<{ filePaths: string[] }> = [];
+    const tool = createTaskApplyGitPatchTool({
+      ...getTestDeps(),
+      workspaceId: fixture.workspaceId,
+      cwd: fixture.targetRepo,
+      runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
+      runtimeTempDir: "/tmp",
+      workspaceSessionDir: fixture.sessionDir,
+      onFilesMutated: async (params) => {
+        mutationCalls.push(params);
+        return "Post-edit LSP diagnostics:\n- README.md:2:1 error TS1000: patch issue";
+      },
+    });
+
+    const result = (await tool.execute!({ task_id: fixture.childTaskId }, mockToolCallOptions)) as {
+      success: boolean;
+      note?: string;
+      projectResults: Array<{ note?: string }>;
+    };
+
+    expect(result.success).toBe(true);
+    expect(mutationCalls).toEqual([{ filePaths: [path.join(fixture.targetRepo, "README.md")] }]);
+    expect(result.note).toContain("Post-edit LSP diagnostics:");
+    expect(result.projectResults[0]?.note).toContain("Post-edit LSP diagnostics:");
+  }, 20_000);
+
+  it("does not request post-apply diagnostics for dry runs", async () => {
+    const fixture = await setupSingleProjectPatchFixture(rootDir, "dry-run");
+    const onFilesMutated = async (_params: { filePaths: string[] }) => {
+      throw new Error("should not be called");
+    };
+    const tool = createTaskApplyGitPatchTool({
+      ...getTestDeps(),
+      workspaceId: fixture.workspaceId,
+      cwd: fixture.targetRepo,
+      runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
+      runtimeTempDir: "/tmp",
+      workspaceSessionDir: fixture.sessionDir,
+      onFilesMutated,
+    });
+
+    const result = (await tool.execute!(
+      { task_id: fixture.childTaskId, dry_run: true },
+      mockToolCallOptions
+    )) as {
+      success: boolean;
+      note?: string;
+    };
+
+    expect(result.success).toBe(true);
+    expect(result.note).not.toContain("Post-edit LSP diagnostics:");
   }, 20_000);
 });

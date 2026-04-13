@@ -1,9 +1,6 @@
 import { readFileString } from "@/node/utils/runtime/helpers";
 import { shellQuote } from "@/common/utils/shell";
-import {
-  LSP_REQUEST_TIMEOUT_MS,
-  LSP_START_TIMEOUT_MS,
-} from "@/constants/lsp";
+import { LSP_REQUEST_TIMEOUT_MS, LSP_START_TIMEOUT_MS } from "@/constants/lsp";
 import { log } from "@/node/services/log";
 import { LspStdioTransport, type LspJsonRpcMessage } from "./lspStdioTransport";
 import type {
@@ -12,12 +9,14 @@ import type {
   LspClientInstance,
   LspClientQueryRequest,
   LspClientQueryResult,
+  LspDiagnostic,
   LspDocumentSymbol,
   LspHover,
   LspLocation,
   LspLocationLink,
   LspMarkedString,
   LspMarkupContent,
+  LspPublishDiagnosticsParams,
   LspSymbolInformation,
 } from "./types";
 
@@ -44,7 +43,10 @@ export class LspClient implements LspClientInstance {
   private initialized = false;
   isClosed = false;
 
-  private constructor(private readonly options: CreateLspClientOptions, transport: LspStdioTransport) {
+  private constructor(
+    private readonly options: CreateLspClientOptions,
+    transport: LspStdioTransport
+  ) {
     this.transport = transport;
     this.transport.onmessage = (message) => this.handleMessage(message);
     this.transport.onclose = () => this.handleClose();
@@ -52,7 +54,10 @@ export class LspClient implements LspClientInstance {
   }
 
   static async create(options: CreateLspClientOptions): Promise<LspClient> {
-    const command = [shellQuote(options.descriptor.command), ...options.descriptor.args.map((arg) => shellQuote(arg))].join(" ");
+    const command = [
+      shellQuote(options.descriptor.command),
+      ...options.descriptor.args.map((arg) => shellQuote(arg)),
+    ].join(" ");
     const execStream = await options.runtime.exec(command, {
       cwd: options.rootPath,
       // LSP servers are long-lived by design; timeout would kill healthy clients mid-session.
@@ -64,7 +69,7 @@ export class LspClient implements LspClientInstance {
     return client;
   }
 
-  async ensureFile(file: LspClientFileHandle): Promise<void> {
+  async ensureFile(file: LspClientFileHandle): Promise<number> {
     this.ensureStarted();
 
     const text = await readFileString(this.options.runtime, file.readablePath);
@@ -83,11 +88,11 @@ export class LspClient implements LspClientInstance {
           text,
         },
       });
-      return;
+      return 1;
     }
 
     if (existingState.text === text) {
-      return;
+      return existingState.version;
     }
 
     const nextVersion = existingState.version + 1;
@@ -102,6 +107,7 @@ export class LspClient implements LspClientInstance {
       },
       contentChanges: [{ text }],
     });
+    return nextVersion;
   }
 
   async query(request: LspClientQueryRequest): Promise<LspClientQueryResult> {
@@ -309,21 +315,23 @@ export class LspClient implements LspClientInstance {
         timeoutId,
       });
 
-      void this.transport.send({
-        jsonrpc: "2.0",
-        id: requestId,
-        method,
-        ...(params !== undefined ? { params } : {}),
-      }).catch((error) => {
-        const pending = this.pendingRequests.get(requestId);
-        if (!pending) {
-          return;
-        }
+      void this.transport
+        .send({
+          jsonrpc: "2.0",
+          id: requestId,
+          method,
+          ...(params !== undefined ? { params } : {}),
+        })
+        .catch((error) => {
+          const pending = this.pendingRequests.get(requestId);
+          if (!pending) {
+            return;
+          }
 
-        clearTimeout(pending.timeoutId);
-        this.pendingRequests.delete(requestId);
-        reject(error instanceof Error ? error : new Error(String(error)));
-      });
+          clearTimeout(pending.timeoutId);
+          this.pendingRequests.delete(requestId);
+          reject(error instanceof Error ? error : new Error(String(error)));
+        });
     });
   }
 
@@ -340,28 +348,34 @@ export class LspClient implements LspClientInstance {
   }
 
   private handleMessage(message: LspJsonRpcMessage): void {
-    if (typeof message.id !== "number") {
+    if (typeof message.id === "number") {
+      const pending = this.pendingRequests.get(message.id);
+      if (!pending) {
+        return;
+      }
+
+      clearTimeout(pending.timeoutId);
+      this.pendingRequests.delete(message.id);
+
+      if (message.error) {
+        pending.reject(
+          new Error(
+            `LSP ${this.options.descriptor.id} request failed: ${message.error.message}${this.buildStderrSuffix()}`
+          )
+        );
+        return;
+      }
+
+      pending.resolve(message.result);
       return;
     }
 
-    const pending = this.pendingRequests.get(message.id);
-    if (!pending) {
-      return;
+    if (message.method === "textDocument/publishDiagnostics") {
+      const params = parsePublishDiagnosticsParams(message.params);
+      if (params) {
+        this.options.onPublishDiagnostics?.(params);
+      }
     }
-
-    clearTimeout(pending.timeoutId);
-    this.pendingRequests.delete(message.id);
-
-    if (message.error) {
-      pending.reject(
-        new Error(
-          `LSP ${this.options.descriptor.id} request failed: ${message.error.message}${this.buildStderrSuffix()}`
-        )
-      );
-      return;
-    }
-
-    pending.resolve(message.result);
   }
 
   private handleClose(): void {
@@ -395,6 +409,85 @@ export class LspClient implements LspClientInstance {
   }
 }
 
+function parsePublishDiagnosticsParams(params: unknown): LspPublishDiagnosticsParams | null {
+  if (typeof params !== "object" || params == null || Array.isArray(params)) {
+    return null;
+  }
+
+  const record = params as Record<string, unknown>;
+  if (typeof record.uri !== "string" || !Array.isArray(record.diagnostics)) {
+    return null;
+  }
+
+  const diagnostics = record.diagnostics
+    .map((diagnostic) => parseDiagnostic(diagnostic))
+    .filter((diagnostic): diagnostic is LspDiagnostic => diagnostic !== null);
+
+  return {
+    uri: record.uri,
+    version: typeof record.version === "number" ? record.version : undefined,
+    diagnostics,
+  };
+}
+
+function parseDiagnostic(value: unknown): LspDiagnostic | null {
+  if (typeof value !== "object" || value == null || Array.isArray(value)) {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  const range = parseRange(record.range);
+  if (!range || typeof record.message !== "string") {
+    return null;
+  }
+
+  const severity =
+    typeof record.severity === "number" && record.severity >= 1 && record.severity <= 4
+      ? (record.severity as 1 | 2 | 3 | 4)
+      : undefined;
+  const code =
+    typeof record.code === "string" || typeof record.code === "number" ? record.code : undefined;
+
+  return {
+    range,
+    message: record.message,
+    severity,
+    code,
+    source: typeof record.source === "string" ? record.source : undefined,
+  };
+}
+
+function parseRange(value: unknown): LspLocation["range"] | null {
+  if (typeof value !== "object" || value == null || Array.isArray(value)) {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  const start = parsePosition(record.start);
+  const end = parsePosition(record.end);
+  if (!start || !end) {
+    return null;
+  }
+
+  return { start, end };
+}
+
+function parsePosition(value: unknown): LspLocation["range"]["start"] | null {
+  if (typeof value !== "object" || value == null || Array.isArray(value)) {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  if (typeof record.line !== "number" || typeof record.character !== "number") {
+    return null;
+  }
+
+  return {
+    line: record.line,
+    character: record.character,
+  };
+}
+
 function normalizeLocations(
   value: LspLocation | LspLocationLink | Array<LspLocation | LspLocationLink> | null | undefined
 ): LspLocation[] {
@@ -415,15 +508,16 @@ function normalizeLocations(
   });
 }
 
-function normalizeHoverContents(
-  contents: LspHover["contents"]
-): string {
+function normalizeHoverContents(contents: LspHover["contents"]): string {
   if (typeof contents === "string") {
     return contents;
   }
 
   if (Array.isArray(contents)) {
-    return contents.map((entry) => normalizeHoverContents(entry)).filter((entry) => entry.length > 0).join("\n\n");
+    return contents
+      .map((entry) => normalizeHoverContents(entry))
+      .filter((entry) => entry.length > 0)
+      .join("\n\n");
   }
 
   if (isMarkupContent(contents)) {
@@ -433,8 +527,6 @@ function normalizeHoverContents(
   return contents.value;
 }
 
-function isMarkupContent(
-  value: LspMarkupContent | LspMarkedString
-): value is LspMarkupContent {
+function isMarkupContent(value: LspMarkupContent | LspMarkedString): value is LspMarkupContent {
   return "kind" in value;
 }

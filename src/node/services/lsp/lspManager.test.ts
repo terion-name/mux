@@ -3,7 +3,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import type { CreateLspClientOptions, LspClientInstance, LspServerDescriptor } from "./types";
+import type {
+  CreateLspClientOptions,
+  LspClientInstance,
+  LspDiagnostic,
+  LspServerDescriptor,
+} from "./types";
 import { LspManager } from "./lspManager";
 
 function createDeferred<T>() {
@@ -16,6 +21,31 @@ function createDeferred<T>() {
   return { promise, resolve, reject };
 }
 
+function createRegistry(): readonly LspServerDescriptor[] {
+  return [
+    {
+      id: "typescript",
+      extensions: [".ts"],
+      command: "fake-lsp",
+      args: ["--stdio"],
+      rootMarkers: ["package.json", ".git"],
+      languageIdForPath: () => "typescript",
+    },
+  ];
+}
+
+function createDiagnostic(message: string): LspDiagnostic {
+  return {
+    range: {
+      start: { line: 0, character: 0 },
+      end: { line: 0, character: 5 },
+    },
+    severity: 1,
+    source: "tsserver",
+    message,
+  };
+}
+
 describe("LspManager", () => {
   let workspacePath: string;
 
@@ -23,7 +53,14 @@ describe("LspManager", () => {
     workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "mux-lsp-manager-"));
     await fs.mkdir(path.join(workspacePath, ".git"));
     await fs.mkdir(path.join(workspacePath, "src"), { recursive: true });
+    await fs.mkdir(path.join(workspacePath, "packages", "pkg", "src"), { recursive: true });
+    await fs.writeFile(path.join(workspacePath, "package.json"), "{}\n");
     await fs.writeFile(path.join(workspacePath, "src", "example.ts"), "export const value = 1;\n");
+    await fs.writeFile(path.join(workspacePath, "packages", "pkg", "package.json"), "{}\n");
+    await fs.writeFile(
+      path.join(workspacePath, "packages", "pkg", "src", "nested.ts"),
+      "export const nested = 1;\n"
+    );
   });
 
   afterEach(async () => {
@@ -31,7 +68,7 @@ describe("LspManager", () => {
   });
 
   test("reuses clients for the same workspace root and forwards normalized positions", async () => {
-    const ensureFile = mock(() => Promise.resolve(undefined));
+    const ensureFile = mock(async () => 1);
     let lastQueryRequest: Parameters<LspClientInstance["query"]>[0] | undefined;
     const query = mock((request: Parameters<LspClientInstance["query"]>[0]) => {
       lastQueryRequest = request;
@@ -52,19 +89,9 @@ describe("LspManager", () => {
       clientFactoryOptions = options;
       return Promise.resolve(client);
     });
-    const registry: readonly LspServerDescriptor[] = [
-      {
-        id: "typescript",
-        extensions: [".ts"],
-        command: "fake-lsp",
-        args: ["--stdio"],
-        rootMarkers: ["package.json", ".git"],
-        languageIdForPath: () => "typescript",
-      },
-    ];
 
     const manager = new LspManager({
-      registry,
+      registry: createRegistry(),
       clientFactory,
     });
     const runtime = new LocalRuntime(workspacePath);
@@ -110,7 +137,7 @@ describe("LspManager", () => {
   });
 
   test("deduplicates concurrent client creation for the same workspace root", async () => {
-    const ensureFile = mock(() => Promise.resolve(undefined));
+    const ensureFile = mock(async () => 1);
     const query = mock(() =>
       Promise.resolve({
         operation: "hover" as const,
@@ -130,19 +157,9 @@ describe("LspManager", () => {
       clientFactoryStarted.resolve();
       return clientReady.promise;
     });
-    const registry: readonly LspServerDescriptor[] = [
-      {
-        id: "typescript",
-        extensions: [".ts"],
-        command: "fake-lsp",
-        args: ["--stdio"],
-        rootMarkers: ["package.json", ".git"],
-        languageIdForPath: () => "typescript",
-      },
-    ];
 
     const manager = new LspManager({
-      registry,
+      registry: createRegistry(),
       clientFactory,
     });
     const runtime = new LocalRuntime(workspacePath);
@@ -180,5 +197,104 @@ describe("LspManager", () => {
 
     await manager.dispose();
     expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  test("collects post-mutation diagnostics, clears empty publishes, and clears workspace cache on dispose", async () => {
+    const ensureFile = mock((file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+      const version = ensureFile.mock.calls.length;
+      const diagnostics = version === 1 ? [createDiagnostic("first pass")] : [];
+      clientOptions?.onPublishDiagnostics?.({
+        uri: file.uri,
+        version,
+        diagnostics,
+      });
+      return Promise.resolve(version);
+    });
+    const close = mock(() => Promise.resolve(undefined));
+    let clientOptions: CreateLspClientOptions | undefined;
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      clientOptions = options;
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile,
+        query: mock(() => Promise.resolve({ operation: "hover" as const, hover: "unused" })),
+        close,
+      });
+    });
+
+    const manager = new LspManager({
+      registry: createRegistry(),
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    const first = await manager.collectPostMutationDiagnostics({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePaths: ["src/example.ts"],
+      timeoutMs: 20,
+    });
+    expect(first).toHaveLength(1);
+    expect(first[0]?.diagnostics[0]?.message).toBe("first pass");
+
+    const second = await manager.collectPostMutationDiagnostics({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePaths: ["src/example.ts"],
+      timeoutMs: 20,
+    });
+    expect(second).toEqual([]);
+
+    const workspaceDiagnostics = (manager as unknown as {
+      workspaceDiagnostics: Map<string, Map<string, Map<string, unknown>>>;
+    }).workspaceDiagnostics;
+    expect(workspaceDiagnostics.get("ws-1")?.values().next().value?.size ?? 0).toBe(0);
+
+    await manager.disposeWorkspace("ws-1");
+    expect(workspaceDiagnostics.has("ws-1")).toBe(false);
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  test("keeps diagnostics isolated by root uri within the same workspace", async () => {
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      const ensureFile = mock((file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+        options.onPublishDiagnostics?.({
+          uri: file.uri,
+          version: 1,
+          diagnostics: [createDiagnostic(`diagnostic for ${options.rootPath}`)],
+        });
+        return Promise.resolve(1);
+      });
+
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile,
+        query: mock(() => Promise.resolve({ operation: "hover" as const, hover: "unused" })),
+        close: mock(() => Promise.resolve(undefined)),
+      });
+    });
+
+    const manager = new LspManager({
+      registry: createRegistry(),
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    const diagnostics = await manager.collectPostMutationDiagnostics({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePaths: ["src/example.ts", "packages/pkg/src/nested.ts"],
+      timeoutMs: 20,
+    });
+
+    expect(diagnostics).toHaveLength(2);
+    expect(new Set(diagnostics.map((entry) => entry.rootUri)).size).toBe(2);
+    expect(diagnostics.map((entry) => entry.path)).toEqual([
+      path.join(workspacePath, "packages", "pkg", "src", "nested.ts"),
+      path.join(workspacePath, "src", "example.ts"),
+    ]);
   });
 });

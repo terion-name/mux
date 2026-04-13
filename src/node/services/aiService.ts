@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import * as fs from "fs/promises";
 import { EventEmitter } from "events";
 
@@ -100,6 +101,7 @@ import { applyToolPolicyAndExperiments, captureMcpToolTelemetry } from "./toolAs
 import { getErrorMessage } from "@/common/utils/errors";
 import { isProjectTrusted } from "@/node/utils/projectTrust";
 import type { LspManager } from "@/node/services/lsp/lspManager";
+import type { LspDiagnostic, LspFileDiagnostics } from "@/node/services/lsp/types";
 
 const STREAM_STARTUP_DIAGNOSTIC_THRESHOLD_MS = 1_000;
 
@@ -204,6 +206,80 @@ export function resolveMuxProjectRootForHostFs(
 
 function derivePromptCacheScope(metadata: WorkspaceMetadata): string {
   return `${metadata.projectName}-${uniqueSuffix([metadata.projectPath])}`;
+}
+
+const MAX_POST_EDIT_DIAGNOSTIC_LINES = 12;
+
+function formatPostMutationDiagnostics(
+  diagnostics: LspFileDiagnostics[],
+  workspacePath: string
+): string | undefined {
+  if (diagnostics.length === 0) {
+    return undefined;
+  }
+
+  const lines: string[] = [];
+  let omittedCount = 0;
+
+  for (const fileDiagnostics of diagnostics) {
+    for (const diagnostic of fileDiagnostics.diagnostics) {
+      if (lines.length >= MAX_POST_EDIT_DIAGNOSTIC_LINES) {
+        omittedCount += 1;
+        continue;
+      }
+
+      lines.push(formatPostMutationDiagnosticLine(fileDiagnostics, diagnostic, workspacePath));
+    }
+  }
+
+  if (lines.length === 0) {
+    return undefined;
+  }
+
+  return [
+    "Post-edit LSP diagnostics:",
+    ...lines.map((line) => `- ${line}`),
+    ...(omittedCount > 0 ? [`- ...and ${omittedCount} more diagnostics`] : []),
+  ].join("\n");
+}
+
+function formatPostMutationDiagnosticLine(
+  fileDiagnostics: LspFileDiagnostics,
+  diagnostic: LspDiagnostic,
+  workspacePath: string
+): string {
+  const relativePath = toWorkspaceRelativePath(fileDiagnostics.path, workspacePath);
+  const line = diagnostic.range.start.line + 1;
+  const column = diagnostic.range.start.character + 1;
+  const severity = formatDiagnosticSeverity(diagnostic.severity);
+  const source = diagnostic.source ? ` ${diagnostic.source}` : "";
+  const code = diagnostic.code != null ? ` ${String(diagnostic.code)}` : "";
+  const message = diagnostic.message.replace(/\s+/g, " ").trim();
+  return `${relativePath}:${line}:${column} ${severity}${source}${code}: ${message}`;
+}
+
+function formatDiagnosticSeverity(severity: LspDiagnostic["severity"]): string {
+  switch (severity) {
+    case 1:
+      return "error";
+    case 2:
+      return "warning";
+    case 3:
+      return "info";
+    case 4:
+      return "hint";
+    default:
+      return "diagnostic";
+  }
+}
+
+function toWorkspaceRelativePath(filePath: string, workspacePath: string): string {
+  const relativePath = path.relative(workspacePath, filePath);
+  if (relativePath.length === 0) {
+    return ".";
+  }
+
+  return relativePath.startsWith("..") ? filePath : relativePath;
 }
 
 export class AIService extends EventEmitter {
@@ -1280,6 +1356,28 @@ export class AIService extends EventEmitter {
           enableAgentReport: Boolean(metadata.parentWorkspaceId),
           // External edit detection callback
           recordFileState,
+          onFilesMutated: async ({ filePaths }) => {
+            if (!this.lspManager) {
+              return undefined;
+            }
+
+            try {
+              const diagnostics = await this.lspManager.collectPostMutationDiagnostics({
+                workspaceId,
+                runtime,
+                workspacePath,
+                filePaths,
+              });
+              return formatPostMutationDiagnostics(diagnostics, workspacePath);
+            } catch (error) {
+              log.debug("Failed to collect post-mutation LSP diagnostics", {
+                workspaceId,
+                filePaths,
+                error,
+              });
+              return undefined;
+            }
+          },
           onConfigChanged: () => this.providerService.notifyConfigChanged(),
           taskService: this.taskService,
           analyticsService: this.analyticsService,

@@ -42,6 +42,30 @@ export interface LspHover {
   contents: string | LspMarkupContent | LspMarkedString | Array<string | LspMarkupContent | LspMarkedString>;
 }
 
+export interface LspDiagnostic {
+  range: LspRange;
+  severity?: 1 | 2 | 3 | 4;
+  code?: string | number;
+  source?: string;
+  message: string;
+}
+
+export interface LspPublishDiagnosticsParams {
+  uri: string;
+  version?: number;
+  diagnostics: LspDiagnostic[];
+}
+
+export interface LspFileDiagnostics {
+  uri: string;
+  path: string;
+  serverId: string;
+  rootUri: string;
+  version?: number;
+  diagnostics: LspDiagnostic[];
+  receivedAtMs: number;
+}
+
 export interface LspDocumentSymbol {
   name: string;
   kind: number;
@@ -121,7 +145,7 @@ export interface LspClientQueryResult {
 
 export interface LspClientInstance {
   readonly isClosed: boolean;
-  ensureFile(file: LspClientFileHandle): Promise<void>;
+  ensureFile(file: LspClientFileHandle): Promise<number>;
   query(request: LspClientQueryRequest): Promise<LspClientQueryResult>;
   close(): Promise<void>;
 }
@@ -131,4 +155,5 @@ export interface CreateLspClientOptions {
   runtime: Runtime;
   rootPath: string;
   rootUri: string;
+  onPublishDiagnostics?: (params: LspPublishDiagnosticsParams) => void;
 }
