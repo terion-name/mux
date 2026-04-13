@@ -631,6 +631,7 @@ export class ServiceContainer {
       telemetryService: this.telemetryService,
       experimentsService: this.experimentsService,
       sessionUsageService: this.sessionUsageService,
+      lspManager: this.lspManager,
       devToolsService: this.devToolsService,
       browserSessionDiscoveryService: this.browserSessionDiscoveryService,
       browserBridgeTokenManager: this.browserBridgeTokenManager,

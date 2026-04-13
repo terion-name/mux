@@ -16,6 +16,7 @@ import type {
   UpdateStatus,
   WorkspaceActivitySnapshot,
   WorkspaceChatMessage,
+  WorkspaceLspDiagnosticsSnapshot,
   WorkspaceStatsSnapshot,
   FrontendWorkspaceMetadataSchemaType,
 } from "@/common/orpc/types";
@@ -3889,6 +3890,51 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) => {
           return context.sessionUsageService.getSessionUsageBatch(input.workspaceIds);
         }),
+      lsp: {
+        listDiagnostics: t
+          .input(schemas.workspace.lsp.listDiagnostics.input)
+          .output(schemas.workspace.lsp.listDiagnostics.output)
+          .handler(({ context, input }) => {
+            return context.lspManager.getWorkspaceDiagnosticsSnapshot(input.workspaceId);
+          }),
+        subscribeDiagnostics: t
+          .input(schemas.workspace.lsp.subscribeDiagnostics.input)
+          .output(schemas.workspace.lsp.subscribeDiagnostics.output)
+          .handler(async function* ({ context, input, signal }) {
+            const workspaceId = input.workspaceId;
+
+            if (signal?.aborted) {
+              return;
+            }
+
+            context.lspManager.acquireLease(workspaceId);
+            const queue = createAsyncEventQueue<WorkspaceLspDiagnosticsSnapshot>();
+            const onAbort = () => {
+              queue.end();
+            };
+
+            if (signal) {
+              signal.addEventListener("abort", onAbort, { once: true });
+            }
+
+            const unsubscribe = context.lspManager.subscribeWorkspaceDiagnostics(
+              workspaceId,
+              (snapshot) => {
+                queue.push(snapshot);
+              }
+            );
+
+            try {
+              yield context.lspManager.getWorkspaceDiagnosticsSnapshot(workspaceId);
+              yield* queue.iterate();
+            } finally {
+              signal?.removeEventListener("abort", onAbort);
+              queue.end();
+              unsubscribe();
+              context.lspManager.releaseLease(workspaceId);
+            }
+          }),
+      },
       stats: {
         subscribe: t
           .input(schemas.workspace.stats.subscribe.input)

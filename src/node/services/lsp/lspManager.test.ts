@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import type { WorkspaceLspDiagnosticsSnapshot } from "@/common/orpc/types";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type {
   CreateLspClientOptions,
@@ -68,7 +69,7 @@ describe("LspManager", () => {
   });
 
   test("reuses clients for the same workspace root and forwards normalized positions", async () => {
-    const ensureFile = mock(async () => 1);
+    const ensureFile = mock(() => Promise.resolve(1));
     let lastQueryRequest: Parameters<LspClientInstance["query"]>[0] | undefined;
     const query = mock((request: Parameters<LspClientInstance["query"]>[0]) => {
       lastQueryRequest = request;
@@ -137,7 +138,7 @@ describe("LspManager", () => {
   });
 
   test("deduplicates concurrent client creation for the same workspace root", async () => {
-    const ensureFile = mock(async () => 1);
+    const ensureFile = mock(() => Promise.resolve(1));
     const query = mock(() =>
       Promise.resolve({
         operation: "hover" as const,
@@ -331,7 +332,7 @@ describe("LspManager", () => {
     const publishByUri = new Map<string, () => void>();
     let secondEnsureResolved = false;
     const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
-      const ensureFile = mock(async (file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+      const ensureFile = mock((file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
         publishByUri.set(file.uri, () => {
           options.onPublishDiagnostics?.({
             uri: file.uri,
@@ -344,7 +345,7 @@ describe("LspManager", () => {
           secondEnsureResolved = true;
           secondEnsureStarted.resolve();
         }
-        return 1;
+        return Promise.resolve(1);
       });
 
       return Promise.resolve({
@@ -432,5 +433,129 @@ describe("LspManager", () => {
       path.join(workspacePath, "packages", "pkg", "src", "nested.ts"),
       path.join(workspacePath, "src", "example.ts"),
     ]);
+  });
+
+  test("returns cloned sorted snapshots and notifies listeners on publish and clear", async () => {
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      const ensureFile = mock((file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+        options.onPublishDiagnostics?.({
+          uri: file.uri,
+          version: 1,
+          diagnostics: [createDiagnostic(`diagnostic for ${file.runtimePath}`)],
+          rawDiagnosticCount: 1,
+        });
+        return Promise.resolve(1);
+      });
+
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile,
+        query: mock(() => Promise.resolve({ operation: "hover" as const, hover: "unused" })),
+        close: mock(() => Promise.resolve(undefined)),
+      });
+    });
+
+    const manager = new LspManager({
+      registry: createRegistry(),
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+    const snapshots: WorkspaceLspDiagnosticsSnapshot[] = [];
+    const unsubscribe = manager.subscribeWorkspaceDiagnostics("ws-1", (snapshot) => {
+      snapshots.push(snapshot);
+    });
+
+    await manager.collectPostMutationDiagnostics({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePaths: ["src/example.ts", "packages/pkg/src/nested.ts"],
+      timeoutMs: 20,
+    });
+
+    const snapshot = manager.getWorkspaceDiagnosticsSnapshot("ws-1");
+    expect(snapshot.diagnostics.map((entry) => entry.path)).toEqual([
+      path.join(workspacePath, "packages", "pkg", "src", "nested.ts"),
+      path.join(workspacePath, "src", "example.ts"),
+    ]);
+    const firstDiagnostic = snapshot.diagnostics[0];
+    expect(firstDiagnostic).toBeDefined();
+    if (!firstDiagnostic) {
+      throw new Error("Expected the first diagnostics entry to exist");
+    }
+    const firstMessage = firstDiagnostic.diagnostics[0];
+    expect(firstMessage).toBeDefined();
+    if (!firstMessage) {
+      throw new Error("Expected the first diagnostic message to exist");
+    }
+    firstMessage.message = "mutated";
+    const refreshedSnapshot = manager.getWorkspaceDiagnosticsSnapshot("ws-1");
+    expect(refreshedSnapshot.diagnostics[0]?.diagnostics[0]?.message).toBe(
+      `diagnostic for ${path.join(workspacePath, "packages", "pkg", "src", "nested.ts")}`
+    );
+
+    expect(snapshots).toHaveLength(2);
+    expect(snapshots[0]?.diagnostics).toHaveLength(1);
+    expect(snapshots[1]?.diagnostics).toHaveLength(2);
+
+    await manager.disposeWorkspace("ws-1");
+    expect(manager.getWorkspaceDiagnosticsSnapshot("ws-1").diagnostics).toEqual([]);
+    expect(snapshots.at(-1)?.diagnostics).toEqual([]);
+
+    unsubscribe();
+  });
+
+  test("ignores malformed publishes in workspace snapshots", async () => {
+    const ensureFile = mock((file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+      const version = ensureFile.mock.calls.length;
+      clientOptions?.onPublishDiagnostics?.({
+        uri: file.uri,
+        version,
+        diagnostics: version === 1 ? [createDiagnostic("first pass")] : [],
+        rawDiagnosticCount: 1,
+      });
+      return Promise.resolve(version);
+    });
+    const close = mock(() => Promise.resolve(undefined));
+    let clientOptions: CreateLspClientOptions | undefined;
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      clientOptions = options;
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile,
+        query: mock(() => Promise.resolve({ operation: "hover" as const, hover: "unused" })),
+        close,
+      });
+    });
+
+    const manager = new LspManager({
+      registry: createRegistry(),
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    await manager.collectPostMutationDiagnostics({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePaths: ["src/example.ts"],
+      timeoutMs: 20,
+    });
+
+    await manager.collectPostMutationDiagnostics({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePaths: ["src/example.ts"],
+      timeoutMs: 20,
+    });
+
+    expect(manager.getWorkspaceDiagnosticsSnapshot("ws-1").diagnostics).toHaveLength(1);
+    expect(
+      manager.getWorkspaceDiagnosticsSnapshot("ws-1").diagnostics[0]?.diagnostics[0]?.message
+    ).toBe("first pass");
+
+    await manager.disposeWorkspace("ws-1");
+    expect(close).toHaveBeenCalledTimes(1);
   });
 });

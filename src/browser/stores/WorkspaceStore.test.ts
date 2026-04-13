@@ -1,7 +1,11 @@
 import { describe, expect, it, beforeEach, afterEach, mock, type Mock } from "bun:test";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { StreamStartEvent, ToolCallStartEvent } from "@/common/types/stream";
-import type { WorkspaceActivitySnapshot, WorkspaceChatMessage } from "@/common/orpc/types";
+import type {
+  WorkspaceActivitySnapshot,
+  WorkspaceChatMessage,
+  WorkspaceLspDiagnosticsSnapshot,
+} from "@/common/orpc/types";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT } from "@/common/constants/ui";
 import {
@@ -48,6 +52,98 @@ const mockHistoryLoadMore = mock(
     })
 );
 const mockActivityList = mock(() => Promise.resolve<Record<string, WorkspaceActivitySnapshot>>({}));
+
+interface ControlledAsyncIterator<T> {
+  iterator: AsyncGenerator<T, void, unknown>;
+  push: (value: T) => void;
+  end: () => void;
+}
+
+function createControlledAsyncIterator<T>(signal?: AbortSignal): ControlledAsyncIterator<T> {
+  const queue: T[] = [];
+  let ended = false;
+  let resolveNext: ((result: IteratorResult<T>) => void) | null = null;
+
+  const push = (value: T) => {
+    if (ended) {
+      return;
+    }
+    if (resolveNext) {
+      const resolve = resolveNext;
+      resolveNext = null;
+      resolve({ value, done: false });
+      return;
+    }
+    queue.push(value);
+  };
+
+  const end = () => {
+    if (ended) {
+      return;
+    }
+    ended = true;
+    if (resolveNext) {
+      const resolve = resolveNext;
+      resolveNext = null;
+      resolve({ value: undefined as void, done: true });
+    }
+  };
+
+  signal?.addEventListener("abort", end, { once: true });
+
+  const iterator: AsyncGenerator<T, void, unknown> = {
+    async next(): Promise<IteratorResult<T>> {
+      if (queue.length > 0) {
+        return { value: queue.shift()!, done: false };
+      }
+      if (ended) {
+        return { value: undefined as void, done: true };
+      }
+      return await new Promise<IteratorResult<T>>((resolve) => {
+        resolveNext = resolve;
+      });
+    },
+    return(): Promise<IteratorResult<T>> {
+      end();
+      return Promise.resolve({ value: undefined as void, done: true });
+    },
+    throw(error: unknown): Promise<IteratorResult<T>> {
+      end();
+      return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    },
+    [Symbol.asyncDispose](): Promise<void> {
+      end();
+      return Promise.resolve();
+    },
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+  };
+
+  return { iterator, push, end };
+}
+
+const lspDiagnosticsSubscriptions: Array<{
+  workspaceId: string;
+  signal?: AbortSignal;
+  push: (snapshot: WorkspaceLspDiagnosticsSnapshot) => void;
+  end: () => void;
+}> = [];
+
+function emitLspDiagnosticsSnapshot(snapshot: WorkspaceLspDiagnosticsSnapshot): void {
+  for (const subscription of lspDiagnosticsSubscriptions) {
+    if (subscription.workspaceId === snapshot.workspaceId) {
+      subscription.push(snapshot);
+    }
+  }
+}
+
+function clearLspDiagnosticsSubscriptions(): void {
+  for (const subscription of lspDiagnosticsSubscriptions) {
+    subscription.end();
+  }
+  lspDiagnosticsSubscriptions.length = 0;
+}
 
 type WorkspaceActivityEvent =
   | {
@@ -99,6 +195,21 @@ const mockSetAutoCompactionThreshold = mock(() =>
   Promise.resolve({ success: true, data: undefined })
 );
 const mockGetStartupAutoRetryModel = mock(() => Promise.resolve({ success: true, data: null }));
+const mockListLspDiagnostics = mock(({ workspaceId }: { workspaceId: string }) =>
+  Promise.resolve<WorkspaceLspDiagnosticsSnapshot>({ workspaceId, diagnostics: [] })
+);
+const mockSubscribeLspDiagnostics = mock(
+  ({ workspaceId }: { workspaceId: string }, options?: { signal?: AbortSignal }) => {
+    const controlled = createControlledAsyncIterator<WorkspaceLspDiagnosticsSnapshot>(options?.signal);
+    lspDiagnosticsSubscriptions.push({
+      workspaceId,
+      signal: options?.signal,
+      push: controlled.push,
+      end: controlled.end,
+    });
+    return controlled.iterator;
+  }
+);
 
 const mockClient = {
   workspace: {
@@ -113,6 +224,10 @@ const mockClient = {
     },
     setAutoCompactionThreshold: mockSetAutoCompactionThreshold,
     getStartupAutoRetryModel: mockGetStartupAutoRetryModel,
+    lsp: {
+      listDiagnostics: mockListLspDiagnostics,
+      subscribeDiagnostics: mockSubscribeLspDiagnostics,
+    },
   },
   terminal: {
     activity: {
@@ -279,6 +394,9 @@ describe("WorkspaceStore", () => {
     mockTerminalActivitySubscribe.mockClear();
     mockSetAutoCompactionThreshold.mockClear();
     mockGetStartupAutoRetryModel.mockClear();
+    mockListLspDiagnostics.mockClear();
+    mockSubscribeLspDiagnostics.mockClear();
+    clearLspDiagnosticsSubscriptions();
     global.window.localStorage?.clear?.();
     mockHistoryLoadMore.mockResolvedValue({
       messages: [],
@@ -314,6 +432,7 @@ describe("WorkspaceStore", () => {
 
   afterEach(() => {
     store.dispose();
+    clearLspDiagnosticsSubscriptions();
   });
 
   describe("pinned todo auto-collapse", () => {
@@ -4485,4 +4604,104 @@ describe("WorkspaceStore", () => {
       expect(usage.lastContextUsage?.model).toBe("claude-3-5-sonnet-20241022");
     });
   });
+
+
+  describe("workspace LSP diagnostics snapshots", () => {
+    it("starts empty and replaces the cached snapshot after the first payload", async () => {
+      const workspaceId = "lsp-diagnostics-snapshot";
+      createAndAddWorkspace(store, workspaceId);
+
+      expect(store.getWorkspaceLspDiagnosticsSnapshot(workspaceId)).toBeNull();
+
+      const unsubscribe = store.subscribeLspDiagnostics(workspaceId, () => undefined);
+      const subscribed = await waitUntil(() => mockSubscribeLspDiagnostics.mock.calls.length === 1);
+      expect(subscribed).toBe(true);
+
+      emitLspDiagnosticsSnapshot({
+        workspaceId,
+        diagnostics: [
+          {
+            uri: "file:///workspace/src/example.ts",
+            path: "/workspace/src/example.ts",
+            serverId: "typescript",
+            rootUri: "file:///workspace",
+            version: 1,
+            diagnostics: [
+              {
+                range: {
+                  start: { line: 1, character: 1 },
+                  end: { line: 1, character: 5 },
+                },
+                severity: 1,
+                source: "tsserver",
+                message: "first snapshot",
+              },
+            ],
+            receivedAtMs: 1,
+          },
+        ],
+      });
+
+      const received = await waitUntil(
+        () =>
+          store.getWorkspaceLspDiagnosticsSnapshot(workspaceId)?.diagnostics[0]?.diagnostics[0]
+            ?.message === "first snapshot"
+      );
+      expect(received).toBe(true);
+
+      emitLspDiagnosticsSnapshot({ workspaceId, diagnostics: [] });
+      const cleared = await waitUntil(
+        () => store.getWorkspaceLspDiagnosticsSnapshot(workspaceId)?.diagnostics.length === 0
+      );
+      expect(cleared).toBe(true);
+
+      unsubscribe();
+    });
+
+    it("shares one backend subscription across listeners and clears state on the last unsubscribe", async () => {
+      const workspaceId = "lsp-diagnostics-refcount";
+      createAndAddWorkspace(store, workspaceId);
+
+      const unsubscribeOne = store.subscribeLspDiagnostics(workspaceId, () => undefined);
+      const unsubscribeTwo = store.subscribeLspDiagnostics(workspaceId, () => undefined);
+      const subscribed = await waitUntil(() => mockSubscribeLspDiagnostics.mock.calls.length === 1);
+      expect(subscribed).toBe(true);
+      expect(mockSubscribeLspDiagnostics).toHaveBeenCalledTimes(1);
+
+      emitLspDiagnosticsSnapshot({ workspaceId, diagnostics: [] });
+      await waitUntil(
+        () => store.getWorkspaceLspDiagnosticsSnapshot(workspaceId)?.workspaceId === workspaceId
+      );
+
+      unsubscribeOne();
+      expect(lspDiagnosticsSubscriptions[0]?.signal?.aborted).toBe(false);
+      expect(store.getWorkspaceLspDiagnosticsSnapshot(workspaceId)?.workspaceId).toBe(workspaceId);
+
+      unsubscribeTwo();
+      const aborted = await waitUntil(() => lspDiagnosticsSubscriptions[0]?.signal?.aborted === true);
+      expect(aborted).toBe(true);
+      expect(store.getWorkspaceLspDiagnosticsSnapshot(workspaceId)).toBeNull();
+    });
+
+    it("aborts LSP diagnostics subscriptions when a workspace is removed", async () => {
+      const workspaceId = "lsp-diagnostics-remove";
+      createAndAddWorkspace(store, workspaceId);
+
+      store.subscribeLspDiagnostics(workspaceId, () => undefined);
+      const subscribed = await waitUntil(() => mockSubscribeLspDiagnostics.mock.calls.length === 1);
+      expect(subscribed).toBe(true);
+
+      emitLspDiagnosticsSnapshot({ workspaceId, diagnostics: [] });
+      await waitUntil(
+        () => store.getWorkspaceLspDiagnosticsSnapshot(workspaceId)?.workspaceId === workspaceId
+      );
+
+      store.removeWorkspace(workspaceId);
+
+      const aborted = await waitUntil(() => lspDiagnosticsSubscriptions[0]?.signal?.aborted === true);
+      expect(aborted).toBe(true);
+      expect(store.getWorkspaceLspDiagnosticsSnapshot(workspaceId)).toBeNull();
+    });
+  });
+
 });

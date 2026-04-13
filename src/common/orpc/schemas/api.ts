@@ -38,6 +38,7 @@ import {
 } from "./terminal";
 import { BashToolResultSchema, FileTreeNodeSchema } from "./tools";
 import { WorkspaceStatsSnapshotSchema } from "./workspaceStats";
+import { WorkspaceLspDiagnosticsSnapshotSchema } from "./workspaceLsp";
 import {
   FrontendWorkspaceMetadataSchema,
   GitStatusSchema,
@@ -1397,6 +1398,16 @@ export const workspace = {
     clear: {
       input: z.object({ workspaceId: z.string() }),
       output: ResultSchema(z.void(), z.string()),
+    },
+  },
+  lsp: {
+    listDiagnostics: {
+      input: z.object({ workspaceId: z.string() }),
+      output: WorkspaceLspDiagnosticsSnapshotSchema,
+    },
+    subscribeDiagnostics: {
+      input: z.object({ workspaceId: z.string() }),
+      output: eventIterator(WorkspaceLspDiagnosticsSnapshotSchema),
     },
   },
   getSessionUsage: {

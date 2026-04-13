@@ -9,6 +9,7 @@ import {
   LSP_PREVIEW_CONTEXT_LINES,
 } from "@/constants/lsp";
 import type { Runtime } from "@/node/runtime/Runtime";
+import type { WorkspaceLspDiagnosticsSnapshot } from "@/common/orpc/types";
 import { log } from "@/node/services/log";
 import { LspClient } from "./lspClient";
 import { LspPathMapper } from "./lspPathMapper";
@@ -50,6 +51,7 @@ interface LspDiagnosticPublishReceipt {
 }
 
 type LspDiagnosticWaiter = (publish: LspDiagnosticPublishReceipt) => void;
+type WorkspaceDiagnosticsListener = (snapshot: WorkspaceLspDiagnosticsSnapshot) => void;
 type LspClientFactory = (options: CreateLspClientOptions) => Promise<LspClientInstance>;
 
 export interface LspManagerOptions {
@@ -94,6 +96,7 @@ export class LspManager {
     string,
     Map<string, Map<string, Set<LspDiagnosticWaiter>>>
   >();
+  private readonly workspaceDiagnosticListeners = new Map<string, Set<WorkspaceDiagnosticsListener>>();
   private readonly registry: readonly LspServerDescriptor[];
   private readonly clientFactory: LspClientFactory;
   private readonly idleTimeoutMs: number;
@@ -126,6 +129,35 @@ export class LspManager {
     }
 
     this.workspaceLeases.set(workspaceId, currentLeaseCount - 1);
+  }
+
+  getWorkspaceDiagnosticsSnapshot(workspaceId: string): WorkspaceLspDiagnosticsSnapshot {
+    const diagnostics = Array.from(this.workspaceDiagnostics.get(workspaceId)?.values() ?? [])
+      .flatMap((diagnosticsForClient) => [...diagnosticsForClient.values()])
+      .sort(compareFileDiagnostics)
+      .map(cloneFileDiagnostics);
+
+    return {
+      workspaceId,
+      diagnostics,
+    };
+  }
+
+  subscribeWorkspaceDiagnostics(
+    workspaceId: string,
+    listener: WorkspaceDiagnosticsListener
+  ): () => void {
+    const listeners =
+      this.workspaceDiagnosticListeners.get(workspaceId) ?? new Set<WorkspaceDiagnosticsListener>();
+    listeners.add(listener);
+    this.workspaceDiagnosticListeners.set(workspaceId, listeners);
+
+    return () => {
+      listeners.delete(listener);
+      if (listeners.size === 0) {
+        this.workspaceDiagnosticListeners.delete(workspaceId);
+      }
+    };
   }
 
   async query(options: LspManagerQueryOptions): Promise<LspManagerQueryResult> {
@@ -284,8 +316,13 @@ export class LspManager {
 
   async dispose(): Promise<void> {
     clearInterval(this.idleInterval);
-    const workspaceIds = [...this.workspaceClients.keys()];
-    await Promise.all(workspaceIds.map(async (workspaceId) => this.disposeWorkspace(workspaceId)));
+    const workspaceIds = new Set([
+      ...this.workspaceClients.keys(),
+      ...this.workspaceDiagnostics.keys(),
+      ...this.workspaceDiagnosticListeners.keys(),
+    ]);
+    await Promise.all([...workspaceIds].map(async (workspaceId) => this.disposeWorkspace(workspaceId)));
+    this.workspaceDiagnosticListeners.clear();
   }
 
   private async getOrCreateClient(
@@ -533,13 +570,15 @@ export class LspManager {
       context.params.uri,
       publishReceipt
     );
+    this.notifyWorkspaceDiagnosticsListeners(context.workspaceId);
   }
 
   private getOrCreateWorkspaceDiagnostics(
     workspaceId: string,
     clientKey: string
   ): Map<string, LspFileDiagnostics> {
-    const workspaceDiagnostics = this.workspaceDiagnostics.get(workspaceId) ?? new Map();
+    const workspaceDiagnostics =
+      this.workspaceDiagnostics.get(workspaceId) ?? new Map<string, Map<string, LspFileDiagnostics>>();
     this.workspaceDiagnostics.set(workspaceId, workspaceDiagnostics);
     const diagnosticsForClient =
       workspaceDiagnostics.get(clientKey) ?? new Map<string, LspFileDiagnostics>();
@@ -551,7 +590,9 @@ export class LspManager {
     workspaceId: string,
     clientKey: string
   ): Map<string, LspDiagnosticPublishReceipt> {
-    const workspacePublishes = this.workspaceDiagnosticPublishes.get(workspaceId) ?? new Map();
+    const workspacePublishes =
+      this.workspaceDiagnosticPublishes.get(workspaceId) ??
+      new Map<string, Map<string, LspDiagnosticPublishReceipt>>();
     this.workspaceDiagnosticPublishes.set(workspaceId, workspacePublishes);
     const publishesForClient =
       workspacePublishes.get(clientKey) ?? new Map<string, LspDiagnosticPublishReceipt>();
@@ -645,7 +686,9 @@ export class LspManager {
     clientKey: string,
     uri: string
   ): Set<LspDiagnosticWaiter> {
-    const workspaceWaiters = this.diagnosticWaiters.get(workspaceId) ?? new Map();
+    const workspaceWaiters =
+      this.diagnosticWaiters.get(workspaceId) ??
+      new Map<string, Map<string, Set<LspDiagnosticWaiter>>>();
     this.diagnosticWaiters.set(workspaceId, workspaceWaiters);
     const clientWaiters =
       workspaceWaiters.get(clientKey) ?? new Map<string, Set<LspDiagnosticWaiter>>();
@@ -666,7 +709,7 @@ export class LspManager {
     if (clientWaiters.size === 0) {
       workspaceWaiters?.delete(clientKey);
     }
-    if (workspaceWaiters && workspaceWaiters.size === 0) {
+    if (workspaceWaiters?.size === 0) {
       this.diagnosticWaiters.delete(workspaceId);
     }
   }
@@ -687,10 +730,23 @@ export class LspManager {
     }
   }
 
+  private notifyWorkspaceDiagnosticsListeners(workspaceId: string): void {
+    const listeners = this.workspaceDiagnosticListeners.get(workspaceId);
+    if (!listeners || listeners.size === 0) {
+      return;
+    }
+
+    const snapshot = this.getWorkspaceDiagnosticsSnapshot(workspaceId);
+    for (const listener of [...listeners]) {
+      listener(snapshot);
+    }
+  }
+
   private clearWorkspaceDiagnostics(workspaceId: string): void {
     this.workspaceDiagnostics.delete(workspaceId);
     this.workspaceDiagnosticPublishes.delete(workspaceId);
     this.diagnosticWaiters.delete(workspaceId);
+    this.notifyWorkspaceDiagnosticsListeners(workspaceId);
   }
 
   private getClientKey(serverId: string, rootUri: string): string {
@@ -841,6 +897,37 @@ function selectPathModule(filePath: string): PathModule {
     return path.win32;
   }
   return path.posix;
+}
+
+function compareFileDiagnostics(left: LspFileDiagnostics, right: LspFileDiagnostics): number {
+  return (
+    left.path.localeCompare(right.path) ||
+    left.serverId.localeCompare(right.serverId) ||
+    left.rootUri.localeCompare(right.rootUri) ||
+    left.uri.localeCompare(right.uri)
+  );
+}
+
+function cloneFileDiagnostics(diagnostics: LspFileDiagnostics): LspFileDiagnostics {
+  return {
+    uri: diagnostics.uri,
+    path: diagnostics.path,
+    serverId: diagnostics.serverId,
+    rootUri: diagnostics.rootUri,
+    version: diagnostics.version,
+    diagnostics: diagnostics.diagnostics.map((diagnostic) => ({
+      ...diagnostic,
+      range: cloneRange(diagnostic.range),
+    })),
+    receivedAtMs: diagnostics.receivedAtMs,
+  };
+}
+
+function cloneRange(range: LspRange): LspRange {
+  return {
+    start: { ...range.start },
+    end: { ...range.end },
+  };
 }
 
 function isFreshDiagnosticPublish(

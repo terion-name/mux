@@ -194,12 +194,13 @@ describe("ServiceContainer", () => {
     ).toBe(true);
   });
 
-  it("exposes desktopSessionManager in the ORPC context", () => {
+  it("exposes desktopSessionManager and lspManager in the ORPC context", () => {
     services = new ServiceContainer(config);
 
     const context = services.toORPCContext();
 
     expect(context.desktopSessionManager).toBe(services.desktopSessionManager);
+    expect(context.lspManager).toBe(services.lspManager);
   });
 
   it("closes desktop sessions during shutdown", async () => {

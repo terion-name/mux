@@ -4,6 +4,7 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type {
   WorkspaceActivitySnapshot,
   WorkspaceChatMessage,
+  WorkspaceLspDiagnosticsSnapshot,
   WorkspaceStatsSnapshot,
   OnChatMode,
   ProvidersConfigMap,
@@ -526,6 +527,13 @@ export class WorkspaceStore {
   // Per-workspace listener refcount for useWorkspaceStatsSnapshot().
   // Used to only subscribe to backend stats when something in the UI is actually reading them.
   private statsListenerCounts = new Map<string, number>();
+
+  // Workspace LSP diagnostics snapshots (from workspace.lsp.subscribeDiagnostics)
+  private workspaceLspDiagnostics = new Map<string, WorkspaceLspDiagnosticsSnapshot>();
+  private lspDiagnosticsStore = new MapStore<string, WorkspaceLspDiagnosticsSnapshot | null>();
+  private lspDiagnosticsUnsubscribers = new Map<string, () => void>();
+  private lspDiagnosticsListenerCounts = new Map<string, number>();
+
   // Cumulative session usage (from session-usage.json)
 
   private sessionUsage = new Map<string, z.infer<typeof SessionUsageFileSchema>>();
@@ -1021,11 +1029,15 @@ export class WorkspaceStore {
       return;
     }
 
-    // Drop stats subscriptions before swapping clients so reconnects resubscribe cleanly.
+    // Drop lazy workspace subscriptions before swapping clients so reconnects resubscribe cleanly.
     for (const unsubscribe of this.statsUnsubscribers.values()) {
       unsubscribe();
     }
     this.statsUnsubscribers.clear();
+    for (const unsubscribe of this.lspDiagnosticsUnsubscribers.values()) {
+      unsubscribe();
+    }
+    this.lspDiagnosticsUnsubscribers.clear();
 
     this.client = client;
     this.clientChangeController.abort();
@@ -1328,6 +1340,58 @@ export class WorkspaceStore {
     })();
 
     this.statsUnsubscribers.set(workspaceId, () => {
+      controller.abort();
+      void iterator?.return?.();
+    });
+  }
+
+  private subscribeToLspDiagnostics(workspaceId: string): void {
+    if (!this.client) {
+      return;
+    }
+
+    if (!this.isWorkspaceRegistered(workspaceId)) {
+      return;
+    }
+    if ((this.lspDiagnosticsListenerCounts.get(workspaceId) ?? 0) <= 0) {
+      return;
+    }
+    if (this.lspDiagnosticsUnsubscribers.has(workspaceId)) {
+      return;
+    }
+
+    const controller = new AbortController();
+    const { signal } = controller;
+    let iterator: AsyncIterator<WorkspaceLspDiagnosticsSnapshot> | null = null;
+
+    (async () => {
+      try {
+        const subscribedIterator = await this.client!.workspace.lsp.subscribeDiagnostics(
+          { workspaceId },
+          { signal }
+        );
+        iterator = subscribedIterator;
+
+        for await (const snapshot of subscribedIterator) {
+          if (signal.aborted) break;
+          queueMicrotask(() => {
+            if (signal.aborted) {
+              return;
+            }
+            this.workspaceLspDiagnostics.set(workspaceId, snapshot);
+            this.lspDiagnosticsStore.bump(workspaceId);
+          });
+        }
+      } catch (error) {
+        if (signal.aborted || isAbortError(error)) return;
+        console.warn(
+          `[WorkspaceStore] Error in LSP diagnostics subscription for ${workspaceId}:`,
+          error
+        );
+      }
+    })();
+
+    this.lspDiagnosticsUnsubscribers.set(workspaceId, () => {
       controller.abort();
       void iterator?.return?.();
     });
@@ -1890,6 +1954,12 @@ export class WorkspaceStore {
     });
   }
 
+  getWorkspaceLspDiagnosticsSnapshot(workspaceId: string): WorkspaceLspDiagnosticsSnapshot | null {
+    return this.lspDiagnosticsStore.get(workspaceId, () => {
+      return this.workspaceLspDiagnostics.get(workspaceId) ?? null;
+    });
+  }
+
   /**
    * Bump state for a workspace to trigger React re-renders.
    * Used by addEphemeralMessage for frontend-only messages.
@@ -2181,6 +2251,46 @@ export class WorkspaceStore {
       }
 
       this.statsListenerCounts.set(workspaceId, currentCount - 1);
+    };
+  }
+
+  subscribeLspDiagnostics(workspaceId: string, listener: () => void): () => void {
+    const unsubscribeFromStore = this.lspDiagnosticsStore.subscribeKey(workspaceId, listener);
+
+    const previousCount = this.lspDiagnosticsListenerCounts.get(workspaceId) ?? 0;
+    const nextCount = previousCount + 1;
+    this.lspDiagnosticsListenerCounts.set(workspaceId, nextCount);
+
+    if (previousCount === 0) {
+      this.subscribeToLspDiagnostics(workspaceId);
+    }
+
+    return () => {
+      unsubscribeFromStore();
+
+      const currentCount = this.lspDiagnosticsListenerCounts.get(workspaceId);
+      if (!currentCount) {
+        console.warn(
+          `[WorkspaceStore] LSP diagnostics listener count underflow for ${workspaceId} (already 0)`
+        );
+        return;
+      }
+
+      if (currentCount === 1) {
+        this.lspDiagnosticsListenerCounts.delete(workspaceId);
+
+        const unsubscribe = this.lspDiagnosticsUnsubscribers.get(workspaceId);
+        if (unsubscribe) {
+          unsubscribe();
+          this.lspDiagnosticsUnsubscribers.delete(workspaceId);
+        }
+        this.workspaceLspDiagnostics.delete(workspaceId);
+        this.lspDiagnosticsStore.bump(workspaceId);
+        this.lspDiagnosticsStore.delete(workspaceId);
+        return;
+      }
+
+      this.lspDiagnosticsListenerCounts.set(workspaceId, currentCount - 1);
     };
   }
 
@@ -3163,6 +3273,9 @@ export class WorkspaceStore {
     // Stats snapshots are subscribed lazily via subscribeStats().
     this.subscribeToStats(workspaceId);
 
+    // LSP diagnostics snapshots are subscribed lazily via subscribeLspDiagnostics().
+    this.subscribeToLspDiagnostics(workspaceId);
+
     this.ensureActiveOnChatSubscription();
 
     if (!this.client) {
@@ -3188,6 +3301,12 @@ export class WorkspaceStore {
     if (statsUnsubscribe) {
       statsUnsubscribe();
       this.statsUnsubscribers.delete(workspaceId);
+    }
+
+    const lspDiagnosticsUnsubscribe = this.lspDiagnosticsUnsubscribers.get(workspaceId);
+    if (lspDiagnosticsUnsubscribe) {
+      lspDiagnosticsUnsubscribe();
+      this.lspDiagnosticsUnsubscribers.delete(workspaceId);
     }
 
     const unsubscribe = this.ipcUnsubscribers.get(workspaceId);
@@ -3218,6 +3337,9 @@ export class WorkspaceStore {
     this.workspaceStats.delete(workspaceId);
     this.statsStore.delete(workspaceId);
     this.statsListenerCounts.delete(workspaceId);
+    this.workspaceLspDiagnostics.delete(workspaceId);
+    this.lspDiagnosticsStore.delete(workspaceId);
+    this.lspDiagnosticsListenerCounts.delete(workspaceId);
     this.historyPagination.delete(workspaceId);
     this.preReplayUsageSnapshot.delete(workspaceId);
     this.sessionUsage.delete(workspaceId);
@@ -3268,6 +3390,10 @@ export class WorkspaceStore {
       unsubscribe();
     }
     this.statsUnsubscribers.clear();
+    for (const unsubscribe of this.lspDiagnosticsUnsubscribers.values()) {
+      unsubscribe();
+    }
+    this.lspDiagnosticsUnsubscribers.clear();
 
     for (const unsubscribe of this.ipcUnsubscribers.values()) {
       unsubscribe();
@@ -3304,6 +3430,9 @@ export class WorkspaceStore {
     this.workspaceStats.clear();
     this.statsStore.clear();
     this.statsListenerCounts.clear();
+    this.workspaceLspDiagnostics.clear();
+    this.lspDiagnosticsStore.clear();
+    this.lspDiagnosticsListenerCounts.clear();
     this.historyPagination.clear();
     this.preReplayUsageSnapshot.clear();
     this.sessionUsage.clear();
@@ -3947,6 +4076,22 @@ export function useWorkspaceStatsSnapshot(workspaceId: string): WorkspaceStatsSn
   );
   const getSnapshot = useCallback(
     () => store.getWorkspaceStatsSnapshot(workspaceId),
+    [store, workspaceId]
+  );
+
+  return useSyncExternalStore(subscribe, getSnapshot);
+}
+
+export function useWorkspaceLspDiagnosticsSnapshot(
+  workspaceId: string
+): WorkspaceLspDiagnosticsSnapshot | null {
+  const store = getStoreInstance();
+  const subscribe = useCallback(
+    (listener: () => void) => store.subscribeLspDiagnostics(workspaceId, listener),
+    [store, workspaceId]
+  );
+  const getSnapshot = useCallback(
+    () => store.getWorkspaceLspDiagnosticsSnapshot(workspaceId),
     [store, workspaceId]
   );
 
