@@ -6,6 +6,16 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { CreateLspClientOptions, LspClientInstance, LspServerDescriptor } from "./types";
 import { LspManager } from "./lspManager";
 
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
 describe("LspManager", () => {
   let workspacePath: string;
 
@@ -94,6 +104,79 @@ describe("LspManager", () => {
     }
     expect(lastQueryRequest.line).toBe(1);
     expect(lastQueryRequest.character).toBe(2);
+
+    await manager.dispose();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  test("deduplicates concurrent client creation for the same workspace root", async () => {
+    const ensureFile = mock(() => Promise.resolve(undefined));
+    const query = mock(() =>
+      Promise.resolve({
+        operation: "hover" as const,
+        hover: "const value: 1",
+      })
+    );
+    const close = mock(() => Promise.resolve(undefined));
+    const client: LspClientInstance = {
+      isClosed: false,
+      ensureFile,
+      query,
+      close,
+    };
+    const clientReady = createDeferred<LspClientInstance>();
+    const clientFactoryStarted = createDeferred<void>();
+    const clientFactory = mock((_options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      clientFactoryStarted.resolve();
+      return clientReady.promise;
+    });
+    const registry: readonly LspServerDescriptor[] = [
+      {
+        id: "typescript",
+        extensions: [".ts"],
+        command: "fake-lsp",
+        args: ["--stdio"],
+        rootMarkers: ["package.json", ".git"],
+        languageIdForPath: () => "typescript",
+      },
+    ];
+
+    const manager = new LspManager({
+      registry,
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    const firstQuery = manager.query({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePath: "src/example.ts",
+      operation: "hover",
+      line: 1,
+      column: 1,
+    });
+    await clientFactoryStarted.promise;
+
+    const secondQuery = manager.query({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePath: "src/example.ts",
+      operation: "hover",
+      line: 1,
+      column: 1,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(clientFactory).toHaveBeenCalledTimes(1);
+
+    clientReady.resolve(client);
+    const [firstResult, secondResult] = await Promise.all([firstQuery, secondQuery]);
+
+    expect(firstResult.hover).toBe("const value: 1");
+    expect(secondResult.hover).toBe("const value: 1");
+    expect(ensureFile).toHaveBeenCalledTimes(2);
 
     await manager.dispose();
     expect(close).toHaveBeenCalledTimes(1);

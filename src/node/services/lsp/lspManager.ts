@@ -28,6 +28,7 @@ import type {
 
 interface WorkspaceClients {
   clients: Map<string, LspClientInstance>;
+  pendingClients: Map<string, Promise<LspClientInstance>>;
   lastActivity: number;
 }
 
@@ -147,8 +148,16 @@ export class LspManager {
     }
 
     this.workspaceClients.delete(workspaceId);
+    const pendingClients = await Promise.allSettled(entry.pendingClients.values());
+    const clientsToClose = new Set(entry.clients.values());
+    for (const result of pendingClients) {
+      if (result.status === "fulfilled") {
+        clientsToClose.add(result.value);
+      }
+    }
+
     await Promise.all(
-      [...entry.clients.values()].map(async (client) => {
+      [...clientsToClose].map(async (client) => {
         try {
           await client.close();
         } catch (error) {
@@ -176,6 +185,7 @@ export class LspManager {
   ): Promise<LspClientInstance> {
     const workspaceEntry = this.workspaceClients.get(workspaceId) ?? {
       clients: new Map<string, LspClientInstance>(),
+      pendingClients: new Map<string, Promise<LspClientInstance>>(),
       lastActivity: Date.now(),
     };
     this.workspaceClients.set(workspaceId, workspaceEntry);
@@ -191,15 +201,49 @@ export class LspManager {
       workspaceEntry.clients.delete(clientKey);
     }
 
-    const client = await this.clientFactory({
+    const pendingClient = workspaceEntry.pendingClients.get(clientKey);
+    if (pendingClient) {
+      return await pendingClient;
+    }
+
+    // Deduplicate concurrent queries for the same workspace/root so we never spawn
+    // orphaned LSP processes that escape manager tracking.
+    const clientPromise = this.clientFactory({
       descriptor,
       runtime,
       rootPath,
       rootUri,
-    });
-    workspaceEntry.clients.set(clientKey, client);
-    workspaceEntry.lastActivity = Date.now();
-    return client;
+    })
+      .then(async (client) => {
+        const currentWorkspaceEntry = this.workspaceClients.get(workspaceId);
+        if (currentWorkspaceEntry !== workspaceEntry) {
+          try {
+            await client.close();
+          } catch (error) {
+            log.debug("Failed to close LSP client created after workspace disposal", {
+              workspaceId,
+              clientKey,
+              error,
+            });
+          }
+          throw new Error(
+            `LSP workspace ${workspaceId} was disposed while starting ${descriptor.id}`
+          );
+        }
+
+        workspaceEntry.clients.set(clientKey, client);
+        workspaceEntry.lastActivity = Date.now();
+        return client;
+      })
+      .finally(() => {
+        const currentWorkspaceEntry = this.workspaceClients.get(workspaceId);
+        if (currentWorkspaceEntry === workspaceEntry) {
+          workspaceEntry.pendingClients.delete(clientKey);
+        }
+      });
+
+    workspaceEntry.pendingClients.set(clientKey, clientPromise);
+    return await clientPromise;
   }
 
   private markActivity(workspaceId: string): void {

@@ -22,6 +22,7 @@ export class LspStdioTransport {
   private running = false;
   private closed = false;
   private stderrTail = "";
+  private sendQueue = Promise.resolve();
 
   onclose?: () => void;
   onerror?: (error: Error) => void;
@@ -51,8 +52,17 @@ export class LspStdioTransport {
   async send(message: LspJsonRpcMessage): Promise<void> {
     const body = this.encoder.encode(JSON.stringify(message));
     const header = this.encoder.encode(`Content-Length: ${body.byteLength}\r\n\r\n`);
-    await this.stdinWriter.write(header);
-    await this.stdinWriter.write(body);
+    const frame = new Uint8Array(header.byteLength + body.byteLength);
+    frame.set(header);
+    frame.set(body, header.byteLength);
+
+    // Serialize framed writes so concurrent requests cannot interleave bytes and
+    // corrupt Content-Length boundaries on the shared stdio stream.
+    const writePromise = this.sendQueue.then(async () => {
+      await this.stdinWriter.write(frame);
+    });
+    this.sendQueue = writePromise.catch(() => undefined);
+    await writePromise;
   }
 
   getStderrTail(): string {
@@ -183,4 +193,3 @@ export class LspStdioTransport {
     log.error("LSP stdio transport error", { error: typedError });
   }
 }
-
