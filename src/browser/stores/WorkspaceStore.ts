@@ -1062,6 +1062,9 @@ export class WorkspaceStore {
     for (const workspaceId of this.statsListenerCounts.keys()) {
       this.subscribeToStats(workspaceId);
     }
+    for (const workspaceId of this.lspDiagnosticsListenerCounts.keys()) {
+      this.subscribeToLspDiagnostics(workspaceId);
+    }
 
     this.ensureActiveOnChatSubscription();
     void this.refreshProvidersConfig(client);
@@ -1345,8 +1348,22 @@ export class WorkspaceStore {
     });
   }
 
+  private canContinueLspDiagnosticsSubscription(
+    workspaceId: string,
+    client: RouterClient<AppRouter>,
+    signal: AbortSignal
+  ): boolean {
+    return (
+      !signal.aborted &&
+      this.client === client &&
+      this.isWorkspaceRegistered(workspaceId) &&
+      (this.lspDiagnosticsListenerCounts.get(workspaceId) ?? 0) > 0
+    );
+  }
+
   private subscribeToLspDiagnostics(workspaceId: string): void {
-    if (!this.client) {
+    const client = this.client;
+    if (!client) {
       return;
     }
 
@@ -1365,29 +1382,62 @@ export class WorkspaceStore {
     let iterator: AsyncIterator<WorkspaceLspDiagnosticsSnapshot> | null = null;
 
     (async () => {
-      try {
-        const subscribedIterator = await this.client!.workspace.lsp.subscribeDiagnostics(
-          { workspaceId },
-          { signal }
-        );
-        iterator = subscribedIterator;
+      let attempt = 0;
 
-        for await (const snapshot of subscribedIterator) {
-          if (signal.aborted) break;
-          queueMicrotask(() => {
-            if (signal.aborted) {
+      while (this.canContinueLspDiagnosticsSubscription(workspaceId, client, signal)) {
+        try {
+          const subscribedIterator = await client.workspace.lsp.subscribeDiagnostics(
+            { workspaceId },
+            { signal }
+          );
+
+          if (!this.canContinueLspDiagnosticsSubscription(workspaceId, client, signal)) {
+            void subscribedIterator.return?.();
+            return;
+          }
+
+          iterator = subscribedIterator;
+
+          for await (const snapshot of subscribedIterator) {
+            if (!this.canContinueLspDiagnosticsSubscription(workspaceId, client, signal)) {
               return;
             }
-            this.workspaceLspDiagnostics.set(workspaceId, snapshot);
-            this.lspDiagnosticsStore.bump(workspaceId);
-          });
+
+            attempt = 0;
+            queueMicrotask(() => {
+              if (!this.canContinueLspDiagnosticsSubscription(workspaceId, client, signal)) {
+                return;
+              }
+              this.workspaceLspDiagnostics.set(workspaceId, snapshot);
+              this.lspDiagnosticsStore.bump(workspaceId);
+            });
+          }
+
+          if (!this.canContinueLspDiagnosticsSubscription(workspaceId, client, signal)) {
+            return;
+          }
+
+          console.warn(
+            `[WorkspaceStore] LSP diagnostics subscription ended unexpectedly for ${workspaceId}; retrying...`
+          );
+        } catch (error) {
+          if (!this.canContinueLspDiagnosticsSubscription(workspaceId, client, signal)) {
+            return;
+          }
+          if (!isAbortError(error)) {
+            console.warn(
+              `[WorkspaceStore] Error in LSP diagnostics subscription for ${workspaceId}:`,
+              error
+            );
+          }
+        } finally {
+          void iterator?.return?.();
+          iterator = null;
         }
-      } catch (error) {
-        if (signal.aborted || isAbortError(error)) return;
-        console.warn(
-          `[WorkspaceStore] Error in LSP diagnostics subscription for ${workspaceId}:`,
-          error
-        );
+
+        const delayMs = calculateSubscriptionBackoffMs(attempt);
+        attempt++;
+        await this.sleepWithAbort(delayMs, signal);
       }
     })();
 

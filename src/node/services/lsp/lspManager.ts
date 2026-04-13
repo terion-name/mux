@@ -50,7 +50,7 @@ interface LspDiagnosticPublishReceipt {
   receivedAtMs: number;
 }
 
-type LspDiagnosticWaiter = (publish: LspDiagnosticPublishReceipt) => void;
+type LspDiagnosticWaiter = (publish?: LspDiagnosticPublishReceipt) => void;
 type WorkspaceDiagnosticsListener = (snapshot: WorkspaceLspDiagnosticsSnapshot) => void;
 type LspClientFactory = (options: CreateLspClientOptions) => Promise<LspClientInstance>;
 
@@ -96,7 +96,10 @@ export class LspManager {
     string,
     Map<string, Map<string, Set<LspDiagnosticWaiter>>>
   >();
-  private readonly workspaceDiagnosticListeners = new Map<string, Set<WorkspaceDiagnosticsListener>>();
+  private readonly workspaceDiagnosticListeners = new Map<
+    string,
+    Set<WorkspaceDiagnosticsListener>
+  >();
   private readonly registry: readonly LspServerDescriptor[];
   private readonly clientFactory: LspClientFactory;
   private readonly idleTimeoutMs: number;
@@ -321,7 +324,9 @@ export class LspManager {
       ...this.workspaceDiagnostics.keys(),
       ...this.workspaceDiagnosticListeners.keys(),
     ]);
-    await Promise.all([...workspaceIds].map(async (workspaceId) => this.disposeWorkspace(workspaceId)));
+    await Promise.all(
+      [...workspaceIds].map(async (workspaceId) => this.disposeWorkspace(workspaceId))
+    );
     this.workspaceDiagnosticListeners.clear();
   }
 
@@ -578,7 +583,8 @@ export class LspManager {
     clientKey: string
   ): Map<string, LspFileDiagnostics> {
     const workspaceDiagnostics =
-      this.workspaceDiagnostics.get(workspaceId) ?? new Map<string, Map<string, LspFileDiagnostics>>();
+      this.workspaceDiagnostics.get(workspaceId) ??
+      new Map<string, Map<string, LspFileDiagnostics>>();
     this.workspaceDiagnostics.set(workspaceId, workspaceDiagnostics);
     const diagnosticsForClient =
       workspaceDiagnostics.get(clientKey) ?? new Map<string, LspFileDiagnostics>();
@@ -657,6 +663,10 @@ export class LspManager {
       };
 
       const onPublish: LspDiagnosticWaiter = (publish) => {
+        if (!publish) {
+          finish(undefined);
+          return;
+        }
         if (
           !isFreshDiagnosticPublish(publish, params.previousReceivedAtMs, params.expectedVersion)
         ) {
@@ -714,6 +724,21 @@ export class LspManager {
     }
   }
 
+  private settleWorkspaceDiagnosticWaiters(workspaceId: string): void {
+    const workspaceWaiters = this.diagnosticWaiters.get(workspaceId);
+    if (!workspaceWaiters) {
+      return;
+    }
+
+    for (const clientWaiters of workspaceWaiters.values()) {
+      for (const waiters of clientWaiters.values()) {
+        for (const waiter of [...waiters]) {
+          waiter(undefined);
+        }
+      }
+    }
+  }
+
   private notifyDiagnosticWaiters(
     workspaceId: string,
     clientKey: string,
@@ -743,6 +768,7 @@ export class LspManager {
   }
 
   private clearWorkspaceDiagnostics(workspaceId: string): void {
+    this.settleWorkspaceDiagnosticWaiters(workspaceId);
     this.workspaceDiagnostics.delete(workspaceId);
     this.workspaceDiagnosticPublishes.delete(workspaceId);
     this.diagnosticWaiters.delete(workspaceId);

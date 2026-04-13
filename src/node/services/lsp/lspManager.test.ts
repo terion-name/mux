@@ -22,6 +22,17 @@ function createDeferred<T>() {
   return { promise, resolve, reject };
 }
 
+async function waitUntil(condition: () => boolean, timeoutMs = 2000): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (condition()) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return false;
+}
+
 function createRegistry(): readonly LspServerDescriptor[] {
   return [
     {
@@ -503,6 +514,70 @@ describe("LspManager", () => {
     expect(snapshots.at(-1)?.diagnostics).toEqual([]);
 
     unsubscribe();
+  });
+
+  test("disposeWorkspace settles pending diagnostics waits promptly", async () => {
+    const ensureFile = mock(() => Promise.resolve(1));
+    const close = mock(() => Promise.resolve(undefined));
+    const clientFactory = mock((_options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile,
+        query: mock(() => Promise.resolve({ operation: "hover" as const, hover: "unused" })),
+        close,
+      });
+    });
+
+    const manager = new LspManager({
+      registry: createRegistry(),
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    const diagnosticsPromise = manager.collectPostMutationDiagnostics({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePaths: ["src/example.ts"],
+      timeoutMs: 10_000,
+    });
+
+    const diagnosticWaiters = (
+      manager as unknown as {
+        diagnosticWaiters: Map<string, Map<string, Map<string, Set<unknown>>>>;
+      }
+    ).diagnosticWaiters;
+    const waiterRegistered = await waitUntil(() => {
+      const workspaceWaiters = diagnosticWaiters.get("ws-1");
+      if (!workspaceWaiters) {
+        return false;
+      }
+      for (const clientWaiters of workspaceWaiters.values()) {
+        for (const waiters of clientWaiters.values()) {
+          if (waiters.size > 0) {
+            return true;
+          }
+        }
+      }
+      return false;
+    });
+    expect(waiterRegistered).toBe(true);
+
+    await manager.disposeWorkspace("ws-1");
+
+    const completion = await Promise.race([
+      diagnosticsPromise.then((diagnostics) => ({ type: "resolved" as const, diagnostics })),
+      new Promise<{ type: "timeout" }>((resolve) => {
+        setTimeout(() => resolve({ type: "timeout" }), 200);
+      }),
+    ]);
+    expect(completion.type).toBe("resolved");
+    if (completion.type !== "resolved") {
+      throw new Error("Expected diagnostics wait to resolve after workspace disposal");
+    }
+    expect(completion.diagnostics).toEqual([]);
+    expect(diagnosticWaiters.has("ws-1")).toBe(false);
+    expect(close).toHaveBeenCalledTimes(1);
   });
 
   test("ignores malformed publishes in workspace snapshots", async () => {
