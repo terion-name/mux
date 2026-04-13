@@ -516,6 +516,128 @@ describe("LspManager", () => {
     unsubscribe();
   });
 
+  test("ignores late diagnostics publishes from disposed clients", async () => {
+    let clientOptions: CreateLspClientOptions | undefined;
+    let ensuredFile: Parameters<LspClientInstance["ensureFile"]>[0] | undefined;
+    const ensureFile = mock((file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+      ensuredFile = file;
+      clientOptions?.onPublishDiagnostics?.({
+        uri: file.uri,
+        version: 1,
+        diagnostics: [createDiagnostic("first pass")],
+        rawDiagnosticCount: 1,
+      });
+      return Promise.resolve(1);
+    });
+    const close = mock(() => Promise.resolve(undefined));
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      clientOptions = options;
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile,
+        query: mock(() => Promise.resolve({ operation: "hover" as const, hover: "unused" })),
+        close,
+      });
+    });
+
+    const manager = new LspManager({
+      registry: createRegistry(),
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    const diagnostics = await manager.collectPostMutationDiagnostics({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePaths: ["src/example.ts"],
+      timeoutMs: 20,
+    });
+    expect(diagnostics).toHaveLength(1);
+
+    await manager.disposeWorkspace("ws-1");
+    expect(manager.getWorkspaceDiagnosticsSnapshot("ws-1").diagnostics).toEqual([]);
+
+    if (!clientOptions || !ensuredFile) {
+      throw new Error("Expected the LSP client to publish diagnostics for the test file");
+    }
+
+    clientOptions.onPublishDiagnostics?.({
+      uri: ensuredFile.uri,
+      version: 2,
+      diagnostics: [createDiagnostic("late publish")],
+      rawDiagnosticCount: 1,
+    });
+
+    expect(manager.getWorkspaceDiagnosticsSnapshot("ws-1").diagnostics).toEqual([]);
+    const workspaceDiagnostics = (
+      manager as unknown as {
+        workspaceDiagnostics: Map<string, Map<string, Map<string, unknown>>>;
+      }
+    ).workspaceDiagnostics;
+    expect(workspaceDiagnostics.has("ws-1")).toBe(false);
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  test("collectPostMutationDiagnostics exits promptly when disposal wins before waiter registration", async () => {
+    const ensureFile = mock(() => Promise.resolve(1));
+    const close = mock(() => Promise.resolve(undefined));
+    const clientFactory = mock((_options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile,
+        query: mock(() => Promise.resolve({ operation: "hover" as const, hover: "unused" })),
+        close,
+      });
+    });
+
+    const manager = new LspManager({
+      registry: createRegistry(),
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+    const managerWithInternals = manager as unknown as {
+      diagnosticWaiters: Map<string, Map<string, Map<string, Set<unknown>>>>;
+      waitForFreshDiagnostics: (params: {
+        workspaceId: string;
+        workspaceGeneration: number;
+        clientKey: string;
+        uri: string;
+        previousReceivedAtMs?: number;
+        expectedVersion: number;
+        timeoutMs: number;
+      }) => Promise<unknown>;
+    };
+    const originalWaitForFreshDiagnostics =
+      managerWithInternals.waitForFreshDiagnostics.bind(managerWithInternals);
+    managerWithInternals.waitForFreshDiagnostics = async (params) => {
+      await manager.disposeWorkspace("ws-1");
+      return await originalWaitForFreshDiagnostics(params);
+    };
+
+    const diagnosticsPromise = manager.collectPostMutationDiagnostics({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePaths: ["src/example.ts"],
+      timeoutMs: 10_000,
+    });
+
+    const completion = await Promise.race([
+      diagnosticsPromise.then((diagnostics) => ({ type: "resolved" as const, diagnostics })),
+      new Promise<{ type: "timeout" }>((resolve) => {
+        setTimeout(() => resolve({ type: "timeout" }), 200);
+      }),
+    ]);
+    expect(completion.type).toBe("resolved");
+    if (completion.type !== "resolved") {
+      throw new Error("Expected diagnostics collection to resolve after workspace disposal");
+    }
+    expect(completion.diagnostics).toEqual([]);
+    expect(managerWithInternals.diagnosticWaiters.has("ws-1")).toBe(false);
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
   test("disposeWorkspace settles pending diagnostics waits promptly", async () => {
     const ensureFile = mock(() => Promise.resolve(1));
     const close = mock(() => Promise.resolve(undefined));

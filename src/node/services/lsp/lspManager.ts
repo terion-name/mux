@@ -39,6 +39,7 @@ interface WorkspaceClients {
 interface ResolvedLspClientContext {
   client: LspClientInstance;
   clientKey: string;
+  workspaceGeneration: number;
   descriptor: LspServerDescriptor;
   fileHandle: LspClientFileHandle;
   pathMapper: LspPathMapper;
@@ -83,6 +84,9 @@ export interface LspManagerCollectDiagnosticsOptions {
 
 export class LspManager {
   private readonly workspaceClients = new Map<string, WorkspaceClients>();
+  // Disposal bumps the generation so late publishes from closing clients and stale
+  // post-mutation waits cannot recreate diagnostics for an already-cleared workspace.
+  private readonly workspaceGenerations = new Map<string, number>();
   private readonly workspaceLeases = new Map<string, number>();
   private readonly workspaceDiagnostics = new Map<
     string,
@@ -242,6 +246,7 @@ export class LspManager {
                     const expectedVersion = await context.client.ensureFile(context.fileHandle);
                     const freshPublish = await this.waitForFreshDiagnostics({
                       workspaceId: options.workspaceId,
+                      workspaceGeneration: context.workspaceGeneration,
                       clientKey: context.clientKey,
                       uri: context.fileHandle.uri,
                       previousReceivedAtMs: previousPublish?.receivedAtMs,
@@ -287,6 +292,8 @@ export class LspManager {
   }
 
   async disposeWorkspace(workspaceId: string): Promise<void> {
+    this.workspaceGenerations.set(workspaceId, this.getWorkspaceGeneration(workspaceId) + 1);
+
     const entry = this.workspaceClients.get(workspaceId);
     if (!entry) {
       this.clearWorkspaceDiagnostics(workspaceId);
@@ -337,7 +344,7 @@ export class LspManager {
     pathMapper: LspPathMapper,
     rootPath: string,
     rootUri: string
-  ): Promise<{ client: LspClientInstance; clientKey: string }> {
+  ): Promise<{ client: LspClientInstance; clientKey: string; workspaceGeneration: number }> {
     const workspaceEntry = this.workspaceClients.get(workspaceId) ?? {
       clients: new Map<string, LspClientInstance>(),
       pendingClients: new Map<string, Promise<LspClientInstance>>(),
@@ -346,10 +353,11 @@ export class LspManager {
     this.workspaceClients.set(workspaceId, workspaceEntry);
 
     const clientKey = this.getClientKey(descriptor.id, rootUri);
+    const workspaceGeneration = this.getWorkspaceGeneration(workspaceId);
     const existingClient = workspaceEntry.clients.get(clientKey);
     if (existingClient && !existingClient.isClosed) {
       workspaceEntry.lastActivity = Date.now();
-      return { client: existingClient, clientKey };
+      return { client: existingClient, clientKey, workspaceGeneration };
     }
 
     if (existingClient?.isClosed) {
@@ -361,6 +369,7 @@ export class LspManager {
       return {
         client: await pendingClient,
         clientKey,
+        workspaceGeneration,
       };
     }
 
@@ -374,6 +383,7 @@ export class LspManager {
       onPublishDiagnostics: (params) =>
         this.handlePublishDiagnostics({
           workspaceId,
+          workspaceGeneration,
           clientKey,
           serverId: descriptor.id,
           rootUri,
@@ -413,6 +423,7 @@ export class LspManager {
     return {
       client: await clientPromise,
       clientKey,
+      workspaceGeneration,
     };
   }
 
@@ -463,6 +474,7 @@ export class LspManager {
     return {
       client: clientResult.client,
       clientKey: clientResult.clientKey,
+      workspaceGeneration: clientResult.workspaceGeneration,
       descriptor,
       fileHandle,
       pathMapper,
@@ -477,6 +489,10 @@ export class LspManager {
     }
 
     entry.lastActivity = Date.now();
+  }
+
+  private getWorkspaceGeneration(workspaceId: string): number {
+    return this.workspaceGenerations.get(workspaceId) ?? 0;
   }
 
   private async cleanupIdleWorkspaces(): Promise<void> {
@@ -529,12 +545,17 @@ export class LspManager {
 
   private handlePublishDiagnostics(context: {
     workspaceId: string;
+    workspaceGeneration: number;
     clientKey: string;
     serverId: string;
     rootUri: string;
     pathMapper: LspPathMapper;
     params: LspPublishDiagnosticsParams;
   }): void {
+    if (context.workspaceGeneration !== this.getWorkspaceGeneration(context.workspaceId)) {
+      return;
+    }
+
     if (isMalformedDiagnosticPublish(context.params)) {
       return;
     }
@@ -624,12 +645,17 @@ export class LspManager {
 
   private async waitForFreshDiagnostics(params: {
     workspaceId: string;
+    workspaceGeneration: number;
     clientKey: string;
     uri: string;
     previousReceivedAtMs?: number;
     expectedVersion: number;
     timeoutMs: number;
   }): Promise<LspDiagnosticPublishReceipt | undefined> {
+    if (params.workspaceGeneration !== this.getWorkspaceGeneration(params.workspaceId)) {
+      return undefined;
+    }
+
     const existingPublish = this.getLatestDiagnosticPublish(
       params.workspaceId,
       params.clientKey,
@@ -645,9 +671,14 @@ export class LspManager {
       let settled = false;
       const workspaceWaiters = this.getOrCreateDiagnosticWaiters(
         params.workspaceId,
+        params.workspaceGeneration,
         params.clientKey,
         params.uri
       );
+      if (!workspaceWaiters) {
+        resolve(undefined);
+        return;
+      }
 
       const finish = (publish?: LspDiagnosticPublishReceipt) => {
         if (settled) {
@@ -693,9 +724,14 @@ export class LspManager {
 
   private getOrCreateDiagnosticWaiters(
     workspaceId: string,
+    workspaceGeneration: number,
     clientKey: string,
     uri: string
-  ): Set<LspDiagnosticWaiter> {
+  ): Set<LspDiagnosticWaiter> | undefined {
+    if (workspaceGeneration !== this.getWorkspaceGeneration(workspaceId)) {
+      return undefined;
+    }
+
     const workspaceWaiters =
       this.diagnosticWaiters.get(workspaceId) ??
       new Map<string, Map<string, Set<LspDiagnosticWaiter>>>();
