@@ -18,6 +18,8 @@ import type { TodoItem } from "@/common/types/tools";
 import { WorkspaceStore } from "./WorkspaceStore";
 import type { ResponseCompleteEvent } from "@/browser/utils/messages/responseCompletionMetadata";
 
+type WorkspaceStoreClient = NonNullable<Parameters<WorkspaceStore["setClient"]>[0]>;
+
 interface LoadMoreResponse {
   messages: WorkspaceChatMessage[];
   nextCursor: { beforeHistorySequence: number; beforeMessageId?: string | null } | null;
@@ -4730,7 +4732,7 @@ describe("WorkspaceStore", () => {
       const oldAborted = await waitUntil(() => oldSignal?.aborted === true);
       expect(oldAborted).toBe(true);
 
-      store.setClient(mockClient as any);
+      store.setClient(mockClient as unknown as WorkspaceStoreClient);
       const resubscribed = await waitUntil(
         () => mockSubscribeLspDiagnostics.mock.calls.length === 2
       );
@@ -4801,7 +4803,7 @@ describe("WorkspaceStore", () => {
         },
         terminal: mockClient.terminal,
       };
-      store.setClient(customClient as any);
+      store.setClient(customClient as unknown as WorkspaceStoreClient);
 
       const workspaceId = "lsp-diagnostics-retry";
       createAndAddWorkspace(store, workspaceId);

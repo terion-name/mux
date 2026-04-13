@@ -867,9 +867,9 @@ describe("task_apply_git_patch tool", () => {
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
       runtimeTempDir: "/tmp",
       workspaceSessionDir: sessionDir,
-      onFilesMutated: async (params) => {
+      onFilesMutated: (params) => {
         mutationCalls.push(params);
-        return undefined;
+        return Promise.resolve(undefined);
       },
     });
 
@@ -955,9 +955,9 @@ describe("task_apply_git_patch tool", () => {
       runtime,
       runtimeTempDir: "/tmp",
       workspaceSessionDir: sessionDir,
-      onFilesMutated: async (params) => {
+      onFilesMutated: (params) => {
         mutationCalls.push(params);
-        return "should not run";
+        return Promise.resolve("should not run");
       },
     });
 
@@ -993,9 +993,11 @@ describe("task_apply_git_patch tool", () => {
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
       runtimeTempDir: "/tmp",
       workspaceSessionDir: fixture.sessionDir,
-      onFilesMutated: async (params) => {
+      onFilesMutated: (params) => {
         mutationCalls.push(params);
-        return "Post-edit LSP diagnostics:\n- README.md:2:1 error TS1000: patch issue";
+        return Promise.resolve(
+          "Post-edit LSP diagnostics:\n- README.md:2:1 error TS1000: patch issue"
+        );
       },
     });
 
@@ -1013,8 +1015,8 @@ describe("task_apply_git_patch tool", () => {
 
   it("does not request post-apply diagnostics for dry runs", async () => {
     const fixture = await setupSingleProjectPatchFixture(rootDir, "dry-run");
-    const onFilesMutated = async (_params: { filePaths: string[] }) => {
-      throw new Error("should not be called");
+    const onFilesMutated = (_params: { filePaths: string[] }) => {
+      return Promise.reject(new Error("should not be called"));
     };
     const tool = createTaskApplyGitPatchTool({
       ...getTestDeps(),

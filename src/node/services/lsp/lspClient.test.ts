@@ -1,4 +1,5 @@
 import { describe, expect, it, mock } from "bun:test";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { LspClient } from "./lspClient";
 import type {
   CreateLspClientOptions,
@@ -37,23 +38,22 @@ function createTransport() {
   };
 }
 
+type LspClientConstructor = new (
+  clientOptions: CreateLspClientOptions,
+  transport: ReturnType<typeof createTransport>
+) => LspClient;
+
 function createClient(options?: Partial<CreateLspClientOptions>) {
   const transport = createTransport();
-  const client = new (LspClient as unknown as {
-    new (
-      clientOptions: CreateLspClientOptions,
-      transport: ReturnType<typeof createTransport>
-    ): LspClient;
-  })(
-    {
-      descriptor: createDescriptor(),
-      runtime: {} as never,
-      rootPath: "/tmp/workspace",
-      rootUri: "file:///tmp/workspace",
-      ...options,
-    },
-    transport
-  );
+  const ClientConstructor = LspClient as unknown as LspClientConstructor;
+  const clientOptions: CreateLspClientOptions = {
+    descriptor: createDescriptor(),
+    runtime: new LocalRuntime("/tmp/workspace"),
+    rootPath: "/tmp/workspace",
+    rootUri: "file:///tmp/workspace",
+    ...options,
+  };
+  const client = new ClientConstructor(clientOptions, transport);
 
   return {
     client,

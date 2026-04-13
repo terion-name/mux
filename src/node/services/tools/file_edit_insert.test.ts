@@ -150,9 +150,11 @@ describe("file_edit_insert tool", () => {
       cwd: testDir,
       runtime: createRuntime({ type: "local", srcBaseDir: testDir }),
       runtimeTempDir: testDir,
-      onFilesMutated: async (params) => {
+      onFilesMutated: (params) => {
         mutationCalls.push(params);
-        return "Post-edit LSP diagnostics:\n- diagnostics.txt:1:1 warning TS1000: created";
+        return Promise.resolve(
+          "Post-edit LSP diagnostics:\n- diagnostics.txt:1:1 warning TS1000: created"
+        );
       },
     });
     const args: FileEditInsertToolArgs = {
