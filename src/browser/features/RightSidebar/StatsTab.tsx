@@ -1,6 +1,11 @@
 import React from "react";
 
-import type { WorkspaceStatsSnapshot, WorkspaceLspDiagnosticsSnapshot } from "@/common/orpc/types";
+import type {
+  WorkspaceStatsSnapshot,
+  WorkspaceLspDiagnosticsSnapshot,
+  LspDiagnostic,
+  LspFileDiagnostics,
+} from "@/common/orpc/types";
 
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import {
@@ -32,15 +37,17 @@ const VIEW_MODE_OPTIONS: Array<ToggleOption<ViewMode>> = [
   { value: "last-request", label: "Last Request" },
 ];
 
-const DIAGNOSTIC_SEVERITY_LABELS: Record<1 | 2 | 3 | 4, string> = {
+type DiagnosticSeverityBucket = 1 | 2 | 3 | 4 | "unknown";
+
+const DIAGNOSTIC_SEVERITY_LABELS: Record<Exclude<DiagnosticSeverityBucket, "unknown">, string> = {
   1: "Error",
   2: "Warning",
   3: "Information",
   4: "Hint",
 };
 
-function getDiagnosticSeverityLabel(severity?: 1 | 2 | 3 | 4): string {
-  if (severity == null) {
+function getDiagnosticSeverityLabel(severity?: DiagnosticSeverityBucket): string {
+  if (severity == null || severity === "unknown") {
     return "Unknown";
   }
 
@@ -51,12 +58,31 @@ function formatDiagnosticLocation(line: number, character: number): string {
   return `Line ${line + 1}, Column ${character + 1}`;
 }
 
+function getDiagnosticsFileIdentity(file: LspFileDiagnostics): string {
+  return [file.serverId, file.rootUri, file.uri].join("::");
+}
+
+function getDiagnosticIdentity(file: LspFileDiagnostics, diagnostic: LspDiagnostic): string {
+  return [
+    getDiagnosticsFileIdentity(file),
+    diagnostic.range.start.line,
+    diagnostic.range.start.character,
+    diagnostic.range.end.line,
+    diagnostic.range.end.character,
+    diagnostic.severity ?? "unknown",
+    diagnostic.source ?? "",
+    diagnostic.code ?? "",
+    diagnostic.message,
+  ].join("::");
+}
+
 function collectDiagnosticsSummary(snapshot: WorkspaceLspDiagnosticsSnapshot) {
-  const counts: Record<1 | 2 | 3 | 4, number> = {
+  const counts: Record<DiagnosticSeverityBucket, number> = {
     1: 0,
     2: 0,
     3: 0,
     4: 0,
+    unknown: 0,
   };
 
   const files = snapshot.diagnostics.filter((file) => file.diagnostics.length > 0);
@@ -65,9 +91,7 @@ function collectDiagnosticsSummary(snapshot: WorkspaceLspDiagnosticsSnapshot) {
   for (const file of files) {
     totalDiagnostics += file.diagnostics.length;
     for (const diagnostic of file.diagnostics) {
-      if (diagnostic.severity != null) {
-        counts[diagnostic.severity] += 1;
-      }
+      counts[diagnostic.severity ?? "unknown"] += 1;
     }
   }
 
@@ -865,7 +889,7 @@ export function DiagnosticsPanel(props: DiagnosticsPanelProps) {
     );
   }
 
-  const summaryParts = ([1, 2, 3, 4] as const)
+  const summaryParts = ([1, 2, 3, 4, "unknown"] as const)
     .flatMap((severity) => {
       const count = counts[severity];
       if (count === 0) {
@@ -890,38 +914,47 @@ export function DiagnosticsPanel(props: DiagnosticsPanelProps) {
       </div>
 
       <div className="flex flex-col gap-4">
-        {files.map((file) => (
-          <section
-            key={`${file.path}-${file.receivedAtMs}`}
-            className="border-border rounded border p-3"
-          >
-            <div className="mb-3 flex flex-col gap-1">
-              <h3 className="text-foreground font-medium break-all">{file.path}</h3>
-              <p className="text-muted text-xs">Server: {file.serverId}</p>
-            </div>
+        {files.map((file) => {
+          const fileIdentity = getDiagnosticsFileIdentity(file);
+          const duplicateDiagnosticCounts = new Map<string, number>();
 
-            <ul className="flex flex-col gap-3">
-              {file.diagnostics.map((diagnostic, index) => {
-                const metadata = [
-                  getDiagnosticSeverityLabel(diagnostic.severity),
-                  formatDiagnosticLocation(
-                    diagnostic.range.start.line,
-                    diagnostic.range.start.character
-                  ),
-                  diagnostic.source,
-                  diagnostic.code != null ? `Code ${diagnostic.code}` : undefined,
-                ].filter((value): value is string => value != null);
+          return (
+            <section key={fileIdentity} className="border-border rounded border p-3">
+              <div className="mb-3 flex flex-col gap-1">
+                <h3 className="text-foreground font-medium break-all">{file.path}</h3>
+                <p className="text-muted text-xs">Server: {file.serverId}</p>
+              </div>
 
-                return (
-                  <li key={`${file.path}-${index}`} className="border-border-light border-l-2 pl-3">
-                    <p className="text-foreground whitespace-pre-wrap">{diagnostic.message}</p>
-                    <p className="text-muted mt-1 text-xs">{metadata.join(" · ")}</p>
-                  </li>
-                );
-              })}
-            </ul>
-          </section>
-        ))}
+              <ul className="flex flex-col gap-3">
+                {file.diagnostics.map((diagnostic) => {
+                  const metadata = [
+                    getDiagnosticSeverityLabel(diagnostic.severity),
+                    formatDiagnosticLocation(
+                      diagnostic.range.start.line,
+                      diagnostic.range.start.character
+                    ),
+                    diagnostic.source,
+                    diagnostic.code != null ? `Code ${diagnostic.code}` : undefined,
+                  ].filter((value): value is string => value != null);
+                  const diagnosticIdentity = getDiagnosticIdentity(file, diagnostic);
+                  const duplicateCount = duplicateDiagnosticCounts.get(diagnosticIdentity) ?? 0;
+                  duplicateDiagnosticCounts.set(diagnosticIdentity, duplicateCount + 1);
+                  const diagnosticKey =
+                    duplicateCount === 0
+                      ? diagnosticIdentity
+                      : `${diagnosticIdentity}::duplicate-${duplicateCount}`;
+
+                  return (
+                    <li key={diagnosticKey} className="border-border-light border-l-2 pl-3">
+                      <p className="text-foreground whitespace-pre-wrap">{diagnostic.message}</p>
+                      <p className="text-muted mt-1 text-xs">{metadata.join(" · ")}</p>
+                    </li>
+                  );
+                })}
+              </ul>
+            </section>
+          );
+        })}
       </div>
     </div>
   );

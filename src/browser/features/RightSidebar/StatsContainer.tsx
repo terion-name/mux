@@ -45,6 +45,7 @@ export function StatsContainer(props: StatsContainerProps) {
               <button
                 key={option.value}
                 type="button"
+                aria-pressed={isActive}
                 className={`rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors ${
                   isActive
                     ? "bg-accent text-foreground"

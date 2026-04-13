@@ -16,19 +16,27 @@ import { DiagnosticsPanel } from "./StatsTab";
 describe("DiagnosticsPanel", () => {
   let originalWindow: typeof globalThis.window;
   let originalDocument: typeof globalThis.document;
+  let originalConsoleError: typeof console.error;
+  let consoleErrorCalls: unknown[][];
 
   beforeEach(() => {
     originalWindow = globalThis.window;
     originalDocument = globalThis.document;
+    originalConsoleError = console.error;
+    consoleErrorCalls = [];
 
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     currentSnapshot = null;
+    console.error = (...args: unknown[]) => {
+      consoleErrorCalls.push(args);
+    };
   });
 
   afterEach(() => {
     cleanup();
     currentSnapshot = null;
+    console.error = originalConsoleError;
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
   });
@@ -50,7 +58,7 @@ describe("DiagnosticsPanel", () => {
     expect(view.getByText("No diagnostics for this workspace.")).toBeTruthy();
   });
 
-  test("renders grouped diagnostics with severity labels and file metadata", () => {
+  test("renders multi-server diagnostics and includes unknown severities in the summary", () => {
     currentSnapshot = {
       workspaceId: "workspace-1",
       diagnostics: [
@@ -85,6 +93,25 @@ describe("DiagnosticsPanel", () => {
           receivedAtMs: 1,
         },
         {
+          uri: "file:///workspace/src/example.ts",
+          path: "/workspace/src/example.ts",
+          serverId: "eslint",
+          rootUri: "file:///workspace",
+          version: 3,
+          diagnostics: [
+            {
+              range: {
+                start: { line: 6, character: 1 },
+                end: { line: 6, character: 12 },
+              },
+              source: "eslint",
+              code: "custom/rule",
+              message: "Use the shared logger helper.",
+            },
+          ],
+          receivedAtMs: 1,
+        },
+        {
           uri: "file:///workspace/src/utils.ts",
           path: "/workspace/src/utils.ts",
           serverId: "typescript",
@@ -108,20 +135,34 @@ describe("DiagnosticsPanel", () => {
 
     const view = render(<DiagnosticsPanel workspaceId="workspace-1" />);
 
-    expect(view.getByText("/workspace/src/example.ts")).toBeTruthy();
+    expect(view.getAllByText("/workspace/src/example.ts").length).toBe(2);
     expect(view.getByText("/workspace/src/utils.ts")).toBeTruthy();
     expect(view.getByText("Type 'string' is not assignable to type 'number'.")).toBeTruthy();
     expect(view.getByText("Unexpected console statement.")).toBeTruthy();
+    expect(view.getByText("Use the shared logger helper.")).toBeTruthy();
     expect(view.getByText("'helper' is declared but its value is never read.")).toBeTruthy();
 
     expect(view.container.textContent).toContain(
-      "3 diagnostics across 2 files · 1 error · 1 warning · 1 information"
+      "4 diagnostics across 3 files · 1 error · 1 warning · 1 information · 1 unknown"
     );
     expect(view.container.textContent).toContain("Server: typescript");
+    expect(view.container.textContent).toContain("Server: eslint");
     expect(view.container.textContent).toContain("Error · Line 2, Column 5 · tsserver · Code 2322");
     expect(view.container.textContent).toContain(
       "Warning · Line 5, Column 3 · eslint · Code no-console"
     );
+    expect(view.container.textContent).toContain(
+      "Unknown · Line 7, Column 2 · eslint · Code custom/rule"
+    );
     expect(view.container.textContent).toContain("Information · Line 10, Column 1 · tsserver");
+    expect(
+      consoleErrorCalls.some((call) =>
+        call.some(
+          (value) =>
+            typeof value === "string" &&
+            value.includes("Encountered two children with the same key")
+        )
+      )
+    ).toBe(false);
   });
 });
