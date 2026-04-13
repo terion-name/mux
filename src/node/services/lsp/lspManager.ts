@@ -164,57 +164,85 @@ export class LspManager {
     this.acquireLease(options.workspaceId);
 
     try {
-      const diagnostics: LspFileDiagnostics[] = [];
-      const seenFilePaths = new Set<string>();
+      const fileContextsByClientKey = new Map<
+        string,
+        Array<{ filePath: string; context: ResolvedLspClientContext }>
+      >();
+      const uniqueFilePaths = [...new Set(options.filePaths)];
 
-      for (const filePath of options.filePaths) {
-        if (seenFilePaths.has(filePath)) {
-          continue;
-        }
-        seenFilePaths.add(filePath);
-
-        try {
-          const context = await this.resolveClientContext({
-            workspaceId: options.workspaceId,
-            runtime: options.runtime,
-            workspacePath: options.workspacePath,
-            filePath,
-          });
-          const previousPublish = this.getLatestDiagnosticPublish(
-            options.workspaceId,
-            context.clientKey,
-            context.fileHandle.uri
-          );
-          const expectedVersion = await context.client.ensureFile(context.fileHandle);
-          const freshPublish = await this.waitForFreshDiagnostics({
-            workspaceId: options.workspaceId,
-            clientKey: context.clientKey,
-            uri: context.fileHandle.uri,
-            previousReceivedAtMs: previousPublish?.receivedAtMs,
-            expectedVersion,
-            timeoutMs: options.timeoutMs ?? LSP_POST_MUTATION_DIAGNOSTICS_TIMEOUT_MS,
-          });
-
-          if (!freshPublish) {
-            continue;
+      await Promise.all(
+        uniqueFilePaths.map(async (filePath) => {
+          try {
+            const context = await this.resolveClientContext({
+              workspaceId: options.workspaceId,
+              runtime: options.runtime,
+              workspacePath: options.workspacePath,
+              filePath,
+            });
+            const entriesForClient = fileContextsByClientKey.get(context.clientKey) ?? [];
+            entriesForClient.push({ filePath, context });
+            fileContextsByClientKey.set(context.clientKey, entriesForClient);
+          } catch (error) {
+            log.debug("Skipping post-mutation LSP diagnostics for file", {
+              workspaceId: options.workspaceId,
+              filePath,
+              error,
+            });
           }
+        })
+      );
 
-          const snapshot = this.getCachedDiagnostics(
-            options.workspaceId,
-            context.clientKey,
-            context.fileHandle.uri
-          );
-          if (snapshot && snapshot.receivedAtMs === freshPublish.receivedAtMs) {
-            diagnostics.push(snapshot);
-          }
-        } catch (error) {
-          log.debug("Skipping post-mutation LSP diagnostics for file", {
-            workspaceId: options.workspaceId,
-            filePath,
-            error,
-          });
-        }
-      }
+      const diagnostics = (
+        await Promise.all(
+          [...fileContextsByClientKey.values()].map(
+            async (fileContexts) =>
+              await Promise.all(
+                fileContexts.map(async ({ filePath, context }) => {
+                  try {
+                    const previousPublish = this.getLatestDiagnosticPublish(
+                      options.workspaceId,
+                      context.clientKey,
+                      context.fileHandle.uri
+                    );
+                    const expectedVersion = await context.client.ensureFile(context.fileHandle);
+                    const freshPublish = await this.waitForFreshDiagnostics({
+                      workspaceId: options.workspaceId,
+                      clientKey: context.clientKey,
+                      uri: context.fileHandle.uri,
+                      previousReceivedAtMs: previousPublish?.receivedAtMs,
+                      expectedVersion,
+                      timeoutMs: options.timeoutMs ?? LSP_POST_MUTATION_DIAGNOSTICS_TIMEOUT_MS,
+                    });
+
+                    if (!freshPublish) {
+                      return undefined;
+                    }
+
+                    const snapshot = this.getCachedDiagnostics(
+                      options.workspaceId,
+                      context.clientKey,
+                      context.fileHandle.uri
+                    );
+                    if (snapshot && snapshot.receivedAtMs === freshPublish.receivedAtMs) {
+                      return snapshot;
+                    }
+
+                    return undefined;
+                  } catch (error) {
+                    log.debug("Skipping post-mutation LSP diagnostics for file", {
+                      workspaceId: options.workspaceId,
+                      filePath,
+                      error,
+                    });
+                    return undefined;
+                  }
+                })
+              )
+          )
+        )
+      )
+        .flat()
+        .filter((snapshot): snapshot is LspFileDiagnostics => snapshot !== undefined);
 
       this.markActivity(options.workspaceId);
       return diagnostics.sort((left, right) => left.path.localeCompare(right.path));
@@ -465,6 +493,10 @@ export class LspManager {
     pathMapper: LspPathMapper;
     params: LspPublishDiagnosticsParams;
   }): void {
+    if (isMalformedDiagnosticPublish(context.params)) {
+      return;
+    }
+
     const receivedAtMs = Date.now();
     const publishReceipt: LspDiagnosticPublishReceipt = {
       version: context.params.version,
@@ -825,6 +857,10 @@ function isFreshDiagnosticPublish(
   }
 
   return publish.receivedAtMs > (previousReceivedAtMs ?? 0);
+}
+
+function isMalformedDiagnosticPublish(params: LspPublishDiagnosticsParams): boolean {
+  return params.rawDiagnosticCount > 0 && params.diagnostics.length === 0;
 }
 
 async function pathExists(runtime: Runtime, candidatePath: string): Promise<boolean> {

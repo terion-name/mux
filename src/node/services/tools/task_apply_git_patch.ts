@@ -184,46 +184,51 @@ function joinRepoRelativePath(repoCwd: string, relativePath: string): string {
   return pathModule.join(repoCwd, ...normalizedSegments);
 }
 
-async function getChangedFilesForAppliedRange(params: {
+async function getChangedFilesForAppliedCommits(params: {
   runtime: ToolConfiguration["runtime"];
   cwd: string;
-  beforeHeadSha: string | undefined;
+  appliedCommits: AppliedCommit[];
 }): Promise<string[]> {
-  const diffCommand = params.beforeHeadSha
-    ? `git diff --name-only ${params.beforeHeadSha}..HEAD --`
-    : "git diff-tree --no-commit-id --name-only -r HEAD";
+  const changedFiles = new Set<string>();
 
-  try {
-    const result = await execBuffered(params.runtime, diffCommand, {
-      cwd: params.cwd,
-      timeout: 30,
-    });
-    if (result.exitCode !== 0) {
-      log.debug("task_apply_git_patch: git diff --name-only failed", {
-        cwd: params.cwd,
-        exitCode: result.exitCode,
-        stderr: result.stderr.trim(),
-        stdout: result.stdout.trim(),
-      });
-      return [];
+  for (const commit of params.appliedCommits) {
+    if (!commit.sha) {
+      continue;
     }
 
-    return Array.from(
-      new Set(
-        result.stdout
-          .split("\n")
-          .map((line) => line.replace(/\r$/, "").trim())
-          .filter((line) => line.length > 0)
-          .map((line) => joinRepoRelativePath(params.cwd, line))
-      )
-    );
-  } catch (error) {
-    log.debug("task_apply_git_patch: git diff --name-only threw", {
-      cwd: params.cwd,
-      error,
-    });
-    return [];
+    try {
+      const result = await execBuffered(
+        params.runtime,
+        `git diff-tree --root --no-commit-id --name-only -z -r ${commit.sha} --`,
+        {
+          cwd: params.cwd,
+          timeout: 30,
+        }
+      );
+      if (result.exitCode !== 0) {
+        log.debug("task_apply_git_patch: git diff-tree --name-only failed", {
+          cwd: params.cwd,
+          commitSha: commit.sha,
+          exitCode: result.exitCode,
+          stderr: result.stderr.trim(),
+          stdout: result.stdout.trim(),
+        });
+        continue;
+      }
+
+      for (const relativePath of result.stdout.split("\u0000").filter((line) => line.length > 0)) {
+        changedFiles.add(joinRepoRelativePath(params.cwd, relativePath));
+      }
+    } catch (error) {
+      log.debug("task_apply_git_patch: git diff-tree --name-only threw", {
+        cwd: params.cwd,
+        commitSha: commit.sha,
+        error,
+      });
+    }
   }
+
+  return [...changedFiles];
 }
 
 const MAX_PARENT_WORKSPACE_DEPTH = 32;
@@ -923,10 +928,10 @@ async function applyProjectPatch(params: {
 
   let postMutationNote: string | undefined;
   if (params.onFilesMutated) {
-    const changedFiles = await getChangedFilesForAppliedRange({
+    const changedFiles = await getChangedFilesForAppliedCommits({
       runtime: params.runtime,
       cwd: params.repoCwd,
-      beforeHeadSha,
+      appliedCommits,
     });
     if (changedFiles.length > 0) {
       try {

@@ -207,6 +207,7 @@ describe("LspManager", () => {
         uri: file.uri,
         version,
         diagnostics,
+        rawDiagnosticCount: diagnostics.length,
       });
       return Promise.resolve(version);
     });
@@ -247,14 +248,148 @@ describe("LspManager", () => {
     });
     expect(second).toEqual([]);
 
-    const workspaceDiagnostics = (manager as unknown as {
-      workspaceDiagnostics: Map<string, Map<string, Map<string, unknown>>>;
-    }).workspaceDiagnostics;
+    const workspaceDiagnostics = (
+      manager as unknown as {
+        workspaceDiagnostics: Map<string, Map<string, Map<string, unknown>>>;
+      }
+    ).workspaceDiagnostics;
     expect(workspaceDiagnostics.get("ws-1")?.values().next().value?.size ?? 0).toBe(0);
 
     await manager.disposeWorkspace("ws-1");
     expect(workspaceDiagnostics.has("ws-1")).toBe(false);
     expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  test("ignores malformed publishes so they do not clear cached diagnostics or satisfy waits", async () => {
+    const ensureFile = mock((file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+      const version = ensureFile.mock.calls.length;
+      clientOptions?.onPublishDiagnostics?.({
+        uri: file.uri,
+        version,
+        diagnostics: version === 1 ? [createDiagnostic("first pass")] : [],
+        rawDiagnosticCount: 1,
+      });
+      return Promise.resolve(version);
+    });
+    const close = mock(() => Promise.resolve(undefined));
+    let clientOptions: CreateLspClientOptions | undefined;
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      clientOptions = options;
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile,
+        query: mock(() => Promise.resolve({ operation: "hover" as const, hover: "unused" })),
+        close,
+      });
+    });
+
+    const manager = new LspManager({
+      registry: createRegistry(),
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    const first = await manager.collectPostMutationDiagnostics({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePaths: ["src/example.ts"],
+      timeoutMs: 20,
+    });
+    expect(first).toHaveLength(1);
+    expect(first[0]?.diagnostics[0]?.message).toBe("first pass");
+
+    const second = await manager.collectPostMutationDiagnostics({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePaths: ["src/example.ts"],
+      timeoutMs: 20,
+    });
+    expect(second).toEqual([]);
+
+    const workspaceDiagnostics = (
+      manager as unknown as {
+        workspaceDiagnostics: Map<
+          string,
+          Map<string, Map<string, { diagnostics: LspDiagnostic[] }>>
+        >;
+      }
+    ).workspaceDiagnostics;
+    const cachedDiagnostics = [
+      ...(workspaceDiagnostics.get("ws-1")?.values().next().value?.values() ?? []),
+    ];
+    expect(cachedDiagnostics).toHaveLength(1);
+    expect(cachedDiagnostics[0]?.diagnostics[0]?.message).toBe("first pass");
+
+    await manager.disposeWorkspace("ws-1");
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  test("collects post-mutation diagnostics across roots without serial waits", async () => {
+    const secondEnsureStarted = createDeferred<void>();
+    const publishByUri = new Map<string, () => void>();
+    let secondEnsureResolved = false;
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      const ensureFile = mock(async (file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+        publishByUri.set(file.uri, () => {
+          options.onPublishDiagnostics?.({
+            uri: file.uri,
+            version: 1,
+            diagnostics: [createDiagnostic(`diagnostic for ${file.uri}`)],
+            rawDiagnosticCount: 1,
+          });
+        });
+        if (publishByUri.size === 2 && !secondEnsureResolved) {
+          secondEnsureResolved = true;
+          secondEnsureStarted.resolve();
+        }
+        return 1;
+      });
+
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile,
+        query: mock(() => Promise.resolve({ operation: "hover" as const, hover: "unused" })),
+        close: mock(() => Promise.resolve(undefined)),
+      });
+    });
+
+    const manager = new LspManager({
+      registry: createRegistry(),
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    const diagnosticsPromise = manager.collectPostMutationDiagnostics({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePaths: ["src/example.ts", "packages/pkg/src/nested.ts"],
+      timeoutMs: 200,
+    });
+
+    await Promise.race([
+      secondEnsureStarted.promise,
+      new Promise<never>((_, reject) => {
+        setTimeout(
+          () =>
+            reject(new Error("Expected both files to start waiting before diagnostics publish")),
+          50
+        );
+      }),
+    ]);
+
+    for (const publish of publishByUri.values()) {
+      publish();
+    }
+
+    const diagnostics = await diagnosticsPromise;
+    expect(diagnostics).toHaveLength(2);
+    expect(diagnostics.map((entry) => entry.path)).toEqual([
+      path.join(workspacePath, "packages", "pkg", "src", "nested.ts"),
+      path.join(workspacePath, "src", "example.ts"),
+    ]);
   });
 
   test("keeps diagnostics isolated by root uri within the same workspace", async () => {
@@ -264,6 +399,7 @@ describe("LspManager", () => {
           uri: file.uri,
           version: 1,
           diagnostics: [createDiagnostic(`diagnostic for ${options.rootPath}`)],
+          rawDiagnosticCount: 1,
         });
         return Promise.resolve(1);
       });

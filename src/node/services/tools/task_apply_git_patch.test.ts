@@ -34,8 +34,9 @@ async function commitFile(
   content: string,
   message: string
 ): Promise<void> {
+  await fsPromises.mkdir(path.dirname(path.join(repoPath, fileName)), { recursive: true });
   await fsPromises.writeFile(path.join(repoPath, fileName), content, "utf-8");
-  execSync(`git add -- ${fileName}`, { cwd: repoPath, stdio: "ignore" });
+  execSync(`git add -- ${JSON.stringify(fileName)}`, { cwd: repoPath, stdio: "ignore" });
   execSync(`git commit -m ${JSON.stringify(message)}`, { cwd: repoPath, stdio: "ignore" });
 }
 
@@ -46,21 +47,23 @@ async function buildReadyProjectArtifact(params: {
   projectPath: string;
   projectName: string;
   childRepo: string;
-  baseSha: string;
+  baseSha?: string;
   headSha: string;
+  commitCount?: number;
+  formatPatchArgs?: string;
 }) {
   const patchPath = getSubagentGitPatchMboxPath(
     params.sessionDir,
     params.childTaskId,
     params.storageKey
   );
-  const patch = execSync(
-    `git format-patch --stdout --binary ${params.baseSha}..${params.headSha}`,
-    {
-      cwd: params.childRepo,
-      encoding: "buffer",
-    }
-  );
+  const formatPatchArgs =
+    params.formatPatchArgs ??
+    (params.baseSha ? `${params.baseSha}..${params.headSha}` : `--root ${params.headSha}`);
+  const patch = execSync(`git format-patch --stdout --binary ${formatPatchArgs}`, {
+    cwd: params.childRepo,
+    encoding: "buffer",
+  });
 
   await fsPromises.mkdir(path.dirname(patchPath), { recursive: true });
   await fsPromises.writeFile(patchPath, patch);
@@ -70,9 +73,9 @@ async function buildReadyProjectArtifact(params: {
     projectName: params.projectName,
     storageKey: params.storageKey,
     status: "ready" as const,
-    baseCommitSha: params.baseSha,
+    ...(params.baseSha ? { baseCommitSha: params.baseSha } : {}),
     headCommitSha: params.headSha,
-    commitCount: 1,
+    commitCount: params.commitCount ?? 1,
     mboxPath: patchPath,
   };
 }
@@ -764,6 +767,84 @@ describe("task_apply_git_patch tool", () => {
     const artifact = await readSubagentGitPatchArtifact(ancestorSessionDir, childTaskId);
     expect(artifact?.projectArtifacts[0]?.appliedAtMs).toBe(appliedAtMs);
     expect(await readSubagentGitPatchArtifact(currentSessionDir, childTaskId)).toBeNull();
+  }, 20_000);
+
+  it("reports changed files across a root patch series, including paths with spaces", async () => {
+    const childRepo = path.join(rootDir, "root-series-child");
+    const targetRepo = path.join(rootDir, "root-series-target");
+    for (const repo of [childRepo, targetRepo]) {
+      await fsPromises.mkdir(repo, { recursive: true });
+      initGitRepo(repo);
+    }
+
+    await commitFile(childRepo, "README.md", "hello\n", "first change");
+    await commitFile(childRepo, "docs/file with spaces.md", "second\n", "second change");
+    const headSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+
+    const muxRoot = path.join(rootDir, "root-series-mux");
+    const workspaceId = "root-series-workspace";
+    const sessionDir = path.join(muxRoot, "sessions", workspaceId);
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    await writeWorkspaceConfig({
+      muxRoot,
+      workspaceId,
+      workspaceName: "root-series",
+      primaryProjectPath: targetRepo,
+      projects: [{ projectPath: targetRepo, projectName: "root-series" }],
+    });
+
+    const childTaskId = "root-series-task";
+    await writePatchArtifact({
+      sessionDir,
+      workspaceId,
+      childTaskId,
+      projectArtifacts: [
+        await buildReadyProjectArtifact({
+          sessionDir,
+          childTaskId,
+          storageKey: "root-series",
+          projectPath: targetRepo,
+          projectName: "root-series",
+          childRepo,
+          headSha,
+          commitCount: 2,
+          formatPatchArgs: `--root ${headSha}`,
+        }),
+      ],
+    });
+
+    const mutationCalls: Array<{ filePaths: string[] }> = [];
+    const tool = createTaskApplyGitPatchTool({
+      ...getTestDeps(),
+      workspaceId,
+      cwd: targetRepo,
+      runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
+      runtimeTempDir: "/tmp",
+      workspaceSessionDir: sessionDir,
+      onFilesMutated: async (params) => {
+        mutationCalls.push(params);
+        return undefined;
+      },
+    });
+
+    const result = (await tool.execute!({ task_id: childTaskId }, mockToolCallOptions)) as {
+      success: boolean;
+      appliedCommits?: Array<{ subject: string }>;
+    };
+
+    expect(result.success).toBe(true);
+    expect(result.appliedCommits?.map((commit) => commit.subject)).toEqual([
+      "first change",
+      "second change",
+    ]);
+    expect(mutationCalls).toEqual([
+      {
+        filePaths: [
+          path.join(targetRepo, "README.md"),
+          path.join(targetRepo, "docs", "file with spaces.md"),
+        ],
+      },
+    ]);
   }, 20_000);
 
   it("appends post-apply diagnostics notes for real applies", async () => {

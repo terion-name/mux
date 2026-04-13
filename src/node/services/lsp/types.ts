@@ -39,7 +39,11 @@ export interface LspMarkedString {
 }
 
 export interface LspHover {
-  contents: string | LspMarkupContent | LspMarkedString | Array<string | LspMarkupContent | LspMarkedString>;
+  contents:
+    | string
+    | LspMarkupContent
+    | LspMarkedString
+    | Array<string | LspMarkupContent | LspMarkedString>;
 }
 
 export interface LspDiagnostic {
@@ -54,6 +58,7 @@ export interface LspPublishDiagnosticsParams {
   uri: string;
   version?: number;
   diagnostics: LspDiagnostic[];
+  rawDiagnosticCount: number;
 }
 
 export interface LspFileDiagnostics {

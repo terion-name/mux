@@ -427,6 +427,7 @@ function parsePublishDiagnosticsParams(params: unknown): LspPublishDiagnosticsPa
     uri: record.uri,
     version: typeof record.version === "number" ? record.version : undefined,
     diagnostics,
+    rawDiagnosticCount: record.diagnostics.length,
   };
 }
 

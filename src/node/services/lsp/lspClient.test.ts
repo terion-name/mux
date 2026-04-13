@@ -1,6 +1,10 @@
 import { describe, expect, it, mock } from "bun:test";
 import { LspClient } from "./lspClient";
-import type { CreateLspClientOptions, LspPublishDiagnosticsParams, LspServerDescriptor } from "./types";
+import type {
+  CreateLspClientOptions,
+  LspPublishDiagnosticsParams,
+  LspServerDescriptor,
+} from "./types";
 
 function createDescriptor(): LspServerDescriptor {
   return {
@@ -15,7 +19,14 @@ function createDescriptor(): LspServerDescriptor {
 
 function createTransport() {
   return {
-    onmessage: undefined as ((message: { jsonrpc: "2.0"; id?: number | string; method?: string; params?: unknown }) => void) | undefined,
+    onmessage: undefined as
+      | ((message: {
+          jsonrpc: "2.0";
+          id?: number | string;
+          method?: string;
+          params?: unknown;
+        }) => void)
+      | undefined,
     onclose: undefined as (() => void) | undefined,
     onerror: undefined as ((error: Error) => void) | undefined,
     start: mock(() => undefined),
@@ -29,7 +40,10 @@ function createTransport() {
 function createClient(options?: Partial<CreateLspClientOptions>) {
   const transport = createTransport();
   const client = new (LspClient as unknown as {
-    new (clientOptions: CreateLspClientOptions, transport: ReturnType<typeof createTransport>): LspClient;
+    new (
+      clientOptions: CreateLspClientOptions,
+      transport: ReturnType<typeof createTransport>
+    ): LspClient;
   })(
     {
       descriptor: createDescriptor(),
@@ -89,10 +103,33 @@ describe("LspClient publishDiagnostics handling", () => {
           message: "Type 'string' is not assignable to type 'number'.",
         },
       ],
+      rawDiagnosticCount: 1,
     });
   });
 
-  it("ignores malformed publishDiagnostics notifications", () => {
+  it("tags explicit clears so the manager can distinguish them from malformed publishes", () => {
+    const onPublishDiagnostics = mock((_params: LspPublishDiagnosticsParams) => undefined);
+    const { transport } = createClient({ onPublishDiagnostics });
+
+    transport.onmessage?.({
+      jsonrpc: "2.0",
+      method: "textDocument/publishDiagnostics",
+      params: {
+        uri: "file:///tmp/workspace/src/example.ts",
+        diagnostics: [],
+      },
+    });
+
+    expect(onPublishDiagnostics).toHaveBeenCalledTimes(1);
+    expect(onPublishDiagnostics.mock.calls[0]?.[0]).toEqual({
+      uri: "file:///tmp/workspace/src/example.ts",
+      version: undefined,
+      diagnostics: [],
+      rawDiagnosticCount: 0,
+    });
+  });
+
+  it("preserves malformed inner diagnostics so the manager can ignore them", () => {
     const onPublishDiagnostics = mock((_params: LspPublishDiagnosticsParams) => undefined);
     const { transport } = createClient({ onPublishDiagnostics });
 
@@ -110,6 +147,7 @@ describe("LspClient publishDiagnostics handling", () => {
       uri: "file:///tmp/workspace/src/example.ts",
       version: undefined,
       diagnostics: [],
+      rawDiagnosticCount: 1,
     });
   });
 });
