@@ -1,4 +1,5 @@
 import * as fsPromises from "fs/promises";
+import os from "node:os";
 import * as path from "path";
 import { tool } from "ai";
 
@@ -11,7 +12,6 @@ import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools"
 import {
   discoverAgentSkills,
   getDefaultAgentSkillsRoots,
-  type AgentSkillsRoots,
 } from "@/node/services/agentSkills/agentSkillsService";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
@@ -164,16 +164,12 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
         });
 
         if (skillCtx.kind === "project-runtime") {
-          // Only enumerate roots that paired mutation tools (write/delete) can target.
-          // Excludes .agents/skills and ~/.agents/skills which are read-only legacy roots.
-          const writableRoots: AgentSkillsRoots = {
-            projectRoot: skillCtx.runtime.normalizePath(".mux/skills", skillCtx.workspacePath),
-            globalRoot: getDefaultAgentSkillsRoots(skillCtx.runtime, skillCtx.workspacePath)
-              .globalRoot,
-          };
+          // Runtime discovery mirrors the shared default roots contract so project-runtime
+          // listings include .mux/skills and .agents/skills plus ~/.mux/skills and ~/.agents/skills.
+          const roots = getDefaultAgentSkillsRoots(skillCtx.runtime, skillCtx.workspacePath);
 
           const discovered = await discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
-            roots: writableRoots,
+            roots,
             containment: skillCtx.containment,
             dedupeByName: false,
           });
@@ -193,6 +189,8 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           throw new Error("agent_skill_list requires muxScope");
         }
 
+        const userHome = os.homedir();
+
         // Always list global skills; also list project skills when in a project workspace.
         const roots: Array<{
           skillsRoot: string;
@@ -204,14 +202,26 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
             containmentRoot: muxScope.muxHome,
             scope: "global",
           },
+          {
+            skillsRoot: path.join(userHome, ".agents", "skills"),
+            containmentRoot: userHome,
+            scope: "global",
+          },
         ];
         if (muxScope.type === "project") {
-          // Project skills listed first so they appear before global ones
-          roots.unshift({
-            skillsRoot: path.join(muxScope.projectRoot, ".mux", "skills"),
-            containmentRoot: muxScope.projectRoot,
-            scope: "project",
-          });
+          roots.unshift(
+            {
+              // Project skills listed first so they appear before global ones.
+              skillsRoot: path.join(muxScope.projectRoot, ".mux", "skills"),
+              containmentRoot: muxScope.projectRoot,
+              scope: "project",
+            },
+            {
+              skillsRoot: path.join(muxScope.projectRoot, ".agents", "skills"),
+              containmentRoot: muxScope.projectRoot,
+              scope: "project",
+            }
+          );
         }
 
         const skills: AgentSkillDescriptor[] = [];
