@@ -278,6 +278,136 @@ describe("LspManager", () => {
     }
   });
 
+  test("re-probes launch plans after a closed client is recreated", async () => {
+    const firstBinDir = path.join(workspacePath, "tools", "first-bin");
+    const secondBinDir = path.join(workspacePath, "tools", "second-bin");
+    const firstExecutable = path.join(firstBinDir, "fake-lsp");
+    const secondExecutable = path.join(secondBinDir, "fake-lsp");
+    await fs.mkdir(firstBinDir, { recursive: true });
+    await fs.mkdir(secondBinDir, { recursive: true });
+    await fs.writeFile(firstExecutable, "#!/bin/sh\nexit 0\n");
+    await fs.writeFile(secondExecutable, "#!/bin/sh\nexit 0\n");
+    await fs.chmod(firstExecutable, 0o755);
+    await fs.chmod(secondExecutable, 0o755);
+
+    const baseDescriptor = createRegistry()[0];
+    if (!baseDescriptor) {
+      throw new Error("Expected the test registry to provide a descriptor");
+    }
+
+    const descriptor: LspServerDescriptor = {
+      ...baseDescriptor,
+      launch: {
+        type: "manual",
+        command: "fake-lsp",
+        args: ["--stdio"],
+        env: { PATH: prependToPath(firstBinDir) },
+      },
+    };
+
+    const launchPlans: Array<CreateLspClientOptions["launchPlan"]> = [];
+    const closedStates: boolean[] = [];
+    const closeMocks: Array<ReturnType<typeof mock>> = [];
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      launchPlans.push(options.launchPlan);
+      const clientIndex = closedStates.length;
+      closedStates.push(false);
+      const close = mock(() => {
+        closedStates[clientIndex] = true;
+        return Promise.resolve(undefined);
+      });
+      closeMocks.push(close);
+      return Promise.resolve({
+        get isClosed() {
+          return closedStates[clientIndex] ?? false;
+        },
+        ensureFile: mock(() => Promise.resolve(1)),
+        query: mock(() =>
+          Promise.resolve({ operation: "hover" as const, hover: options.launchPlan.command })
+        ),
+        close,
+      });
+    });
+
+    const manager = new LspManager({
+      registry: [descriptor],
+      clientFactory,
+    });
+    const runtime = new CountingLocalRuntime(workspacePath);
+
+    const first = await manager.query({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePath: "src/example.ts",
+      operation: "hover",
+      line: 1,
+      column: 1,
+    });
+    const warmReuse = await manager.query({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePath: "src/example.ts",
+      operation: "hover",
+      line: 1,
+      column: 1,
+    });
+
+    await closeMocks[0]?.();
+    descriptor.launch = {
+      ...descriptor.launch,
+      env: { PATH: prependToPath(secondBinDir) },
+    };
+
+    const recreated = await manager.query({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePath: "src/example.ts",
+      operation: "hover",
+      line: 1,
+      column: 1,
+    });
+    const recreatedWarmReuse = await manager.query({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePath: "src/example.ts",
+      operation: "hover",
+      line: 1,
+      column: 1,
+    });
+
+    expect(first.hover).toBe(firstExecutable);
+    expect(warmReuse.hover).toBe(firstExecutable);
+    expect(recreated.hover).toBe(secondExecutable);
+    expect(recreatedWarmReuse.hover).toBe(secondExecutable);
+    expect(clientFactory).toHaveBeenCalledTimes(2);
+    expect(runtime.pathProbeCommands).toHaveLength(2);
+    expect(launchPlans).toEqual([
+      {
+        command: firstExecutable,
+        args: ["--stdio"],
+        cwd: workspacePath,
+        env: { PATH: prependToPath(firstBinDir) },
+        initializationOptions: undefined,
+      },
+      {
+        command: secondExecutable,
+        args: ["--stdio"],
+        cwd: workspacePath,
+        env: { PATH: prependToPath(secondBinDir) },
+        initializationOptions: undefined,
+      },
+    ]);
+
+    await manager.dispose();
+    expect(closeMocks).toHaveLength(2);
+    expect(closeMocks[0]).toHaveBeenCalledTimes(1);
+    expect(closeMocks[1]).toHaveBeenCalledTimes(1);
+  });
+
   test("deduplicates concurrent client creation for the same workspace root", async () => {
     const ensureFile = mock(() => Promise.resolve(1));
     const query = mock(() =>

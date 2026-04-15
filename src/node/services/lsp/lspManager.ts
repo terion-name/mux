@@ -366,6 +366,9 @@ export class LspManager {
 
     if (existingClient?.isClosed) {
       workspaceEntry.clients.delete(clientKey);
+      // Re-resolve launch plans when a client restarts so executable/path changes do not
+      // stay pinned to a stale absolute command across the workspace lifetime.
+      workspaceEntry.launchPlans.delete(clientKey);
     }
 
     const pendingClient = workspaceEntry.pendingClients.get(clientKey);
