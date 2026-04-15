@@ -289,83 +289,106 @@ describe("LspManager", () => {
   });
 
   test("creates separate clients when LSP policy context changes for the same root", async () => {
-    const localExecutable = path.join(
-      workspacePath,
-      "node_modules",
-      ".bin",
-      "typescript-language-server"
-    );
-    const pathExecutable = path.join(workspacePath, "tools", "bin", "typescript-language-server");
-    await fs.mkdir(path.dirname(localExecutable), { recursive: true });
-    await fs.mkdir(path.dirname(pathExecutable), { recursive: true });
-    await fs.writeFile(localExecutable, "#!/bin/sh\nexit 0\n");
-    await fs.writeFile(pathExecutable, "#!/bin/sh\nexit 0\n");
-    await fs.chmod(localExecutable, 0o755);
-    await fs.chmod(pathExecutable, 0o755);
+    const externalBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-lsp-global-bin-"));
+    try {
+      const localExecutable = path.join(
+        workspacePath,
+        "node_modules",
+        ".bin",
+        "typescript-language-server"
+      );
+      const workspacePathExecutable = path.join(
+        workspacePath,
+        "tools",
+        "bin",
+        "typescript-language-server"
+      );
+      const externalPathExecutable = path.join(externalBinDir, "typescript-language-server");
+      await fs.mkdir(path.dirname(localExecutable), { recursive: true });
+      await fs.mkdir(path.dirname(workspacePathExecutable), { recursive: true });
+      await fs.writeFile(localExecutable, "#!/bin/sh\nexit 0\n");
+      await fs.writeFile(workspacePathExecutable, "#!/bin/sh\nexit 0\n");
+      await fs.writeFile(externalPathExecutable, "#!/bin/sh\nexit 0\n");
+      await fs.chmod(localExecutable, 0o755);
+      await fs.chmod(workspacePathExecutable, 0o755);
+      await fs.chmod(externalPathExecutable, 0o755);
 
-    const descriptor: LspServerDescriptor = {
-      id: "typescript",
-      extensions: [".ts"],
-      launch: {
-        type: "provisioned",
-        args: ["--stdio"],
-        env: { PATH: prependToPath(path.join(workspacePath, "tools", "bin")) },
-        strategies: [
-          {
-            type: "workspaceLocalExecutable",
-            relativeCandidates: ["node_modules/.bin/typescript-language-server"],
+      const descriptor: LspServerDescriptor = {
+        id: "typescript",
+        extensions: [".ts"],
+        launch: {
+          type: "provisioned",
+          args: ["--stdio"],
+          env: {
+            PATH: [path.join(workspacePath, "tools", "bin"), prependToPath(externalBinDir)]
+              .filter((value) => value.length > 0)
+              .join(path.delimiter),
           },
-          { type: "pathCommand", command: "typescript-language-server" },
-        ],
-      },
-      rootMarkers: ["package.json", ".git"],
-      languageIdForPath: () => "typescript",
-    };
+          strategies: [
+            {
+              type: "workspaceLocalExecutable",
+              relativeCandidates: ["node_modules/.bin/typescript-language-server"],
+            },
+            { type: "pathCommand", command: "typescript-language-server" },
+          ],
+        },
+        rootMarkers: ["package.json", ".git"],
+        languageIdForPath: () => "typescript",
+      };
 
-    const launchPlans: Array<CreateLspClientOptions["launchPlan"]> = [];
-    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
-      launchPlans.push(options.launchPlan);
-      return Promise.resolve({
-        isClosed: false,
-        ensureFile: mock(() => Promise.resolve(1)),
-        query: mock(() => Promise.resolve({ operation: "hover" as const, hover: options.launchPlan.command })),
-        close: mock(() => Promise.resolve(undefined)),
+      const launchPlans: Array<CreateLspClientOptions["launchPlan"]> = [];
+      const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+        launchPlans.push(options.launchPlan);
+        return Promise.resolve({
+          isClosed: false,
+          ensureFile: mock(() => Promise.resolve(1)),
+          query: mock(() =>
+            Promise.resolve({ operation: "hover" as const, hover: options.launchPlan.command })
+          ),
+          close: mock(() => Promise.resolve(undefined)),
+        });
       });
-    });
 
-    const manager = new LspManager({ registry: [descriptor], clientFactory });
-    const runtime = new CountingLocalRuntime(workspacePath);
+      const manager = new LspManager({ registry: [descriptor], clientFactory });
+      const runtime = new CountingLocalRuntime(workspacePath);
+      try {
+        const trustedResult = await manager.query({
+          workspaceId: "ws-1",
+          runtime,
+          workspacePath,
+          filePath: "src/example.ts",
+          policyContext: TEST_LSP_POLICY_CONTEXT,
+          operation: "hover",
+          line: 1,
+          column: 1,
+        });
+        const untrustedResult = await manager.query({
+          workspaceId: "ws-1",
+          runtime,
+          workspacePath,
+          filePath: "src/example.ts",
+          policyContext: {
+            provisioningMode: "manual",
+            trustedWorkspaceExecution: false,
+          },
+          operation: "hover",
+          line: 1,
+          column: 1,
+        });
 
-    const trustedResult = await manager.query({
-      workspaceId: "ws-1",
-      runtime,
-      workspacePath,
-      filePath: "src/example.ts",
-      policyContext: TEST_LSP_POLICY_CONTEXT,
-      operation: "hover",
-      line: 1,
-      column: 1,
-    });
-    const untrustedResult = await manager.query({
-      workspaceId: "ws-1",
-      runtime,
-      workspacePath,
-      filePath: "src/example.ts",
-      policyContext: {
-        provisioningMode: "manual",
-        trustedWorkspaceExecution: false,
-      },
-      operation: "hover",
-      line: 1,
-      column: 1,
-    });
-
-    expect(trustedResult.hover).toBe(localExecutable);
-    expect(untrustedResult.hover).toBe(pathExecutable);
-    expect(clientFactory).toHaveBeenCalledTimes(2);
-    expect(launchPlans.map((plan) => plan.command)).toEqual([localExecutable, pathExecutable]);
-
-    await manager.dispose();
+        expect(trustedResult.hover).toBe(localExecutable);
+        expect(untrustedResult.hover).toBe(externalPathExecutable);
+        expect(clientFactory).toHaveBeenCalledTimes(2);
+        expect(launchPlans.map((plan) => plan.command)).toEqual([
+          localExecutable,
+          externalPathExecutable,
+        ]);
+      } finally {
+        await manager.dispose();
+      }
+    } finally {
+      await fs.rm(externalBinDir, { recursive: true, force: true });
+    }
   });
 
   test("re-probes launch plans after a closed client is recreated", async () => {
