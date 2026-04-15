@@ -153,47 +153,59 @@ describe("resolveLspLaunchPlan", () => {
     });
   });
 
-  it("skips workspace-local probes for untrusted workspaces and falls back to PATH", async () => {
-    await writeExecutable(
-      path.join(workspacePath, "node_modules", ".bin", "typescript-language-server"),
-      "#!/bin/sh\nexit 0\n"
-    );
-    await fs.mkdir(path.join(workspacePath, "node_modules", "typescript", "lib"), {
-      recursive: true,
-    });
-    await fs.writeFile(
-      path.join(workspacePath, "node_modules", "typescript", "lib", "tsserver.js"),
-      "module.exports = {};\n"
-    );
-    await writeExecutable(path.join(binDir, "typescript-language-server"), "#!/bin/sh\nexit 0\n");
+  it("skips workspace-local probes for untrusted workspaces and falls back to a sanitized PATH", async () => {
+    const externalBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-lsp-global-bin-"));
+    try {
+      await writeExecutable(
+        path.join(workspacePath, "node_modules", ".bin", "typescript-language-server"),
+        "#!/bin/sh\nexit 0\n"
+      );
+      await fs.mkdir(path.join(workspacePath, "node_modules", "typescript", "lib"), {
+        recursive: true,
+      });
+      await fs.writeFile(
+        path.join(workspacePath, "node_modules", "typescript", "lib", "tsserver.js"),
+        "module.exports = {};\n"
+      );
+      await writeExecutable(
+        path.join(externalBinDir, "typescript-language-server"),
+        "#!/bin/sh\nexit 0\n"
+      );
 
-    const launchPlan = await resolveLspLaunchPlan({
-      descriptor: {
-        id: "typescript",
-        extensions: [".ts"],
-        launch: {
-          type: "provisioned",
-          args: ["--stdio"],
-          env: { PATH: prependToPath(binDir) },
-          workspaceTsserverPathCandidates: ["node_modules/typescript/lib"],
-          strategies: [
-            {
-              type: "workspaceLocalExecutable",
-              relativeCandidates: ["node_modules/.bin/typescript-language-server"],
+      const launchPlan = await resolveLspLaunchPlan({
+        descriptor: {
+          id: "typescript",
+          extensions: [".ts"],
+          launch: {
+            type: "provisioned",
+            args: ["--stdio"],
+            env: {
+              PATH: ["node_modules/.bin", prependToPath(externalBinDir)]
+                .filter((value) => value.length > 0)
+                .join(path.delimiter),
             },
-            { type: "pathCommand", command: "typescript-language-server" },
-          ],
+            workspaceTsserverPathCandidates: ["node_modules/typescript/lib"],
+            strategies: [
+              {
+                type: "workspaceLocalExecutable",
+                relativeCandidates: ["node_modules/.bin/typescript-language-server"],
+              },
+              { type: "pathCommand", command: "typescript-language-server" },
+            ],
+          },
+          rootMarkers: ["package.json", ".git"],
+          languageIdForPath: () => "typescript",
         },
-        rootMarkers: ["package.json", ".git"],
-        languageIdForPath: () => "typescript",
-      },
-      runtime,
-      rootPath: workspacePath,
-      policyContext: UNTRUSTED_AUTO_POLICY_CONTEXT,
-    });
+        runtime,
+        rootPath: workspacePath,
+        policyContext: UNTRUSTED_AUTO_POLICY_CONTEXT,
+      });
 
-    expect(launchPlan.command).toBe(path.join(binDir, "typescript-language-server"));
-    expect(launchPlan.initializationOptions).toBeUndefined();
+      expect(launchPlan.command).toBe(path.join(externalBinDir, "typescript-language-server"));
+      expect(launchPlan.initializationOptions).toBeUndefined();
+    } finally {
+      await fs.rm(externalBinDir, { recursive: true, force: true });
+    }
   });
 
   it("orders package-manager execution using repo signals", async () => {
@@ -239,7 +251,72 @@ describe("resolveLspLaunchPlan", () => {
     });
   });
 
+  it("disables automatic provisioning strategies for untrusted workspaces", async () => {
+    try {
+      await resolveLspLaunchPlan({
+        descriptor: {
+          id: "typescript",
+          extensions: [".ts"],
+          launch: {
+            type: "provisioned",
+            env: { PATH: prependToPath(binDir) },
+            strategies: [
+              {
+                type: "nodePackageExec",
+                packageName: "typescript-language-server",
+                binaryName: "typescript-language-server",
+              },
+            ],
+          },
+          rootMarkers: ["package.json", ".git"],
+          languageIdForPath: () => "typescript",
+        },
+        runtime,
+        rootPath: workspacePath,
+        policyContext: UNTRUSTED_AUTO_POLICY_CONTEXT,
+      });
+      throw new Error("Expected untrusted package-manager provisioning to be rejected");
+    } catch (error) {
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain(
+        "automatic package-manager provisioning is disabled for untrusted workspaces"
+      );
+    }
+
+    try {
+      await resolveLspLaunchPlan({
+        descriptor: {
+          id: "go",
+          extensions: [".go"],
+          launch: {
+            type: "provisioned",
+            env: { PATH: prependToPath(binDir) },
+            strategies: [
+              {
+                type: "goManagedInstall",
+                module: "golang.org/x/tools/gopls@v0.21.0",
+                binaryName: "gopls",
+              },
+            ],
+          },
+          rootMarkers: ["go.mod", ".git"],
+          languageIdForPath: () => "go",
+        },
+        runtime,
+        rootPath: workspacePath,
+        policyContext: UNTRUSTED_AUTO_POLICY_CONTEXT,
+      });
+      throw new Error("Expected untrusted managed Go provisioning to be rejected");
+    } catch (error) {
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain(
+        "managed Go installs are disabled for untrusted workspaces"
+      );
+    }
+  });
+
   it("gates managed gopls installs on provisioning mode and installs in auto mode", async () => {
+    const installSubdirectory = ["tests", path.basename(workspacePath), "go", "bin"] as const;
     await writeExecutable(
       path.join(binDir, "go"),
       '#!/bin/sh\nmkdir -p "$GOBIN"\nprintf \'#!/bin/sh\\nexit 0\\n\' > "$GOBIN/gopls"\nchmod +x "$GOBIN/gopls"\n'
@@ -256,6 +333,7 @@ describe("resolveLspLaunchPlan", () => {
             type: "goManagedInstall",
             module: "golang.org/x/tools/gopls@v0.21.0",
             binaryName: "gopls",
+            installSubdirectory,
           },
         ],
       },
@@ -284,10 +362,64 @@ describe("resolveLspLaunchPlan", () => {
     });
 
     expect(launchPlan.command).toBe(
-      path.join(await runtime.resolvePath(getManagedLspToolsDir(runtime, "go", "bin")), "gopls")
+      path.join(
+        await runtime.resolvePath(getManagedLspToolsDir(runtime, ...installSubdirectory)),
+        "gopls"
+      )
     );
     expect(launchPlan.cwd).toBe(workspacePath);
     expect(launchPlan.env).toEqual({ PATH: prependToPath(binDir) });
+  });
+
+  it("reuses an existing managed gopls binary before re-running go install", async () => {
+    const installSubdirectory = [
+      "tests",
+      path.basename(workspacePath),
+      "reused-go",
+      "bin",
+    ] as const;
+    const managedBinDir = await runtime.resolvePath(
+      getManagedLspToolsDir(runtime, ...installSubdirectory)
+    );
+    const goInvocationMarker = path.join(workspacePath, "go-invoked.txt");
+
+    await writeExecutable(
+      path.join(binDir, "go"),
+      `#!/bin/sh\nprintf 'unexpected go install\\n' > ${JSON.stringify(goInvocationMarker)}\nexit 1\n`
+    );
+    await writeExecutable(path.join(managedBinDir, "gopls"), "#!/bin/sh\nexit 0\n");
+
+    const launchPlan = await resolveLspLaunchPlan({
+      descriptor: {
+        id: "go",
+        extensions: [".go"],
+        launch: {
+          type: "provisioned",
+          env: { PATH: prependToPath(binDir) },
+          strategies: [
+            {
+              type: "goManagedInstall",
+              module: "golang.org/x/tools/gopls@v0.21.0",
+              binaryName: "gopls",
+              installSubdirectory,
+            },
+          ],
+        },
+        rootMarkers: ["go.mod", ".git"],
+        languageIdForPath: () => "go",
+      },
+      runtime,
+      rootPath: workspacePath,
+      policyContext: TRUSTED_AUTO_POLICY_CONTEXT,
+    });
+
+    expect(launchPlan.command).toBe(path.join(managedBinDir, "gopls"));
+    try {
+      await fs.stat(goInvocationMarker);
+      throw new Error("Expected managed gopls reuse to avoid re-running go install");
+    } catch (error) {
+      expect(error).toMatchObject({ code: "ENOENT" });
+    }
   });
 
   it("returns unsupported errors for servers without auto-install support", async () => {

@@ -1,4 +1,6 @@
+import * as path from "node:path";
 import type { Runtime } from "@/node/runtime/Runtime";
+import { isPathInsideDir } from "@/node/utils/pathUtils";
 import {
   ensureManagedGoTool,
   probeCommandOnPath,
@@ -113,13 +115,33 @@ async function resolveProvisionedLaunchPlan(
       }
 
       case "pathCommand": {
+        const pathCommandProbeEnv = getPathCommandProbeEnv(
+          options.rootPath,
+          launchPolicy.env,
+          options.policyContext
+        );
         const resolvedCommand = await probeCommandOnPath(
           options.runtime,
           strategy.command,
           launchCwd,
-          launchPolicy.env
+          pathCommandProbeEnv
         );
         if (resolvedCommand) {
+          if (
+            !options.policyContext.trustedWorkspaceExecution &&
+            (await resolvesInsideWorkspace(
+              options.runtime,
+              resolvedCommand,
+              launchCwd,
+              options.rootPath
+            ))
+          ) {
+            failureReasons.push(
+              `skipped untrusted workspace-local PATH resolution for ${strategy.command}`
+            );
+            break;
+          }
+
           return {
             command: resolvedCommand,
             args: launchPolicy.args ?? [],
@@ -234,6 +256,56 @@ async function resolveManualCommand(
   }
 
   return (await probeCommandOnPath(runtime, command, launchCwd, env)) ?? command;
+}
+
+function getPathCommandProbeEnv(
+  rootPath: string,
+  env: Readonly<Record<string, string>> | undefined,
+  policyContext: LspPolicyContext
+): Readonly<Record<string, string>> | undefined {
+  if (policyContext.trustedWorkspaceExecution || env?.PATH == null) {
+    return env;
+  }
+
+  // Untrusted workspaces must not influence PATH-based binary resolution with
+  // repo-local or relative entries that resolve under the workspace root.
+  const sanitizedPath = env.PATH.split(path.delimiter)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+    .filter((entry) => {
+      if (!path.isAbsolute(entry)) {
+        return false;
+      }
+      const resolvedEntry = path.resolve(entry);
+      return !isPathInsideDir(rootPath, resolvedEntry);
+    })
+    .join(path.delimiter);
+
+  if (sanitizedPath === env.PATH) {
+    return env;
+  }
+
+  return {
+    ...env,
+    PATH: sanitizedPath,
+  };
+}
+
+async function resolvesInsideWorkspace(
+  runtime: Runtime,
+  command: string,
+  launchCwd: string,
+  rootPath: string
+): Promise<boolean> {
+  if (!looksLikePathCandidate(command)) {
+    return false;
+  }
+
+  const normalizedCommandPath = runtime.normalizePath(command, launchCwd);
+  const resolvedCommandPath = await runtime
+    .resolvePath(normalizedCommandPath)
+    .catch(() => normalizedCommandPath);
+  return isPathInsideDir(rootPath, resolvedCommandPath);
 }
 
 function mergeInitializationOptions(base: unknown, extra: unknown): unknown {

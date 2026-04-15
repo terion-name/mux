@@ -159,6 +159,11 @@ export async function resolveNodePackageExecCommand(
   strategy: LspNodePackageExecStrategy,
   policyContext: LspPolicyContext
 ): Promise<{ command: string; args: readonly string[] } | { reason: string }> {
+  if (!policyContext.trustedWorkspaceExecution) {
+    return {
+      reason: "automatic package-manager provisioning is disabled for untrusted workspaces",
+    };
+  }
   if (policyContext.provisioningMode !== "auto") {
     return {
       reason: `automatic package-manager provisioning is disabled in ${policyContext.provisioningMode} mode`,
@@ -200,15 +205,15 @@ export async function ensureManagedGoTool(
   strategy: LspGoManagedInstallStrategy,
   policyContext: LspPolicyContext
 ): Promise<{ command: string } | { reason: string }> {
+  if (!policyContext.trustedWorkspaceExecution) {
+    return {
+      reason: "managed Go installs are disabled for untrusted workspaces",
+    };
+  }
   if (policyContext.provisioningMode !== "auto") {
     return {
       reason: `managed Go installs are disabled in ${policyContext.provisioningMode} mode`,
     };
-  }
-
-  const goCommand = await probeCommandOnPath(runtime, "go", cwd, env);
-  if (!goCommand) {
-    return { reason: "go is not available on PATH for managed gopls installation" };
   }
 
   const installDirectory = await ensureManagedLspToolsDir(
@@ -222,6 +227,21 @@ export async function ensureManagedGoTool(
     ...(env ?? {}),
     GOBIN: resolvedInstallDirectory,
   };
+  const existingManagedBinary = await resolveManagedGoBinary(
+    runtime,
+    cwd,
+    installEnv,
+    resolvedInstallDirectory,
+    strategy.binaryName
+  );
+  if (existingManagedBinary) {
+    return { command: existingManagedBinary };
+  }
+
+  const goCommand = await probeCommandOnPath(runtime, "go", cwd, env);
+  if (!goCommand) {
+    return { reason: "go is not available on PATH for managed gopls installation" };
+  }
 
   const installResult = await execProbe(
     runtime,
@@ -241,20 +261,36 @@ export async function ensureManagedGoTool(
     };
   }
 
-  const installedBinaryPath = joinRuntimePath(resolvedInstallDirectory, strategy.binaryName);
-  const resolvedBinaryPath = await resolveExecutablePathCandidate(
+  const resolvedBinaryPath = await resolveManagedGoBinary(
     runtime,
-    installedBinaryPath,
     cwd,
-    installEnv
+    installEnv,
+    resolvedInstallDirectory,
+    strategy.binaryName
   );
   if (!resolvedBinaryPath) {
+    const installedBinaryPath = joinRuntimePath(resolvedInstallDirectory, strategy.binaryName);
     return {
       reason: `${strategy.binaryName} was installed but the managed binary is not runnable at ${installedBinaryPath}`,
     };
   }
 
   return { command: resolvedBinaryPath };
+}
+
+async function resolveManagedGoBinary(
+  runtime: Runtime,
+  cwd: string,
+  env: Readonly<Record<string, string>>,
+  installDirectory: string,
+  binaryName: string
+): Promise<string | null> {
+  return await resolveExecutablePathCandidate(
+    runtime,
+    joinRuntimePath(installDirectory, binaryName),
+    cwd,
+    env
+  );
 }
 
 async function resolveNodePackageManagerCommand(

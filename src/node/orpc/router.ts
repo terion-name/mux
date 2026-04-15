@@ -156,6 +156,47 @@ function isTrustedProjectPath(context: ORPCContext, projectPath?: string | null)
   return isProjectTrusted(context.config, projectPath);
 }
 
+async function disposeLspWorkspacesForProjects(
+  context: ORPCContext,
+  projectPaths?: readonly string[]
+): Promise<void> {
+  const normalizedProjectPaths = projectPaths?.map((projectPath) =>
+    stripTrailingSlashes(projectPath)
+  );
+  const allWorkspaceMetadata = await context.config.getAllWorkspaceMetadata();
+  const workspaceIds = new Set(
+    allWorkspaceMetadata
+      .filter((metadata) => {
+        if (normalizedProjectPaths == null || normalizedProjectPaths.length === 0) {
+          return true;
+        }
+
+        const workspaceProjectPaths = [
+          metadata.projectPath,
+          ...(metadata.projects?.map((project) => project.projectPath) ?? []),
+        ].map((projectPath) => stripTrailingSlashes(projectPath));
+        return normalizedProjectPaths.some((projectPath) =>
+          workspaceProjectPaths.includes(projectPath)
+        );
+      })
+      .map((metadata) => metadata.id)
+  );
+
+  await Promise.all(
+    [...workspaceIds].map(async (workspaceId) => {
+      try {
+        await context.lspManager.disposeWorkspace(workspaceId);
+      } catch (error) {
+        log.debug("Failed to dispose LSP workspace after config/trust update", {
+          workspaceId,
+          projectPaths: normalizedProjectPaths,
+          error,
+        });
+      }
+    })
+  );
+}
+
 function normalizeMuxMessageFromDisk(value: unknown): MuxMessage | null {
   if (!value || typeof value !== "object") {
     return null;
@@ -967,6 +1008,9 @@ export const router = (authToken?: string) => {
             }
             return next;
           });
+
+          // Provisioning mode changes alter launch-plan policy for every workspace.
+          await disposeLspWorkspacesForProjects(context);
         }),
       updateLlmDebugLogs: t
         .input(schemas.config.updateLlmDebugLogs.input)
@@ -2425,8 +2469,8 @@ export const router = (authToken?: string) => {
         .input(schemas.projects.setTrust.input)
         .output(schemas.projects.setTrust.output)
         .handler(async ({ context, input }) => {
+          const normalizedPath = stripTrailingSlashes(input.projectPath);
           await context.config.editConfig((config) => {
-            const normalizedPath = stripTrailingSlashes(input.projectPath);
             let project = config.projects.get(normalizedPath);
             if (!project) {
               // Create a minimal project entry so trust can be set before
@@ -2437,6 +2481,9 @@ export const router = (authToken?: string) => {
             project.trusted = input.trusted;
             return config;
           });
+
+          // Trust flips change which launch strategies are legal for this repo.
+          await disposeLspWorkspacesForProjects(context, [normalizedPath]);
         }),
       setDisplayName: t
         .input(schemas.projects.setDisplayName.input)
