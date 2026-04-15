@@ -1,18 +1,21 @@
 import * as path from "node:path";
 import { shellQuote } from "@/common/utils/shell";
-import type { Runtime } from "@/node/runtime/Runtime";
-import { execBuffered } from "@/node/utils/runtime/helpers";
+import type { ExecOptions, Runtime } from "@/node/runtime/Runtime";
+
+const LSP_PROBE_TIMEOUT_SECONDS = 5;
 
 // These helpers expose runtime-level probing primitives so future managed installs can
 // resolve absolute executables without teaching Runtime about LSP-specific policy.
 export async function probeCommandOnPath(
   runtime: Runtime,
   command: string,
-  cwd: string
+  cwd: string,
+  env?: Readonly<Record<string, string>>
 ): Promise<string | null> {
-  const result = await execBuffered(runtime, `command -v ${shellQuote(command)}`, {
+  const result = await execProbe(runtime, `command -v ${shellQuote(command)}`, {
     cwd,
-    timeout: 5,
+    ...(env ? { env: { ...env } } : {}),
+    timeout: LSP_PROBE_TIMEOUT_SECONDS,
   });
   if (result.exitCode !== 0) {
     return null;
@@ -28,14 +31,21 @@ export async function probeCommandOnPath(
 export async function resolveExecutablePathCandidate(
   runtime: Runtime,
   candidatePath: string,
-  cwd: string
+  cwd: string,
+  env?: Readonly<Record<string, string>>
 ): Promise<string | null> {
   const normalizedCandidatePath = runtime.normalizePath(candidatePath, cwd);
 
   try {
     const resolvedCandidatePath = await runtime.resolvePath(normalizedCandidatePath);
     const stat = await runtime.stat(resolvedCandidatePath);
-    return stat.isDirectory ? null : resolvedCandidatePath;
+    if (stat.isDirectory) {
+      return null;
+    }
+
+    return (await isRunnablePath(runtime, resolvedCandidatePath, cwd, env))
+      ? resolvedCandidatePath
+      : null;
   } catch {
     return null;
   }
@@ -84,6 +94,63 @@ export async function ensureManagedLspToolsDir(
   const directoryPath = getManagedLspToolsDir(runtime, ...segments);
   await runtime.ensureDir(directoryPath);
   return directoryPath;
+}
+
+async function execProbe(
+  runtime: Runtime,
+  command: string,
+  options: ExecOptions
+): Promise<{ stdout: string; exitCode: number }> {
+  const stream = await runtime.exec(command, options);
+  try {
+    await stream.stdin.close();
+  } catch {
+    // Probes do not write to stdin, and some runtimes can close the stream before callers do.
+  }
+
+  const [stdout, , exitCode] = await Promise.all([
+    streamToString(stream.stdout),
+    streamToString(stream.stderr),
+    stream.exitCode,
+  ]);
+  return { stdout, exitCode };
+}
+
+async function streamToString(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder("utf-8");
+  const chunks: string[] = [];
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      chunks.push(decoder.decode(value, { stream: true }));
+    }
+    const tail = decoder.decode();
+    if (tail) {
+      chunks.push(tail);
+    }
+    return chunks.join("");
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function isRunnablePath(
+  runtime: Runtime,
+  filePath: string,
+  cwd: string,
+  env?: Readonly<Record<string, string>>
+): Promise<boolean> {
+  const result = await execProbe(runtime, `test -x ${shellQuote(filePath)}`, {
+    cwd,
+    ...(env ? { env: { ...env } } : {}),
+    timeout: LSP_PROBE_TIMEOUT_SECONDS,
+  });
+  return result.exitCode === 0;
 }
 
 function joinRuntimePath(basePath: string, ...segments: string[]): string {

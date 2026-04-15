@@ -35,6 +35,7 @@ import type {
 interface WorkspaceClients {
   clients: Map<string, LspClientInstance>;
   pendingClients: Map<string, Promise<LspClientInstance>>;
+  launchPlans: Map<string, Promise<ResolvedLspLaunchPlan>>;
   lastActivity: number;
 }
 
@@ -342,7 +343,6 @@ export class LspManager {
   private async getOrCreateClient(
     workspaceId: string,
     descriptor: LspServerDescriptor,
-    launchPlan: ResolvedLspLaunchPlan,
     runtime: Runtime,
     pathMapper: LspPathMapper,
     rootPath: string,
@@ -351,6 +351,7 @@ export class LspManager {
     const workspaceEntry = this.workspaceClients.get(workspaceId) ?? {
       clients: new Map<string, LspClientInstance>(),
       pendingClients: new Map<string, Promise<LspClientInstance>>(),
+      launchPlans: new Map<string, Promise<ResolvedLspLaunchPlan>>(),
       lastActivity: Date.now(),
     };
     this.workspaceClients.set(workspaceId, workspaceEntry);
@@ -376,25 +377,42 @@ export class LspManager {
       };
     }
 
+    const launchPlanPromise = this.getOrCreateLaunchPlan(
+      workspaceEntry,
+      clientKey,
+      descriptor,
+      runtime,
+      rootPath
+    );
+
     // Deduplicate concurrent queries for the same workspace/root so we never spawn
     // orphaned LSP processes that escape manager tracking.
-    const clientPromise = this.clientFactory({
-      descriptor,
-      launchPlan,
-      runtime,
-      rootPath,
-      rootUri,
-      onPublishDiagnostics: (params) =>
-        this.handlePublishDiagnostics({
-          workspaceId,
-          workspaceGeneration,
-          clientKey,
-          serverId: descriptor.id,
+    const clientPromise = launchPlanPromise
+      .then(async (launchPlan) => {
+        if (this.workspaceClients.get(workspaceId) !== workspaceEntry) {
+          throw new Error(
+            `LSP workspace ${workspaceId} was disposed while starting ${descriptor.id}`
+          );
+        }
+
+        return await this.clientFactory({
+          descriptor,
+          launchPlan,
+          runtime,
+          rootPath,
           rootUri,
-          pathMapper,
-          params,
-        }),
-    })
+          onPublishDiagnostics: (params) =>
+            this.handlePublishDiagnostics({
+              workspaceId,
+              workspaceGeneration,
+              clientKey,
+              serverId: descriptor.id,
+              rootUri,
+              pathMapper,
+              params,
+            }),
+        });
+      })
       .then(async (client) => {
         const currentWorkspaceEntry = this.workspaceClients.get(workspaceId);
         if (currentWorkspaceEntry !== workspaceEntry) {
@@ -431,6 +449,31 @@ export class LspManager {
     };
   }
 
+  private getOrCreateLaunchPlan(
+    workspaceEntry: WorkspaceClients,
+    clientKey: string,
+    descriptor: LspServerDescriptor,
+    runtime: Runtime,
+    rootPath: string
+  ): Promise<ResolvedLspLaunchPlan> {
+    const existingLaunchPlan = workspaceEntry.launchPlans.get(clientKey);
+    if (existingLaunchPlan) {
+      return existingLaunchPlan;
+    }
+
+    const launchPlanPromise = resolveLspLaunchPlan({
+      descriptor,
+      runtime,
+      rootPath,
+    }).catch((error) => {
+      workspaceEntry.launchPlans.delete(clientKey);
+      throw error;
+    });
+
+    workspaceEntry.launchPlans.set(clientKey, launchPlanPromise);
+    return launchPlanPromise;
+  }
+
   private async resolveClientContext(options: {
     workspaceId: string;
     runtime: Runtime;
@@ -459,11 +502,6 @@ export class LspManager {
       descriptor.rootMarkers
     );
     const rootUri = pathMapper.toUri(rootPath);
-    const launchPlan = await resolveLspLaunchPlan({
-      descriptor,
-      runtime: options.runtime,
-      rootPath,
-    });
     const fileHandle: LspClientFileHandle = {
       runtimePath: runtimeFilePath,
       readablePath: pathMapper.toReadablePath(runtimeFilePath),
@@ -474,7 +512,6 @@ export class LspManager {
     const clientResult = await this.getOrCreateClient(
       options.workspaceId,
       descriptor,
-      launchPlan,
       options.runtime,
       pathMapper,
       rootPath,

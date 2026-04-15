@@ -25,6 +25,12 @@ function createDescriptor(command: string): LspServerDescriptor {
   };
 }
 
+function prependToPath(entry: string): string {
+  return [entry, process.env.PATH]
+    .filter((value): value is string => value != null && value.length > 0)
+    .join(path.delimiter);
+}
+
 describe("resolveLspLaunchPlan", () => {
   let workspacePath: string;
 
@@ -32,7 +38,8 @@ describe("resolveLspLaunchPlan", () => {
     workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "mux-lsp-launch-"));
     await fs.mkdir(path.join(workspacePath, "subdir"), { recursive: true });
     await fs.mkdir(path.join(workspacePath, "tools", "bin"), { recursive: true });
-    await fs.writeFile(path.join(workspacePath, "tools", "bin", "fake-lsp"), "#!/bin/sh\n");
+    await fs.writeFile(path.join(workspacePath, "tools", "bin", "fake-lsp"), "#!/bin/sh\nexit 0\n");
+    await fs.chmod(path.join(workspacePath, "tools", "bin", "fake-lsp"), 0o755);
   });
 
   afterEach(async () => {
@@ -67,6 +74,66 @@ describe("resolveLspLaunchPlan", () => {
     });
   });
 
+  it("resolves PATH lookups against the same env that will be used for launch", async () => {
+    const launchPath = prependToPath(path.join(workspacePath, "tools", "bin"));
+    const descriptor: LspServerDescriptor = {
+      ...createDescriptor("fake-lsp"),
+      launch: {
+        type: "manual",
+        command: "fake-lsp",
+        args: ["--stdio"],
+        env: {
+          PATH: launchPath,
+          LSP_TRACE: "verbose",
+        },
+      },
+    };
+
+    const launchPlan = await resolveLspLaunchPlan({
+      descriptor,
+      runtime: new LocalRuntime(workspacePath),
+      rootPath: workspacePath,
+    });
+
+    expect(launchPlan).toEqual({
+      command: path.join(workspacePath, "tools", "bin", "fake-lsp"),
+      args: ["--stdio"],
+      cwd: workspacePath,
+      env: {
+        PATH: launchPath,
+        LSP_TRACE: "verbose",
+      },
+      initializationOptions: undefined,
+    });
+  });
+
+  it("falls back to the raw path command when the candidate is not runnable", async () => {
+    const nonRunnableCommand = "../tools/bin/non-runnable-lsp";
+    await fs.writeFile(path.join(workspacePath, "tools", "bin", "non-runnable-lsp"), "#!/bin/sh\n");
+
+    const launchPlan = await resolveLspLaunchPlan({
+      descriptor: {
+        ...createDescriptor(nonRunnableCommand),
+        launch: {
+          type: "manual",
+          command: nonRunnableCommand,
+          args: ["--stdio"],
+          cwd: "./subdir",
+        },
+      },
+      runtime: new LocalRuntime(workspacePath),
+      rootPath: workspacePath,
+    });
+
+    expect(launchPlan).toEqual({
+      command: nonRunnableCommand,
+      args: ["--stdio"],
+      cwd: path.join(workspacePath, "subdir"),
+      env: undefined,
+      initializationOptions: undefined,
+    });
+  });
+
   it("falls back to the raw command when path probing cannot resolve it", async () => {
     const launchPlan = await resolveLspLaunchPlan({
       descriptor: createDescriptor("mux-test-missing-lsp"),
@@ -90,7 +157,11 @@ describe("lspLaunchProvisioning helpers", () => {
   beforeEach(async () => {
     workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "mux-lsp-provisioning-"));
     await fs.mkdir(path.join(workspacePath, "node_modules", ".bin"), { recursive: true });
-    await fs.writeFile(path.join(workspacePath, "node_modules", ".bin", "fake-lsp"), "#!/bin/sh\n");
+    await fs.writeFile(
+      path.join(workspacePath, "node_modules", ".bin", "fake-lsp"),
+      "#!/bin/sh\nexit 0\n"
+    );
+    await fs.chmod(path.join(workspacePath, "node_modules", ".bin", "fake-lsp"), 0o755);
   });
 
   afterEach(async () => {
@@ -105,7 +176,12 @@ describe("lspLaunchProvisioning helpers", () => {
       path.join(workspacePath, "node_modules", ".bin", "fake-lsp")
     );
     expect(
-      await probeWorkspaceLocalExecutableForWorkspace(runtime, "/unused/project", "feature", relativeCandidates)
+      await probeWorkspaceLocalExecutableForWorkspace(
+        runtime,
+        "/unused/project",
+        "feature",
+        relativeCandidates
+      )
     ).toBe(path.join(workspacePath, "node_modules", ".bin", "fake-lsp"));
   });
 

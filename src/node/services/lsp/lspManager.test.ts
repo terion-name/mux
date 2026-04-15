@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { WorkspaceLspDiagnosticsSnapshot } from "@/common/orpc/types";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import type { ExecOptions, ExecStream } from "@/node/runtime/Runtime";
 import type {
   CreateLspClientOptions,
   LspClientInstance,
@@ -49,6 +50,18 @@ function createRegistry(): readonly LspServerDescriptor[] {
   ];
 }
 
+class CountingLocalRuntime extends LocalRuntime {
+  readonly pathProbeCommands: string[] = [];
+
+  override async exec(command: string, options: ExecOptions): Promise<ExecStream> {
+    if (command.startsWith("command -v ")) {
+      this.pathProbeCommands.push(command);
+    }
+
+    return await super.exec(command, options);
+  }
+}
+
 function createDiagnostic(message: string): LspDiagnostic {
   return {
     range: {
@@ -59,6 +72,12 @@ function createDiagnostic(message: string): LspDiagnostic {
     source: "tsserver",
     message,
   };
+}
+
+function prependToPath(entry: string): string {
+  return [entry, process.env.PATH]
+    .filter((value): value is string => value != null && value.length > 0)
+    .join(path.delimiter);
 }
 
 describe("LspManager", () => {
@@ -156,6 +175,107 @@ describe("LspManager", () => {
 
     await manager.dispose();
     expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  test("reuses launch-plan probes for warm clients but re-runs them for a different root", async () => {
+    const lspBinDir = path.join(workspacePath, "tools", "bin");
+    const lspExecutable = path.join(lspBinDir, "fake-lsp");
+    const launchPath = prependToPath(lspBinDir);
+    await fs.mkdir(lspBinDir, { recursive: true });
+    await fs.writeFile(lspExecutable, "#!/bin/sh\nexit 0\n");
+    await fs.chmod(lspExecutable, 0o755);
+
+    const baseDescriptor = createRegistry()[0];
+    if (!baseDescriptor) {
+      throw new Error("Expected the test registry to provide a descriptor");
+    }
+
+    const descriptor: LspServerDescriptor = {
+      ...baseDescriptor,
+      launch: {
+        type: "manual",
+        command: "fake-lsp",
+        args: ["--stdio"],
+        env: { PATH: launchPath },
+      },
+    };
+    const launchPlans: Array<CreateLspClientOptions["launchPlan"]> = [];
+    const closeMocks: Array<ReturnType<typeof mock>> = [];
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      launchPlans.push(options.launchPlan);
+      const close = mock(() => Promise.resolve(undefined));
+      closeMocks.push(close);
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile: mock(() => Promise.resolve(1)),
+        query: mock(() =>
+          Promise.resolve({ operation: "hover" as const, hover: options.rootPath })
+        ),
+        close,
+      });
+    });
+
+    const manager = new LspManager({
+      registry: [descriptor],
+      clientFactory,
+    });
+    const runtime = new CountingLocalRuntime(workspacePath);
+
+    const first = await manager.query({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePath: "src/example.ts",
+      operation: "hover",
+      line: 1,
+      column: 1,
+    });
+    const second = await manager.query({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePath: "src/example.ts",
+      operation: "hover",
+      line: 1,
+      column: 1,
+    });
+    const third = await manager.query({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePath: "packages/pkg/src/nested.ts",
+      operation: "hover",
+      line: 1,
+      column: 1,
+    });
+
+    expect(first.hover).toBe(workspacePath);
+    expect(second.hover).toBe(workspacePath);
+    expect(third.hover).toBe(path.join(workspacePath, "packages", "pkg"));
+    expect(clientFactory).toHaveBeenCalledTimes(2);
+    expect(runtime.pathProbeCommands).toHaveLength(2);
+    expect(launchPlans).toEqual([
+      {
+        command: lspExecutable,
+        args: ["--stdio"],
+        cwd: workspacePath,
+        env: { PATH: launchPath },
+        initializationOptions: undefined,
+      },
+      {
+        command: lspExecutable,
+        args: ["--stdio"],
+        cwd: path.join(workspacePath, "packages", "pkg"),
+        env: { PATH: launchPath },
+        initializationOptions: undefined,
+      },
+    ]);
+
+    await manager.dispose();
+    expect(closeMocks).toHaveLength(2);
+    for (const close of closeMocks) {
+      expect(close).toHaveBeenCalledTimes(1);
+    }
   });
 
   test("deduplicates concurrent client creation for the same workspace root", async () => {

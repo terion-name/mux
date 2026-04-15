@@ -29,7 +29,12 @@ async function resolveManualLaunchPlan(
   launchPolicy: LspManualLaunchPolicy
 ): Promise<ResolvedLspLaunchPlan> {
   const launchCwd = await resolveLaunchCwd(runtime, rootPath, launchPolicy.cwd);
-  const resolvedCommand = await resolveManualCommand(runtime, launchCwd, launchPolicy.command);
+  const resolvedCommand = await resolveManualCommand(
+    runtime,
+    launchCwd,
+    launchPolicy.command,
+    launchPolicy.env
+  );
 
   return {
     command: resolvedCommand,
@@ -58,13 +63,14 @@ async function resolveLaunchCwd(
 async function resolveManualCommand(
   runtime: Runtime,
   launchCwd: string,
-  command: string
+  command: string,
+  env?: Readonly<Record<string, string>>
 ): Promise<string> {
   if (looksLikePathCandidate(command)) {
-    return (await resolveExecutablePathCandidate(runtime, command, launchCwd)) ?? command;
+    return (await resolveExecutablePathCandidate(runtime, command, launchCwd, env)) ?? command;
   }
 
-  return (await probeCommandOnPath(runtime, command, launchCwd)) ?? command;
+  return (await probeCommandOnPath(runtime, command, launchCwd, env)) ?? command;
 }
 
 function looksLikePathCandidate(command: string): boolean {
