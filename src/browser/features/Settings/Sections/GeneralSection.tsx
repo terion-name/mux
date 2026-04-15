@@ -235,6 +235,7 @@ export function GeneralSection() {
   const worktreeArchiveBehaviorPendingUpdateRef = useRef<WorktreeArchiveBehavior | undefined>(
     undefined
   );
+  const lspProvisioningModePendingUpdateRef = useRef<LspProvisioningMode | undefined>(undefined);
 
   useEffect(() => {
     if (!api) {
@@ -275,7 +276,8 @@ export function GeneralSection() {
 
         // Use an independent nonce so provisioning-mode changes do not discard other config updates.
         if (lspProvisioningModeNonce === lspProvisioningModeLoadNonceRef.current) {
-          setLspProvisioningMode(cfg.lspProvisioningMode ?? DEFAULT_LSP_PROVISIONING_MODE);
+          const nextLspProvisioningMode = cfg.lspProvisioningMode ?? DEFAULT_LSP_PROVISIONING_MODE;
+          setLspProvisioningMode(nextLspProvisioningMode);
           setLspProvisioningModeLoaded(true);
         }
       })
@@ -365,6 +367,34 @@ export function GeneralSection() {
     [api, archiveSettingsLoaded, queueArchiveBehaviorUpdate]
   );
 
+  const queueLspProvisioningModeUpdate = useCallback(() => {
+    if (!api?.config?.updateLspProvisioningMode || !lspProvisioningModeLoaded) {
+      return;
+    }
+
+    lspProvisioningModeUpdateChainRef.current = lspProvisioningModeUpdateChainRef.current
+      .then(async () => {
+        for (;;) {
+          const pendingLspProvisioningMode = lspProvisioningModePendingUpdateRef.current;
+          if (pendingLspProvisioningMode === undefined) {
+            return;
+          }
+
+          // Clear before awaiting so rapid changes coalesce into a new pending value.
+          lspProvisioningModePendingUpdateRef.current = undefined;
+
+          try {
+            await api.config.updateLspProvisioningMode({ mode: pendingLspProvisioningMode });
+          } catch {
+            // Best-effort only. Swallow errors so the queue doesn't get stuck.
+          }
+        }
+      })
+      .catch(() => {
+        // Best-effort only.
+      });
+  }, [api, lspProvisioningModeLoaded]);
+
   const handleLspProvisioningModeChange = useCallback(
     (mode: LspProvisioningMode) => {
       if (!lspProvisioningModeLoaded || !api?.config?.updateLspProvisioningMode) {
@@ -375,20 +405,10 @@ export function GeneralSection() {
       lspProvisioningModeLoadNonceRef.current++;
       setLspProvisioningMode(mode);
 
-      // Serialize writes so rapid selection changes always persist the last user choice.
-      lspProvisioningModeUpdateChainRef.current = lspProvisioningModeUpdateChainRef.current
-        .catch(() => {
-          // Best-effort only.
-        })
-        .then(() => api.config.updateLspProvisioningMode({ mode }))
-        .then(() => {
-          // Coerce the chain back to Promise<void>.
-        })
-        .catch(() => {
-          // Best-effort persistence.
-        });
+      lspProvisioningModePendingUpdateRef.current = mode;
+      queueLspProvisioningModeUpdate();
     },
-    [api, lspProvisioningModeLoaded]
+    [api, lspProvisioningModeLoaded, queueLspProvisioningModeUpdate]
   );
 
   const handleLlmDebugLogsChange = (checked: boolean) => {
@@ -662,7 +682,7 @@ export function GeneralSection() {
           <div className="text-foreground text-sm">LSP provisioning mode</div>
           <div className="text-muted text-xs">
             Choose whether mux only uses existing language servers or can also auto-provision
-            supported ones.
+            supported ones. Changing this restarts active LSP clients.
           </div>
         </div>
         <Select
@@ -670,7 +690,10 @@ export function GeneralSection() {
           onValueChange={(value) => handleLspProvisioningModeChange(value as LspProvisioningMode)}
           disabled={!api?.config?.updateLspProvisioningMode || !lspProvisioningModeLoaded}
         >
-          <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
+          <SelectTrigger
+            aria-label="LSP provisioning mode"
+            className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors"
+          >
             <SelectValue />
           </SelectTrigger>
           <SelectContent>

@@ -296,6 +296,10 @@ describe("GeneralSection", () => {
     return trigger;
   }
 
+  function getLspProvisioningModeTrigger(view: ReturnType<typeof render>): HTMLElement {
+    return view.getByRole("combobox", { name: "LSP provisioning mode" });
+  }
+
   function chooseSelectOption(
     view: ReturnType<typeof render>,
     label: string,
@@ -323,6 +327,18 @@ describe("GeneralSection", () => {
     });
   });
 
+  test("adds an accessible name and restart warning for the LSP provisioning mode control", async () => {
+    const { view } = renderGeneralSection();
+
+    await waitFor(() => {
+      expect(getLspProvisioningModeTrigger(view).textContent).toContain("Manual");
+    });
+
+    expect(
+      view.getByText(/supported ones\. changing this restarts active lsp clients\./i)
+    ).toBeTruthy();
+  });
+
   test("persists the selected LSP provisioning mode", async () => {
     const { updateLspProvisioningModeMock, view } = renderGeneralSection({
       lspProvisioningMode: DEFAULT_LSP_PROVISIONING_MODE,
@@ -338,6 +354,57 @@ describe("GeneralSection", () => {
       expect(updateLspProvisioningModeMock).toHaveBeenCalledWith({ mode: "auto" });
       expect(getSelectTrigger(view, "LSP provisioning mode").textContent).toContain("Auto");
     });
+  });
+
+  test("serializes rapid LSP provisioning mode changes so only the latest value is persisted", async () => {
+    const { api, updateLspProvisioningModeMock } = createMockAPI({
+      lspProvisioningMode: DEFAULT_LSP_PROVISIONING_MODE,
+    });
+    let resolveFirstUpdate: (() => void) | undefined;
+    let resolveSecondUpdate: (() => void) | undefined;
+
+    api.config.updateLspProvisioningMode = updateLspProvisioningModeMock.mockImplementation(
+      ({ mode: _mode }: { mode: LspProvisioningMode }) =>
+        new Promise<void>((resolve) => {
+          if (!resolveFirstUpdate) {
+            resolveFirstUpdate = resolve;
+            return;
+          }
+
+          resolveSecondUpdate = resolve;
+        })
+    );
+    mockApi = api;
+
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <GeneralSection />
+      </ThemeProvider>
+    );
+
+    await waitFor(() => {
+      expect(getLspProvisioningModeTrigger(view).textContent).toContain("Manual");
+    });
+
+    chooseSelectOption(view, "LSP provisioning mode", "Auto");
+
+    await waitFor(() => {
+      expect(updateLspProvisioningModeMock).toHaveBeenCalledTimes(1);
+      expect(updateLspProvisioningModeMock).toHaveBeenNthCalledWith(1, { mode: "auto" });
+    });
+
+    chooseSelectOption(view, "LSP provisioning mode", "Manual");
+    expect(updateLspProvisioningModeMock).toHaveBeenCalledTimes(1);
+
+    resolveFirstUpdate?.();
+
+    await waitFor(() => {
+      expect(updateLspProvisioningModeMock).toHaveBeenCalledTimes(2);
+      expect(updateLspProvisioningModeMock).toHaveBeenNthCalledWith(2, { mode: "manual" });
+      expect(getLspProvisioningModeTrigger(view).textContent).toContain("Manual");
+    });
+
+    resolveSecondUpdate?.();
   });
 
   test("re-enables LSP provisioning mode with the default after config load errors", async () => {
