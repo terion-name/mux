@@ -56,6 +56,7 @@ import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { ProjectRef } from "@/common/types/workspace";
 import type { LspManager } from "@/node/services/lsp/lspManager";
+import type { LspPolicyContext } from "@/node/services/lsp/types";
 
 /**
  * Configuration for tools that need runtime context
@@ -126,6 +127,8 @@ export interface ToolConfiguration {
   desktopSessionManager?: DesktopSessionManager;
   /** Shared workspace-scoped LSP manager for built-in query tooling */
   lspManager?: LspManager;
+  /** Effective LSP launch policy context for this workspace/request. */
+  lspPolicyContext?: LspPolicyContext;
   /** Whether the experiment-gated lsp_query tool should be exposed for this request */
   lspQueryEnabled?: boolean;
 }
@@ -354,7 +357,7 @@ export async function getToolsForModel(
     agent_skill_read_file: wrap(createAgentSkillReadFileTool(config)),
     file_edit_replace_string: wrap(createFileEditReplaceStringTool(config)),
     file_edit_insert: wrap(createFileEditInsertTool(config)),
-    ...(config.lspManager && config.lspQueryEnabled
+    ...(config.lspManager && config.lspPolicyContext && config.lspQueryEnabled
       ? {
           lsp_query: wrap(createLspQueryTool(config)),
         }
@@ -505,7 +508,10 @@ export async function getToolsForModel(
     getAvailableTools(modelString, {
       enableAgentReport: config.enableAgentReport,
       enableAnalyticsQuery: Boolean(config.analyticsService),
-      enableLspQuery: config.lspManager != null && config.lspQueryEnabled === true,
+      enableLspQuery:
+        config.lspManager != null &&
+        config.lspPolicyContext != null &&
+        config.lspQueryEnabled === true,
       // Mux global tools are always created; tool policy (agent frontmatter)
       // controls which agents can actually use them.
       enableMuxGlobalAgentsTools: true,

@@ -1,5 +1,6 @@
 import { os, ORPCError } from "@orpc/server";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
+import { DEFAULT_LSP_PROVISIONING_MODE } from "@/common/config/schemas/appConfigOnDisk";
 import * as schemas from "@/common/orpc/schemas";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { ORPCContext } from "./context";
@@ -586,6 +587,7 @@ export const router = (authToken?: string) => {
             worktreeArchiveBehavior: config.worktreeArchiveBehavior ?? "keep",
             runtimeEnablement: normalizeRuntimeEnablement(config.runtimeEnablement),
             defaultRuntime: config.defaultRuntime ?? null,
+            lspProvisioningMode: config.lspProvisioningMode ?? DEFAULT_LSP_PROVISIONING_MODE,
             agentAiDefaults: config.agentAiDefaults ?? {},
             // Legacy fields (downgrade compatibility)
             subagentAiDefaults: config.subagentAiDefaults ?? {},
@@ -951,6 +953,20 @@ export const router = (authToken?: string) => {
 
           // Re-evaluate task queue in case more slots opened up
           await context.taskService.maybeStartQueuedTasks();
+        }),
+      updateLspProvisioningMode: t
+        .input(schemas.config.updateLspProvisioningMode.input)
+        .output(schemas.config.updateLspProvisioningMode.output)
+        .handler(async ({ context, input }) => {
+          await context.config.editConfig((config) => {
+            const next = { ...config };
+            if (input.mode === DEFAULT_LSP_PROVISIONING_MODE) {
+              delete next.lspProvisioningMode;
+            } else {
+              next.lspProvisioningMode = input.mode;
+            }
+            return next;
+          });
         }),
       updateLlmDebugLogs: t
         .input(schemas.config.updateLlmDebugLogs.input)

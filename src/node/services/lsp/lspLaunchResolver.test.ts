@@ -9,9 +9,22 @@ import {
   probeWorkspaceLocalExecutableForWorkspace,
 } from "./lspLaunchProvisioning";
 import { resolveLspLaunchPlan } from "./lspLaunchResolver";
-import type { LspServerDescriptor } from "./types";
+import type { LspPolicyContext, LspServerDescriptor } from "./types";
 
-function createDescriptor(command: string): LspServerDescriptor {
+const TRUSTED_MANUAL_POLICY_CONTEXT: LspPolicyContext = {
+  provisioningMode: "manual",
+  trustedWorkspaceExecution: true,
+};
+const TRUSTED_AUTO_POLICY_CONTEXT: LspPolicyContext = {
+  provisioningMode: "auto",
+  trustedWorkspaceExecution: true,
+};
+const UNTRUSTED_AUTO_POLICY_CONTEXT: LspPolicyContext = {
+  provisioningMode: "auto",
+  trustedWorkspaceExecution: false,
+};
+
+function createManualDescriptor(command: string): LspServerDescriptor {
   return {
     id: "typescript",
     extensions: [".ts"],
@@ -31,15 +44,25 @@ function prependToPath(entry: string): string {
     .join(path.delimiter);
 }
 
+async function writeExecutable(filePath: string, script: string): Promise<void> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, script);
+  await fs.chmod(filePath, 0o755);
+}
+
 describe("resolveLspLaunchPlan", () => {
   let workspacePath: string;
+  let runtime: LocalRuntime;
+  let binDir: string;
 
   beforeEach(async () => {
     workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "mux-lsp-launch-"));
+    runtime = new LocalRuntime(workspacePath);
+    binDir = path.join(workspacePath, "tools", "bin");
+
     await fs.mkdir(path.join(workspacePath, "subdir"), { recursive: true });
-    await fs.mkdir(path.join(workspacePath, "tools", "bin"), { recursive: true });
-    await fs.writeFile(path.join(workspacePath, "tools", "bin", "fake-lsp"), "#!/bin/sh\nexit 0\n");
-    await fs.chmod(path.join(workspacePath, "tools", "bin", "fake-lsp"), 0o755);
+    await fs.mkdir(path.join(workspacePath, ".git"), { recursive: true });
+    await fs.writeFile(path.join(workspacePath, "package.json"), "{}\n");
   });
 
   afterEach(async () => {
@@ -47,8 +70,13 @@ describe("resolveLspLaunchPlan", () => {
   });
 
   it("resolves explicit relative executables and launch cwd before client creation", async () => {
+    await writeExecutable(
+      path.join(workspacePath, "tools", "bin", "fake-lsp"),
+      "#!/bin/sh\nexit 0\n"
+    );
+
     const descriptor: LspServerDescriptor = {
-      ...createDescriptor("../tools/bin/fake-lsp"),
+      ...createManualDescriptor("../tools/bin/fake-lsp"),
       launch: {
         type: "manual",
         command: "../tools/bin/fake-lsp",
@@ -61,8 +89,9 @@ describe("resolveLspLaunchPlan", () => {
 
     const launchPlan = await resolveLspLaunchPlan({
       descriptor,
-      runtime: new LocalRuntime(workspacePath),
+      runtime,
       rootPath: workspacePath,
+      policyContext: TRUSTED_MANUAL_POLICY_CONTEXT,
     });
 
     expect(launchPlan).toEqual({
@@ -74,80 +103,221 @@ describe("resolveLspLaunchPlan", () => {
     });
   });
 
-  it("resolves PATH lookups against the same env that will be used for launch", async () => {
-    const launchPath = prependToPath(path.join(workspacePath, "tools", "bin"));
-    const descriptor: LspServerDescriptor = {
-      ...createDescriptor("fake-lsp"),
-      launch: {
-        type: "manual",
-        command: "fake-lsp",
-        args: ["--stdio"],
-        env: {
-          PATH: launchPath,
-          LSP_TRACE: "verbose",
-        },
-      },
-    };
-
-    const launchPlan = await resolveLspLaunchPlan({
-      descriptor,
-      runtime: new LocalRuntime(workspacePath),
-      rootPath: workspacePath,
+  it("prefers trusted workspace-local TypeScript server and injects project tsserver path", async () => {
+    await writeExecutable(
+      path.join(workspacePath, "node_modules", ".bin", "typescript-language-server"),
+      "#!/bin/sh\nexit 0\n"
+    );
+    await fs.mkdir(path.join(workspacePath, "node_modules", "typescript", "lib"), {
+      recursive: true,
     });
-
-    expect(launchPlan).toEqual({
-      command: path.join(workspacePath, "tools", "bin", "fake-lsp"),
-      args: ["--stdio"],
-      cwd: workspacePath,
-      env: {
-        PATH: launchPath,
-        LSP_TRACE: "verbose",
-      },
-      initializationOptions: undefined,
-    });
-  });
-
-  it("falls back to the raw path command when the candidate is not runnable", async () => {
-    const nonRunnableCommand = "../tools/bin/non-runnable-lsp";
-    await fs.writeFile(path.join(workspacePath, "tools", "bin", "non-runnable-lsp"), "#!/bin/sh\n");
+    await fs.writeFile(
+      path.join(workspacePath, "node_modules", "typescript", "lib", "tsserver.js"),
+      "module.exports = {};\n"
+    );
+    await writeExecutable(path.join(binDir, "typescript-language-server"), "#!/bin/sh\nexit 0\n");
 
     const launchPlan = await resolveLspLaunchPlan({
       descriptor: {
-        ...createDescriptor(nonRunnableCommand),
+        id: "typescript",
+        extensions: [".ts"],
         launch: {
-          type: "manual",
-          command: nonRunnableCommand,
+          type: "provisioned",
           args: ["--stdio"],
-          cwd: "./subdir",
+          env: { PATH: prependToPath(binDir) },
+          workspaceTsserverPathCandidates: ["node_modules/typescript/lib"],
+          strategies: [
+            {
+              type: "workspaceLocalExecutable",
+              relativeCandidates: ["node_modules/.bin/typescript-language-server"],
+            },
+            { type: "pathCommand", command: "typescript-language-server" },
+          ],
         },
+        rootMarkers: ["package.json", ".git"],
+        languageIdForPath: () => "typescript",
       },
-      runtime: new LocalRuntime(workspacePath),
+      runtime,
       rootPath: workspacePath,
+      policyContext: TRUSTED_MANUAL_POLICY_CONTEXT,
+    });
+
+    expect(launchPlan.command).toBe(
+      path.join(workspacePath, "node_modules", ".bin", "typescript-language-server")
+    );
+    expect(launchPlan.args).toEqual(["--stdio"]);
+    expect(launchPlan.initializationOptions).toEqual({
+      tsserver: {
+        path: path.join(workspacePath, "node_modules", "typescript", "lib"),
+      },
+    });
+  });
+
+  it("skips workspace-local probes for untrusted workspaces and falls back to PATH", async () => {
+    await writeExecutable(
+      path.join(workspacePath, "node_modules", ".bin", "typescript-language-server"),
+      "#!/bin/sh\nexit 0\n"
+    );
+    await fs.mkdir(path.join(workspacePath, "node_modules", "typescript", "lib"), {
+      recursive: true,
+    });
+    await fs.writeFile(
+      path.join(workspacePath, "node_modules", "typescript", "lib", "tsserver.js"),
+      "module.exports = {};\n"
+    );
+    await writeExecutable(path.join(binDir, "typescript-language-server"), "#!/bin/sh\nexit 0\n");
+
+    const launchPlan = await resolveLspLaunchPlan({
+      descriptor: {
+        id: "typescript",
+        extensions: [".ts"],
+        launch: {
+          type: "provisioned",
+          args: ["--stdio"],
+          env: { PATH: prependToPath(binDir) },
+          workspaceTsserverPathCandidates: ["node_modules/typescript/lib"],
+          strategies: [
+            {
+              type: "workspaceLocalExecutable",
+              relativeCandidates: ["node_modules/.bin/typescript-language-server"],
+            },
+            { type: "pathCommand", command: "typescript-language-server" },
+          ],
+        },
+        rootMarkers: ["package.json", ".git"],
+        languageIdForPath: () => "typescript",
+      },
+      runtime,
+      rootPath: workspacePath,
+      policyContext: UNTRUSTED_AUTO_POLICY_CONTEXT,
+    });
+
+    expect(launchPlan.command).toBe(path.join(binDir, "typescript-language-server"));
+    expect(launchPlan.initializationOptions).toBeUndefined();
+  });
+
+  it("orders package-manager execution using repo signals", async () => {
+    await writeExecutable(path.join(binDir, "bunx"), "#!/bin/sh\nexit 0\n");
+    await writeExecutable(path.join(binDir, "pnpm"), "#!/bin/sh\nexit 0\n");
+    await writeExecutable(path.join(binDir, "npm"), "#!/bin/sh\nexit 0\n");
+    await fs.writeFile(
+      path.join(workspacePath, "package.json"),
+      JSON.stringify({ packageManager: "bun@1.2.0" })
+    );
+    await fs.writeFile(path.join(workspacePath, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+
+    const launchPlan = await resolveLspLaunchPlan({
+      descriptor: {
+        id: "typescript",
+        extensions: [".ts"],
+        launch: {
+          type: "provisioned",
+          args: ["--stdio"],
+          env: { PATH: prependToPath(binDir) },
+          strategies: [
+            {
+              type: "nodePackageExec",
+              packageName: "typescript-language-server",
+              binaryName: "typescript-language-server",
+            },
+          ],
+        },
+        rootMarkers: ["package.json", ".git"],
+        languageIdForPath: () => "typescript",
+      },
+      runtime,
+      rootPath: workspacePath,
+      policyContext: TRUSTED_AUTO_POLICY_CONTEXT,
     });
 
     expect(launchPlan).toEqual({
-      command: nonRunnableCommand,
-      args: ["--stdio"],
-      cwd: path.join(workspacePath, "subdir"),
-      env: undefined,
+      command: path.join(binDir, "bunx"),
+      args: ["--package", "typescript-language-server", "typescript-language-server", "--stdio"],
+      cwd: workspacePath,
+      env: { PATH: prependToPath(binDir) },
       initializationOptions: undefined,
     });
   });
 
-  it("falls back to the raw command when path probing cannot resolve it", async () => {
+  it("gates managed gopls installs on provisioning mode and installs in auto mode", async () => {
+    await writeExecutable(
+      path.join(binDir, "go"),
+      '#!/bin/sh\nmkdir -p "$GOBIN"\nprintf \'#!/bin/sh\\nexit 0\\n\' > "$GOBIN/gopls"\nchmod +x "$GOBIN/gopls"\n'
+    );
+
+    const descriptor: LspServerDescriptor = {
+      id: "go",
+      extensions: [".go"],
+      launch: {
+        type: "provisioned",
+        env: { PATH: prependToPath(binDir) },
+        strategies: [
+          {
+            type: "goManagedInstall",
+            module: "golang.org/x/tools/gopls@v0.21.0",
+            binaryName: "gopls",
+          },
+        ],
+      },
+      rootMarkers: ["go.mod", ".git"],
+      languageIdForPath: () => "go",
+    };
+
+    try {
+      await resolveLspLaunchPlan({
+        descriptor,
+        runtime,
+        rootPath: workspacePath,
+        policyContext: TRUSTED_MANUAL_POLICY_CONTEXT,
+      });
+      throw new Error("Expected manual provisioning mode to reject managed gopls installs");
+    } catch (error) {
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain("managed Go installs are disabled in manual mode");
+    }
+
     const launchPlan = await resolveLspLaunchPlan({
-      descriptor: createDescriptor("mux-test-missing-lsp"),
-      runtime: new LocalRuntime(workspacePath),
+      descriptor,
+      runtime,
       rootPath: workspacePath,
+      policyContext: TRUSTED_AUTO_POLICY_CONTEXT,
     });
 
-    expect(launchPlan).toEqual({
-      command: "mux-test-missing-lsp",
-      args: ["--stdio"],
-      cwd: workspacePath,
-      env: undefined,
-      initializationOptions: undefined,
-    });
+    expect(launchPlan.command).toBe(
+      path.join(await runtime.resolvePath(getManagedLspToolsDir(runtime, "go", "bin")), "gopls")
+    );
+    expect(launchPlan.cwd).toBe(workspacePath);
+    expect(launchPlan.env).toEqual({ PATH: prependToPath(binDir) });
+  });
+
+  it("returns unsupported errors for servers without auto-install support", async () => {
+    try {
+      await resolveLspLaunchPlan({
+        descriptor: {
+          id: "rust",
+          extensions: [".rs"],
+          launch: {
+            type: "provisioned",
+            strategies: [
+              {
+                type: "unsupported",
+                message:
+                  "rust-analyzer is not available on PATH and automatic installation is not supported yet",
+              },
+            ],
+          },
+          rootMarkers: ["Cargo.toml", ".git"],
+          languageIdForPath: () => "rust",
+        },
+        runtime,
+        rootPath: workspacePath,
+        policyContext: TRUSTED_AUTO_POLICY_CONTEXT,
+      });
+      throw new Error("Expected rust-analyzer provisioning to report unsupported auto-install");
+    } catch (error) {
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain("automatic installation is not supported yet");
+    }
   });
 });
 

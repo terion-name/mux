@@ -24,6 +24,7 @@ import type {
   LspFileDiagnostics,
   LspLocation,
   LspManagerQueryResult,
+  LspPolicyContext,
   LspPublishDiagnosticsParams,
   LspQueryOperation,
   LspRange,
@@ -70,6 +71,7 @@ export interface LspManagerQueryOptions {
   runtime: Runtime;
   workspacePath: string;
   filePath: string;
+  policyContext: LspPolicyContext;
   operation: LspQueryOperation;
   line?: number;
   column?: number;
@@ -82,6 +84,7 @@ export interface LspManagerCollectDiagnosticsOptions {
   runtime: Runtime;
   workspacePath: string;
   filePaths: string[];
+  policyContext: LspPolicyContext;
   timeoutMs?: number;
 }
 
@@ -220,6 +223,7 @@ export class LspManager {
               runtime: options.runtime,
               workspacePath: options.workspacePath,
               filePath,
+              policyContext: options.policyContext,
             });
             const entriesForClient = fileContextsByClientKey.get(context.clientKey) ?? [];
             entriesForClient.push({ filePath, context });
@@ -346,7 +350,8 @@ export class LspManager {
     runtime: Runtime,
     pathMapper: LspPathMapper,
     rootPath: string,
-    rootUri: string
+    rootUri: string,
+    policyContext: LspPolicyContext
   ): Promise<{ client: LspClientInstance; clientKey: string; workspaceGeneration: number }> {
     const workspaceEntry = this.workspaceClients.get(workspaceId) ?? {
       clients: new Map<string, LspClientInstance>(),
@@ -356,7 +361,7 @@ export class LspManager {
     };
     this.workspaceClients.set(workspaceId, workspaceEntry);
 
-    const clientKey = this.getClientKey(descriptor.id, rootUri);
+    const clientKey = this.getClientKey(descriptor.id, rootUri, policyContext);
     const workspaceGeneration = this.getWorkspaceGeneration(workspaceId);
     const existingClient = workspaceEntry.clients.get(clientKey);
     if (existingClient && !existingClient.isClosed) {
@@ -385,7 +390,8 @@ export class LspManager {
       clientKey,
       descriptor,
       runtime,
-      rootPath
+      rootPath,
+      policyContext
     );
 
     // Deduplicate concurrent queries for the same workspace/root so we never spawn
@@ -457,7 +463,8 @@ export class LspManager {
     clientKey: string,
     descriptor: LspServerDescriptor,
     runtime: Runtime,
-    rootPath: string
+    rootPath: string,
+    policyContext: LspPolicyContext
   ): Promise<ResolvedLspLaunchPlan> {
     const existingLaunchPlan = workspaceEntry.launchPlans.get(clientKey);
     if (existingLaunchPlan) {
@@ -468,6 +475,7 @@ export class LspManager {
       descriptor,
       runtime,
       rootPath,
+      policyContext,
     }).catch((error) => {
       workspaceEntry.launchPlans.delete(clientKey);
       throw error;
@@ -482,6 +490,7 @@ export class LspManager {
     runtime: Runtime;
     workspacePath: string;
     filePath: string;
+    policyContext: LspPolicyContext;
   }): Promise<ResolvedLspClientContext> {
     const pathMapper = new LspPathMapper({
       runtime: options.runtime,
@@ -518,7 +527,8 @@ export class LspManager {
       options.runtime,
       pathMapper,
       rootPath,
-      rootUri
+      rootUri,
+      options.policyContext
     );
 
     return {
@@ -861,8 +871,12 @@ export class LspManager {
     this.notifyWorkspaceDiagnosticsListeners(workspaceId);
   }
 
-  private getClientKey(serverId: string, rootUri: string): string {
-    return `${serverId}:${rootUri}`;
+  private getClientKey(serverId: string, rootUri: string, policyContext: LspPolicyContext): string {
+    return `${serverId}:${rootUri}:${this.getPolicyContextKey(policyContext)}`;
+  }
+
+  private getPolicyContextKey(policyContext: LspPolicyContext): string {
+    return `${policyContext.provisioningMode}:${policyContext.trustedWorkspaceExecution ? "trusted" : "untrusted"}`;
   }
 
   private async normalizeQueryResult(

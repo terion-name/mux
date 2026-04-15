@@ -5,6 +5,11 @@ import { createTestToolConfig } from "./testHelpers";
 import { createLspQueryTool } from "./lsp_query";
 import type { LspQueryToolResult } from "@/common/types/tools";
 
+const TEST_LSP_POLICY_CONTEXT = {
+  provisioningMode: "manual" as const,
+  trustedWorkspaceExecution: true,
+};
+
 const mockToolCallOptions: ToolExecutionOptions = {
   toolCallId: "tool-call-id",
   messages: [],
@@ -24,6 +29,7 @@ describe("lsp_query tool", () => {
     lspManager.query = query;
     const config = createTestToolConfig(process.cwd());
     config.lspManager = lspManager;
+    config.lspPolicyContext = TEST_LSP_POLICY_CONTEXT;
     const configuredTool = createLspQueryTool(config);
 
     try {
@@ -43,6 +49,11 @@ describe("lsp_query tool", () => {
         expect(result.hover).toBe("const value: 1");
       }
       expect(query).toHaveBeenCalledTimes(1);
+      expect(query).toHaveBeenCalledWith(
+        expect.objectContaining({
+          policyContext: TEST_LSP_POLICY_CONTEXT,
+        })
+      );
     } finally {
       await lspManager.dispose();
     }
@@ -61,6 +72,7 @@ describe("lsp_query tool", () => {
     );
     lspManager.query = query;
     config.lspManager = lspManager;
+    config.lspPolicyContext = TEST_LSP_POLICY_CONTEXT;
     const tool = createLspQueryTool(config);
 
     try {

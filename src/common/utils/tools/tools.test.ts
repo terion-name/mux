@@ -192,6 +192,10 @@ describe("getToolsForModel", () => {
           runtime,
           runtimeTempDir: "/tmp",
           lspManager,
+          lspPolicyContext: {
+            provisioningMode: "manual",
+            trustedWorkspaceExecution: true,
+          },
           lspQueryEnabled: true,
         },
         "ws-1",

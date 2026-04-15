@@ -143,6 +143,36 @@ describe("Config", () => {
     });
   });
 
+  describe("lspProvisioningMode", () => {
+    it("persists auto provisioning mode and omits the default manual mode", async () => {
+      await config.editConfig((cfg) => {
+        cfg.lspProvisioningMode = "auto";
+        return cfg;
+      });
+
+      let loaded = config.loadConfigOrDefault();
+      expect(loaded.lspProvisioningMode).toBe("auto");
+
+      let raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        lspProvisioningMode?: unknown;
+      };
+      expect(raw.lspProvisioningMode).toBe("auto");
+
+      await config.editConfig((cfg) => {
+        delete cfg.lspProvisioningMode;
+        return cfg;
+      });
+
+      loaded = config.loadConfigOrDefault();
+      expect(loaded.lspProvisioningMode).toBeUndefined();
+
+      raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        lspProvisioningMode?: unknown;
+      };
+      expect(raw.lspProvisioningMode).toBeUndefined();
+    });
+  });
+
   describe("server GitHub owner auth setting", () => {
     it("persists serverAuthGithubOwner", async () => {
       await config.editConfig((cfg) => {

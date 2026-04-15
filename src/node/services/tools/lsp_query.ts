@@ -36,7 +36,7 @@ export const createLspQueryTool: ToolFactory = (config: ToolConfiguration) =>
     description: TOOL_DEFINITIONS.lsp_query.description,
     inputSchema: TOOL_DEFINITIONS.lsp_query.schema,
     execute: async (args): Promise<LspQueryToolResult> => {
-      if (!config.lspManager || !config.workspaceId) {
+      if (!config.lspManager || !config.workspaceId || !config.lspPolicyContext) {
         return {
           success: false,
           error: "LSP query tool is unavailable in this workspace",
@@ -72,6 +72,7 @@ export const createLspQueryTool: ToolFactory = (config: ToolConfiguration) =>
           workspacePath: config.cwd,
           filePath: resolvedPath,
           operation: args.operation,
+          policyContext: config.lspPolicyContext,
           line: args.line ?? undefined,
           column: args.column ?? undefined,
           query: args.query ?? undefined,

@@ -1,3 +1,4 @@
+import type { LspProvisioningMode } from "@/common/config/schemas/appConfigOnDisk";
 import type { Runtime } from "@/node/runtime/Runtime";
 
 export type LspQueryOperation =
@@ -116,6 +117,11 @@ export interface LspManagerQueryResult {
   warning?: string;
 }
 
+export interface LspPolicyContext {
+  provisioningMode: LspProvisioningMode;
+  trustedWorkspaceExecution: boolean;
+}
+
 export interface LspManualLaunchPolicy {
   type: "manual";
   command: string;
@@ -125,7 +131,55 @@ export interface LspManualLaunchPolicy {
   initializationOptions?: unknown;
 }
 
-export type LspServerLaunchPolicy = LspManualLaunchPolicy;
+export type LspNodePackageManager = "bunx" | "pnpm" | "npm";
+
+export interface LspWorkspaceLocalExecutableStrategy {
+  type: "workspaceLocalExecutable";
+  relativeCandidates: readonly string[];
+}
+
+export interface LspPathCommandStrategy {
+  type: "pathCommand";
+  command: string;
+}
+
+export interface LspNodePackageExecStrategy {
+  type: "nodePackageExec";
+  packageName: string;
+  binaryName: string;
+  packageManagers?: readonly LspNodePackageManager[];
+}
+
+export interface LspGoManagedInstallStrategy {
+  type: "goManagedInstall";
+  module: string;
+  binaryName: string;
+  installSubdirectory?: readonly string[];
+}
+
+export interface LspUnsupportedProvisioningStrategy {
+  type: "unsupported";
+  message: string;
+}
+
+export type LspProvisioningStrategy =
+  | LspWorkspaceLocalExecutableStrategy
+  | LspPathCommandStrategy
+  | LspNodePackageExecStrategy
+  | LspGoManagedInstallStrategy
+  | LspUnsupportedProvisioningStrategy;
+
+export interface LspProvisionedLaunchPolicy {
+  type: "provisioned";
+  args?: readonly string[];
+  env?: Readonly<Record<string, string>>;
+  cwd?: string;
+  initializationOptions?: unknown;
+  workspaceTsserverPathCandidates?: readonly string[];
+  strategies: readonly LspProvisioningStrategy[];
+}
+
+export type LspServerLaunchPolicy = LspManualLaunchPolicy | LspProvisionedLaunchPolicy;
 
 export interface ResolvedLspLaunchPlan {
   command: string;

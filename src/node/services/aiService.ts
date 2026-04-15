@@ -13,6 +13,7 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { SendMessageOptions, ProvidersConfigMap } from "@/common/orpc/types";
 
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
+import { DEFAULT_LSP_PROVISIONING_MODE } from "@/common/config/schemas/appConfigOnDisk";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 
 import type { MuxMessage } from "@/common/types/message";
@@ -101,7 +102,7 @@ import { applyToolPolicyAndExperiments, captureMcpToolTelemetry } from "./toolAs
 import { getErrorMessage } from "@/common/utils/errors";
 import { isProjectTrusted } from "@/node/utils/projectTrust";
 import type { LspManager } from "@/node/services/lsp/lspManager";
-import type { LspDiagnostic, LspFileDiagnostics } from "@/node/services/lsp/types";
+import type { LspDiagnostic, LspFileDiagnostics, LspPolicyContext } from "@/node/services/lsp/types";
 
 const STREAM_STARTUP_DIAGNOSTIC_THRESHOLD_MS = 1_000;
 
@@ -1121,6 +1122,11 @@ export class AIService extends EventEmitter {
       const projectTrusted = isProjectTrusted(this.config, metadata.projectPath);
       const sharedExecutionTrusted = isWorkspaceTrustedForSharedExecution(metadata, cfg.projects);
 
+      const lspPolicyContext: LspPolicyContext = {
+        provisioningMode: cfg.lspProvisioningMode ?? DEFAULT_LSP_PROVISIONING_MODE,
+        trustedWorkspaceExecution: sharedExecutionTrusted,
+      };
+
       // Fetch workspace MCP overrides (for filtering servers and tools)
       // NOTE: Stored in <workspace>/.mux/mcp.local.jsonc (not ~/.mux/config.json).
       let mcpOverrides: WorkspaceMCPOverrides | undefined;
@@ -1367,6 +1373,7 @@ export class AIService extends EventEmitter {
                 runtime,
                 workspacePath,
                 filePaths,
+                policyContext: lspPolicyContext,
               });
               return formatPostMutationDiagnostics(diagnostics, workspacePath);
             } catch (error) {
@@ -1383,6 +1390,7 @@ export class AIService extends EventEmitter {
           analyticsService: this.analyticsService,
           desktopSessionManager: this.desktopSessionManager,
           lspManager: this.lspManager,
+          lspPolicyContext,
           lspQueryEnabled,
           // PTC experiments for inheritance to subagents
           experiments,

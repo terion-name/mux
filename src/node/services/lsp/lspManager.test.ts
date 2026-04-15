@@ -13,6 +13,11 @@ import type {
 } from "./types";
 import { LspManager } from "./lspManager";
 
+const TEST_LSP_POLICY_CONTEXT = {
+  provisioningMode: "manual" as const,
+  trustedWorkspaceExecution: true,
+};
+
 function createDeferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;
@@ -135,6 +140,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePath: "src/example.ts",
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       operation: "hover",
       line: 2,
       column: 3,
@@ -144,6 +150,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePath: "src/example.ts",
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       operation: "hover",
       line: 2,
       column: 3,
@@ -226,6 +233,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePath: "src/example.ts",
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       operation: "hover",
       line: 1,
       column: 1,
@@ -235,6 +243,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePath: "src/example.ts",
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       operation: "hover",
       line: 1,
       column: 1,
@@ -244,6 +253,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePath: "packages/pkg/src/nested.ts",
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       operation: "hover",
       line: 1,
       column: 1,
@@ -276,6 +286,86 @@ describe("LspManager", () => {
     for (const close of closeMocks) {
       expect(close).toHaveBeenCalledTimes(1);
     }
+  });
+
+  test("creates separate clients when LSP policy context changes for the same root", async () => {
+    const localExecutable = path.join(
+      workspacePath,
+      "node_modules",
+      ".bin",
+      "typescript-language-server"
+    );
+    const pathExecutable = path.join(workspacePath, "tools", "bin", "typescript-language-server");
+    await fs.mkdir(path.dirname(localExecutable), { recursive: true });
+    await fs.mkdir(path.dirname(pathExecutable), { recursive: true });
+    await fs.writeFile(localExecutable, "#!/bin/sh\nexit 0\n");
+    await fs.writeFile(pathExecutable, "#!/bin/sh\nexit 0\n");
+    await fs.chmod(localExecutable, 0o755);
+    await fs.chmod(pathExecutable, 0o755);
+
+    const descriptor: LspServerDescriptor = {
+      id: "typescript",
+      extensions: [".ts"],
+      launch: {
+        type: "provisioned",
+        args: ["--stdio"],
+        env: { PATH: prependToPath(path.join(workspacePath, "tools", "bin")) },
+        strategies: [
+          {
+            type: "workspaceLocalExecutable",
+            relativeCandidates: ["node_modules/.bin/typescript-language-server"],
+          },
+          { type: "pathCommand", command: "typescript-language-server" },
+        ],
+      },
+      rootMarkers: ["package.json", ".git"],
+      languageIdForPath: () => "typescript",
+    };
+
+    const launchPlans: Array<CreateLspClientOptions["launchPlan"]> = [];
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      launchPlans.push(options.launchPlan);
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile: mock(() => Promise.resolve(1)),
+        query: mock(() => Promise.resolve({ operation: "hover" as const, hover: options.launchPlan.command })),
+        close: mock(() => Promise.resolve(undefined)),
+      });
+    });
+
+    const manager = new LspManager({ registry: [descriptor], clientFactory });
+    const runtime = new CountingLocalRuntime(workspacePath);
+
+    const trustedResult = await manager.query({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePath: "src/example.ts",
+      policyContext: TEST_LSP_POLICY_CONTEXT,
+      operation: "hover",
+      line: 1,
+      column: 1,
+    });
+    const untrustedResult = await manager.query({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePath: "src/example.ts",
+      policyContext: {
+        provisioningMode: "manual",
+        trustedWorkspaceExecution: false,
+      },
+      operation: "hover",
+      line: 1,
+      column: 1,
+    });
+
+    expect(trustedResult.hover).toBe(localExecutable);
+    expect(untrustedResult.hover).toBe(pathExecutable);
+    expect(clientFactory).toHaveBeenCalledTimes(2);
+    expect(launchPlans.map((plan) => plan.command)).toEqual([localExecutable, pathExecutable]);
+
+    await manager.dispose();
   });
 
   test("re-probes launch plans after a closed client is recreated", async () => {
@@ -340,6 +430,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePath: "src/example.ts",
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       operation: "hover",
       line: 1,
       column: 1,
@@ -349,6 +440,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePath: "src/example.ts",
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       operation: "hover",
       line: 1,
       column: 1,
@@ -365,6 +457,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePath: "src/example.ts",
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       operation: "hover",
       line: 1,
       column: 1,
@@ -374,6 +467,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePath: "src/example.ts",
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       operation: "hover",
       line: 1,
       column: 1,
@@ -441,6 +535,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePath: "src/example.ts",
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       operation: "hover",
       line: 1,
       column: 1,
@@ -452,6 +547,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePath: "src/example.ts",
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       operation: "hover",
       line: 1,
       column: 1,
@@ -506,6 +602,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePaths: ["src/example.ts"],
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       timeoutMs: 20,
     });
     expect(first).toHaveLength(1);
@@ -516,6 +613,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePaths: ["src/example.ts"],
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       timeoutMs: 20,
     });
     expect(second).toEqual([]);
@@ -566,6 +664,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePaths: ["src/example.ts"],
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       timeoutMs: 20,
     });
     expect(first).toHaveLength(1);
@@ -576,6 +675,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePaths: ["src/example.ts"],
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       timeoutMs: 20,
     });
     expect(second).toEqual([]);
@@ -638,6 +738,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePaths: ["src/example.ts", "packages/pkg/src/nested.ts"],
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       timeoutMs: 200,
     });
 
@@ -695,6 +796,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePaths: ["src/example.ts", "packages/pkg/src/nested.ts"],
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       timeoutMs: 20,
     });
 
@@ -741,6 +843,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePaths: ["src/example.ts", "packages/pkg/src/nested.ts"],
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       timeoutMs: 20,
     });
 
@@ -811,6 +914,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePaths: ["src/example.ts"],
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       timeoutMs: 20,
     });
     expect(diagnostics).toHaveLength(1);
@@ -880,6 +984,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePaths: ["src/example.ts"],
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       timeoutMs: 10_000,
     });
 
@@ -921,6 +1026,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePaths: ["src/example.ts"],
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       timeoutMs: 10_000,
     });
 
@@ -996,6 +1102,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePaths: ["src/example.ts"],
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       timeoutMs: 20,
     });
 
@@ -1004,6 +1111,7 @@ describe("LspManager", () => {
       runtime,
       workspacePath,
       filePaths: ["src/example.ts"],
+      policyContext: TEST_LSP_POLICY_CONTEXT,
       timeoutMs: 20,
     });
 

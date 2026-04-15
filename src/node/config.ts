@@ -17,8 +17,10 @@ import type {
   ProjectConfig,
   ProjectsConfig,
   FeatureFlagOverride,
+  LspProvisioningMode,
   UpdateChannel,
 } from "@/common/types/project";
+import { DEFAULT_LSP_PROVISIONING_MODE } from "@/common/config/schemas/appConfigOnDisk";
 import type {
   AppConfigOnDisk,
   BaseProviderConfig as ProviderConfig,
@@ -100,6 +102,14 @@ function parseOptionalBoolean(value: unknown): boolean | undefined {
 
 function parseUpdateChannel(value: unknown): UpdateChannel | undefined {
   if (value === "stable" || value === "nightly") {
+    return value;
+  }
+
+  return undefined;
+}
+
+function parseLspProvisioningMode(value: unknown): LspProvisioningMode | undefined {
+  if (value === "manual" || value === "auto") {
     return value;
   }
 
@@ -679,6 +689,7 @@ export class Config {
 
         const runtimeEnablement = normalizeRuntimeEnablementOverrides(parsed.runtimeEnablement);
         const defaultRuntime = normalizeRuntimeEnablementId(parsed.defaultRuntime);
+        const lspProvisioningMode = parseLspProvisioningMode(parsed.lspProvisioningMode);
 
         const agentAiDefaults =
           parsed.agentAiDefaults !== undefined
@@ -725,6 +736,7 @@ export class Config {
           updateChannel,
           defaultRuntime,
           runtimeEnablement,
+          lspProvisioningMode,
           onePasswordAccountName: parseOptionalNonEmptyString(parsed.onePasswordAccountName),
         };
       }
@@ -910,6 +922,11 @@ export class Config {
       const defaultRuntime = normalizeRuntimeEnablementId(config.defaultRuntime);
       if (defaultRuntime !== undefined) {
         data.defaultRuntime = defaultRuntime;
+      }
+
+      const lspProvisioningMode = parseLspProvisioningMode(config.lspProvisioningMode);
+      if (lspProvisioningMode !== undefined && lspProvisioningMode !== DEFAULT_LSP_PROVISIONING_MODE) {
+        data.lspProvisioningMode = lspProvisioningMode;
       }
 
       const onePasswordAccountName = parseOptionalNonEmptyString(config.onePasswordAccountName);

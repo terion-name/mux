@@ -78,6 +78,7 @@ import { PolicyGetResponseSchema } from "./policy";
 import {
   AgentAiDefaultsSchema,
   SubagentAiDefaultsSchema,
+  LspProvisioningModeSchema,
   UpdateChannelSchema,
 } from "../../config/schemas/appConfigOnDisk";
 import {
@@ -1766,6 +1767,7 @@ export const config = {
       worktreeArchiveBehavior: z.enum(WORKTREE_ARCHIVE_BEHAVIORS),
       runtimeEnablement: z.record(z.string(), z.boolean()),
       defaultRuntime: z.string().nullable(),
+      lspProvisioningMode: LspProvisioningModeSchema,
       agentAiDefaults: AgentAiDefaultsSchema,
       // Legacy fields (downgrade compatibility)
       subagentAiDefaults: SubagentAiDefaultsSchema,
@@ -1840,6 +1842,14 @@ export const config = {
         runtimeEnablement: z.record(z.string(), z.boolean()).nullish(),
         defaultRuntime: RuntimeEnablementIdSchema.nullish(),
         runtimeOverridesEnabled: z.boolean().nullish(),
+      })
+      .strict(),
+    output: z.void(),
+  },
+  updateLspProvisioningMode: {
+    input: z
+      .object({
+        mode: LspProvisioningModeSchema,
       })
       .strict(),
     output: z.void(),
