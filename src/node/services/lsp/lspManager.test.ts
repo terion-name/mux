@@ -38,8 +38,11 @@ function createRegistry(): readonly LspServerDescriptor[] {
     {
       id: "typescript",
       extensions: [".ts"],
-      command: "fake-lsp",
-      args: ["--stdio"],
+      launch: {
+        type: "manual",
+        command: "mux-test-fake-lsp",
+        args: ["--stdio"],
+      },
       rootMarkers: ["package.json", ".git"],
       languageIdForPath: () => "typescript",
     },
@@ -136,6 +139,13 @@ describe("LspManager", () => {
       throw new Error("Expected the LSP client factory to receive a call");
     }
     expect(clientFactoryOptions.rootPath).toBe(workspacePath);
+    expect(clientFactoryOptions.launchPlan).toEqual({
+      command: "mux-test-fake-lsp",
+      args: ["--stdio"],
+      cwd: workspacePath,
+      env: undefined,
+      initializationOptions: undefined,
+    });
 
     expect(lastQueryRequest).toBeDefined();
     if (!lastQueryRequest) {

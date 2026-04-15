@@ -10,8 +10,11 @@ const TYPESCRIPT_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".m
 const typescriptServer: LspServerDescriptor = {
   id: "typescript",
   extensions: TYPESCRIPT_EXTENSIONS,
-  command: "typescript-language-server",
-  args: ["--stdio"],
+  launch: {
+    type: "manual",
+    command: "typescript-language-server",
+    args: ["--stdio"],
+  },
   rootMarkers: ["tsconfig.json", "jsconfig.json", "package.json", ".git"],
   languageIdForPath(filePath: string): string {
     const fileExt = ext(filePath);
@@ -25,8 +28,11 @@ const typescriptServer: LspServerDescriptor = {
 const pythonServer: LspServerDescriptor = {
   id: "python",
   extensions: [".py"],
-  command: "pyright-langserver",
-  args: ["--stdio"],
+  launch: {
+    type: "manual",
+    command: "pyright-langserver",
+    args: ["--stdio"],
+  },
   rootMarkers: ["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", ".git"],
   languageIdForPath(): string {
     return "python";
@@ -36,8 +42,10 @@ const pythonServer: LspServerDescriptor = {
 const goServer: LspServerDescriptor = {
   id: "go",
   extensions: [".go"],
-  command: "gopls",
-  args: [],
+  launch: {
+    type: "manual",
+    command: "gopls",
+  },
   rootMarkers: ["go.work", "go.mod", ".git"],
   languageIdForPath(): string {
     return "go";
@@ -47,8 +55,10 @@ const goServer: LspServerDescriptor = {
 const rustServer: LspServerDescriptor = {
   id: "rust",
   extensions: [".rs"],
-  command: "rust-analyzer",
-  args: [],
+  launch: {
+    type: "manual",
+    command: "rust-analyzer",
+  },
   rootMarkers: ["Cargo.toml", "rust-project.json", ".git"],
   languageIdForPath(): string {
     return "rust";
@@ -69,4 +79,3 @@ export function findLspServerForFile(
   const fileExt = ext(filePath);
   return registry.find((descriptor) => descriptor.extensions.includes(fileExt)) ?? null;
 }
-

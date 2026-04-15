@@ -116,11 +116,29 @@ export interface LspManagerQueryResult {
   warning?: string;
 }
 
+export interface LspManualLaunchPolicy {
+  type: "manual";
+  command: string;
+  args?: readonly string[];
+  env?: Readonly<Record<string, string>>;
+  cwd?: string;
+  initializationOptions?: unknown;
+}
+
+export type LspServerLaunchPolicy = LspManualLaunchPolicy;
+
+export interface ResolvedLspLaunchPlan {
+  command: string;
+  args: readonly string[];
+  cwd?: string;
+  env?: Readonly<Record<string, string>>;
+  initializationOptions?: unknown;
+}
+
 export interface LspServerDescriptor {
   id: string;
   extensions: readonly string[];
-  command: string;
-  args: readonly string[];
+  launch: LspServerLaunchPolicy;
   rootMarkers: readonly string[];
   languageIdForPath(filePath: string): string;
 }
@@ -157,6 +175,7 @@ export interface LspClientInstance {
 
 export interface CreateLspClientOptions {
   descriptor: LspServerDescriptor;
+  launchPlan: ResolvedLspLaunchPlan;
   runtime: Runtime;
   rootPath: string;
   rootUri: string;

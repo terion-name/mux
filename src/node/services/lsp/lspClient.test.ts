@@ -11,8 +11,11 @@ function createDescriptor(): LspServerDescriptor {
   return {
     id: "typescript",
     extensions: [".ts"],
-    command: "fake-lsp",
-    args: ["--stdio"],
+    launch: {
+      type: "manual",
+      command: "fake-lsp",
+      args: ["--stdio"],
+    },
     rootMarkers: ["package.json", ".git"],
     languageIdForPath: () => "typescript",
   };
@@ -48,6 +51,11 @@ function createClient(options?: Partial<CreateLspClientOptions>) {
   const ClientConstructor = LspClient as unknown as LspClientConstructor;
   const clientOptions: CreateLspClientOptions = {
     descriptor: createDescriptor(),
+    launchPlan: {
+      command: "fake-lsp",
+      args: ["--stdio"],
+      cwd: "/tmp/workspace",
+    },
     runtime: new LocalRuntime("/tmp/workspace"),
     rootPath: "/tmp/workspace",
     rootUri: "file:///tmp/workspace",
@@ -60,6 +68,113 @@ function createClient(options?: Partial<CreateLspClientOptions>) {
     transport,
   };
 }
+
+describe("LspClient", () => {
+  it("launches from the resolved plan and forwards initialization options", async () => {
+    const requests: Array<{ id?: number | string; method?: string; params?: unknown }> = [];
+    const exec = mock((_command: string, _options: { cwd: string; env?: Record<string, string> }) => {
+      let stdoutController!: ReadableStreamDefaultController<Uint8Array>;
+      const stdout = new ReadableStream<Uint8Array>({
+        start(controller) {
+          stdoutController = controller;
+        },
+      });
+      const stderr = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.close();
+        },
+      });
+      let resolveExitCode!: (value: number) => void;
+      const exitCode = new Promise<number>((resolve) => {
+        resolveExitCode = resolve;
+      });
+      const decoder = new TextDecoder();
+      const encoder = new TextEncoder();
+      const stdin = new WritableStream<Uint8Array>({
+        write(chunk) {
+          const payload = decoder.decode(chunk);
+          const headerEnd = payload.indexOf("\r\n\r\n");
+          if (headerEnd === -1) {
+            throw new Error(`Missing LSP frame header: ${payload}`);
+          }
+
+          const message = JSON.parse(payload.slice(headerEnd + 4)) as {
+            id?: number | string;
+            method?: string;
+            params?: unknown;
+          };
+          requests.push(message);
+
+          if (message.id == null) {
+            return;
+          }
+
+          const responseBody = JSON.stringify({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: message.method === "initialize" ? { capabilities: {} } : null,
+          });
+          const responseFrame = `Content-Length: ${responseBody.length}\r\n\r\n${responseBody}`;
+          stdoutController.enqueue(encoder.encode(responseFrame));
+        },
+        close() {
+          resolveExitCode(0);
+        },
+      });
+
+      return Promise.resolve({
+        stdout,
+        stderr,
+        stdin,
+        exitCode,
+        duration: Promise.resolve(0),
+      });
+    });
+    const runtime = new LocalRuntime("/tmp/workspace");
+    runtime.exec = exec;
+
+    const client = await LspClient.create({
+      descriptor: createDescriptor(),
+      launchPlan: {
+        command: "/tmp/.mux/bin/typescript-language-server",
+        args: ["--stdio"],
+        cwd: "/tmp/workspace/.lsp",
+        env: { LSP_TRACE: "verbose" },
+        initializationOptions: {
+          preferences: {
+            includeCompletionsForModuleExports: true,
+          },
+        },
+      },
+      runtime,
+      rootPath: "/tmp/workspace",
+      rootUri: "file:///tmp/workspace",
+    });
+
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls[0]).toEqual([
+      "'/tmp/.mux/bin/typescript-language-server' '--stdio'",
+      {
+        cwd: "/tmp/workspace/.lsp",
+        env: { LSP_TRACE: "verbose" },
+      },
+    ]);
+    expect(requests[0]?.method).toBe("initialize");
+    expect(requests[0]?.params).toMatchObject({
+      rootUri: "file:///tmp/workspace",
+      rootPath: "/tmp/workspace",
+      initializationOptions: {
+        preferences: {
+          includeCompletionsForModuleExports: true,
+        },
+      },
+    });
+
+    await client.close();
+    expect(requests.at(-2)?.method).toBe("shutdown");
+    expect(requests.at(-1)?.method).toBe("exit");
+  });
+});
 
 describe("LspClient publishDiagnostics handling", () => {
   it("forwards valid publishDiagnostics notifications", () => {

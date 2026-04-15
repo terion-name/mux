@@ -12,6 +12,7 @@ import type { Runtime } from "@/node/runtime/Runtime";
 import type { WorkspaceLspDiagnosticsSnapshot } from "@/common/orpc/types";
 import { log } from "@/node/services/log";
 import { LspClient } from "./lspClient";
+import { resolveLspLaunchPlan } from "./lspLaunchResolver";
 import { LspPathMapper } from "./lspPathMapper";
 import { BUILTIN_LSP_SERVERS, findLspServerForFile } from "./lspServerRegistry";
 import type {
@@ -28,6 +29,7 @@ import type {
   LspRange,
   LspServerDescriptor,
   LspSymbolInformation,
+  ResolvedLspLaunchPlan,
 } from "./types";
 
 interface WorkspaceClients {
@@ -340,6 +342,7 @@ export class LspManager {
   private async getOrCreateClient(
     workspaceId: string,
     descriptor: LspServerDescriptor,
+    launchPlan: ResolvedLspLaunchPlan,
     runtime: Runtime,
     pathMapper: LspPathMapper,
     rootPath: string,
@@ -377,6 +380,7 @@ export class LspManager {
     // orphaned LSP processes that escape manager tracking.
     const clientPromise = this.clientFactory({
       descriptor,
+      launchPlan,
       runtime,
       rootPath,
       rootUri,
@@ -455,6 +459,11 @@ export class LspManager {
       descriptor.rootMarkers
     );
     const rootUri = pathMapper.toUri(rootPath);
+    const launchPlan = await resolveLspLaunchPlan({
+      descriptor,
+      runtime: options.runtime,
+      rootPath,
+    });
     const fileHandle: LspClientFileHandle = {
       runtimePath: runtimeFilePath,
       readablePath: pathMapper.toReadablePath(runtimeFilePath),
@@ -465,6 +474,7 @@ export class LspManager {
     const clientResult = await this.getOrCreateClient(
       options.workspaceId,
       descriptor,
+      launchPlan,
       options.runtime,
       pathMapper,
       rootPath,

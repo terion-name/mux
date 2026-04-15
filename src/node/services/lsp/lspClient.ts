@@ -55,11 +55,12 @@ export class LspClient implements LspClientInstance {
 
   static async create(options: CreateLspClientOptions): Promise<LspClient> {
     const command = [
-      shellQuote(options.descriptor.command),
-      ...options.descriptor.args.map((arg) => shellQuote(arg)),
+      shellQuote(options.launchPlan.command),
+      ...options.launchPlan.args.map((arg) => shellQuote(arg)),
     ].join(" ");
     const execStream = await options.runtime.exec(command, {
-      cwd: options.rootPath,
+      cwd: options.launchPlan.cwd ?? options.rootPath,
+      ...(options.launchPlan.env ? { env: { ...options.launchPlan.env } } : {}),
       // LSP servers are long-lived by design; timeout would kill healthy clients mid-session.
     });
 
@@ -249,6 +250,9 @@ export class LspClient implements LspClientInstance {
             },
           },
         },
+        ...(this.options.launchPlan.initializationOptions !== undefined
+          ? { initializationOptions: this.options.launchPlan.initializationOptions }
+          : {}),
       },
       LSP_START_TIMEOUT_MS
     )) as InitializeResult;
