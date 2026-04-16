@@ -797,15 +797,20 @@ export class LspManager {
       (candidate) => !isGenericLspRootMarker(candidate.matchedMarker)
     );
     const candidateMatches = specificMatches.length > 0 ? specificMatches : matches;
-    const selectedMatch = candidateMatches[0];
+    const selectedMatch = pickDeepestRootMatch(candidateMatches, workspaceRuntimePath);
     if (!selectedMatch) {
       throw new Error(
         `Could not infer a built-in LSP server for directory ${outputPath}. Provide a representative source file path or use a directory with a language-specific project marker.`
       );
     }
 
-    if (candidateMatches.length > 1) {
-      const matchingServers = candidateMatches
+    const bestDepth = getWorkspaceRelativePathDepth(selectedMatch.rootPath, workspaceRuntimePath);
+    const ambiguousMatches = candidateMatches.filter(
+      (candidate) =>
+        getWorkspaceRelativePathDepth(candidate.rootPath, workspaceRuntimePath) === bestDepth
+    );
+    if (ambiguousMatches.length > 1) {
+      const matchingServers = ambiguousMatches
         .map((candidate) => {
           const matchedMarker = candidate.matchedMarker ?? "workspace root";
           return `${candidate.descriptor.id} (${matchedMarker})`;
@@ -1468,6 +1473,37 @@ function requireQueryFileHandle(
   }
 
   return fileHandle;
+}
+
+function pickDeepestRootMatch<T extends { rootPath: string }>(
+  matches: readonly T[],
+  workspaceRuntimePath: string
+): T | undefined {
+  let selectedMatch: T | undefined;
+  let selectedDepth = -1;
+
+  for (const match of matches) {
+    const matchDepth = getWorkspaceRelativePathDepth(match.rootPath, workspaceRuntimePath);
+    if (matchDepth > selectedDepth) {
+      selectedMatch = match;
+      selectedDepth = matchDepth;
+    }
+  }
+
+  return selectedMatch;
+}
+
+function getWorkspaceRelativePathDepth(
+  candidatePath: string,
+  workspaceRuntimePath: string
+): number {
+  const pathModule = selectPathModule(candidatePath);
+  const relativePath = pathModule.relative(workspaceRuntimePath, candidatePath);
+  if (relativePath.length === 0) {
+    return 0;
+  }
+
+  return relativePath.split(pathModule.sep).filter((segment) => segment.length > 0).length;
 }
 
 function isGenericLspRootMarker(marker: string | null): boolean {

@@ -243,6 +243,74 @@ describe("LspManager", () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 
+  test("prefers the deepest matching workspace_symbols root for nested directories", async () => {
+    const pythonWorkspacePath = path.join(workspacePath, "services", "python");
+    await fs.mkdir(pythonWorkspacePath, { recursive: true });
+    await fs.writeFile(
+      path.join(pythonWorkspacePath, "pyproject.toml"),
+      "[project]\nname = 'python-service'\n"
+    );
+
+    const pythonDescriptor: LspServerDescriptor = {
+      id: "python",
+      extensions: [".py"],
+      launch: {
+        type: "manual",
+        command: "mux-test-python-lsp",
+        args: ["--stdio"],
+      },
+      rootMarkers: ["pyproject.toml", ".git"],
+      languageIdForPath: () => "python",
+    };
+    let clientFactoryOptions: CreateLspClientOptions | undefined;
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      clientFactoryOptions = options;
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile: mock(() => Promise.resolve(1)),
+        query: mock(() =>
+          Promise.resolve({
+            operation: "workspace_symbols" as const,
+            symbols: [],
+          })
+        ),
+        close: mock(() => Promise.resolve(undefined)),
+      });
+    });
+
+    const manager = new LspManager({
+      registry: [...createRegistry(), pythonDescriptor],
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    try {
+      const result = await manager.query({
+        workspaceId: "ws-1",
+        runtime,
+        workspacePath,
+        filePath: "services/python",
+        policyContext: TEST_LSP_POLICY_CONTEXT,
+        operation: "workspace_symbols",
+        query: "ResourceService",
+      });
+
+      expect(result).toMatchObject({
+        operation: "workspace_symbols",
+        serverId: "python",
+        symbols: [],
+      });
+      expect(clientFactory).toHaveBeenCalledTimes(1);
+      expect(clientFactoryOptions).toBeDefined();
+      if (!clientFactoryOptions) {
+        throw new Error("Expected the LSP client factory to receive a call");
+      }
+      expect(clientFactoryOptions.rootPath).toBe(pythonWorkspacePath);
+    } finally {
+      await manager.dispose();
+    }
+  });
+
   test("fails workspace_symbols directory inference when multiple LSP roots match", async () => {
     await fs.writeFile(path.join(workspacePath, "pyproject.toml"), "[project]\nname = 'mixed'\n");
 
