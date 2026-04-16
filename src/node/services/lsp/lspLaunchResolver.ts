@@ -149,7 +149,10 @@ async function resolveProvisionedLaunchPlan(
             command: resolvedCommand,
             args: launchPolicy.args ?? [],
             cwd: launchCwd,
-            env: pathCommandEnv,
+            // Only explicit launch env overrides belong on the final plan. The sanitized
+            // PATH is still used for probing, but pathCommand launches that inherit env
+            // should keep the runtime's HOME/TMPDIR/XDG_* variables intact.
+            env: launchPolicy.env == null ? undefined : pathCommandEnv,
             initializationOptions,
           };
         }

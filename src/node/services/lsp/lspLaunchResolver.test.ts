@@ -263,6 +263,54 @@ describe("resolveLspLaunchPlan", () => {
     }
   });
 
+  it("keeps inherited launch env for untrusted pathCommand probes without explicit env", async () => {
+    const externalBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-lsp-global-bin-"));
+    const workspaceBinDir = path.join(workspacePath, "node_modules", ".bin");
+    const originalPath = process.env.PATH;
+
+    try {
+      await writeExecutable(
+        path.join(workspaceBinDir, "mux-inherited-path-command"),
+        "#!/bin/sh\nexit 0\n"
+      );
+      await writeExecutable(
+        path.join(externalBinDir, "mux-inherited-path-command"),
+        "#!/bin/sh\nexit 0\n"
+      );
+
+      process.env.PATH = [workspaceBinDir, externalBinDir, originalPath]
+        .filter((value): value is string => value != null && value.length > 0)
+        .join(path.delimiter);
+
+      const launchPlan = await resolveLspLaunchPlan({
+        descriptor: {
+          id: "typescript",
+          extensions: [".ts"],
+          launch: {
+            type: "provisioned",
+            args: ["--stdio"],
+            strategies: [{ type: "pathCommand", command: "mux-inherited-path-command" }],
+          },
+          rootMarkers: ["package.json", ".git"],
+          languageIdForPath: () => "typescript",
+        },
+        runtime,
+        rootPath: workspacePath,
+        policyContext: UNTRUSTED_AUTO_POLICY_CONTEXT,
+      });
+
+      expect(launchPlan.command).toBe(path.join(externalBinDir, "mux-inherited-path-command"));
+      expect(launchPlan.env).toBeUndefined();
+    } finally {
+      if (originalPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = originalPath;
+      }
+      await fs.rm(externalBinDir, { recursive: true, force: true });
+    }
+  });
+
   it("orders package-manager execution using repo signals", async () => {
     await writeExecutable(path.join(binDir, "bunx"), "#!/bin/sh\nexit 0\n");
     await writeExecutable(path.join(binDir, "pnpm"), "#!/bin/sh\nexit 0\n");
