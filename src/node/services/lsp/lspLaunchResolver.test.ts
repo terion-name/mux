@@ -2,13 +2,16 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
+import { DockerRuntime } from "@/node/runtime/DockerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import {
   getManagedLspToolsDir,
   probeWorkspaceLocalExecutable,
   probeWorkspaceLocalExecutableForWorkspace,
 } from "./lspLaunchProvisioning";
-import { resolveLspLaunchPlan } from "./lspLaunchResolver";
+import { getPathCommandEnv, resolveLspLaunchPlan } from "./lspLaunchResolver";
 import type { LspPolicyContext, LspServerDescriptor } from "./types";
 
 const TRUSTED_MANUAL_POLICY_CONTEXT: LspPolicyContext = {
@@ -311,6 +314,63 @@ describe("resolveLspLaunchPlan", () => {
       } else {
         process.env.PATH = originalPath;
       }
+      await fs.rm(externalBinDir, { recursive: true, force: true });
+    }
+  });
+
+  it("sanitizes untrusted PATH env only for local and worktree runtimes", async () => {
+    const externalBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-lsp-global-bin-"));
+    const workspaceBinDir = path.join(workspacePath, "node_modules", ".bin");
+    const explicitPath = [workspaceBinDir, externalBinDir]
+      .filter((value) => value.length > 0)
+      .join(path.delimiter);
+    const expectedSanitizedPath = externalBinDir;
+
+    try {
+      const localEnv = getPathCommandEnv(
+        runtime,
+        workspacePath,
+        { LSP_TRACE: "verbose", PATH: explicitPath },
+        UNTRUSTED_AUTO_POLICY_CONTEXT
+      );
+      expect(localEnv).toEqual({
+        LSP_TRACE: "verbose",
+        PATH: expectedSanitizedPath,
+      });
+
+      const worktreeEnv = getPathCommandEnv(
+        new WorktreeRuntime(os.tmpdir()),
+        workspacePath,
+        { LSP_TRACE: "verbose", PATH: explicitPath },
+        UNTRUSTED_AUTO_POLICY_CONTEXT
+      );
+      expect(worktreeEnv).toEqual({
+        LSP_TRACE: "verbose",
+        PATH: expectedSanitizedPath,
+      });
+
+      const remotePath = ["node_modules/.bin", "/usr/local/bin"].join(path.delimiter);
+      const remoteEnv = { LSP_TRACE: "verbose", PATH: remotePath };
+
+      const devcontainerEnv = getPathCommandEnv(
+        new DevcontainerRuntime({
+          srcBaseDir: os.tmpdir(),
+          configPath: path.join(workspacePath, ".devcontainer", "devcontainer.json"),
+        }),
+        workspacePath,
+        remoteEnv,
+        UNTRUSTED_AUTO_POLICY_CONTEXT
+      );
+      expect(devcontainerEnv).toEqual(remoteEnv);
+
+      const dockerEnv = getPathCommandEnv(
+        new DockerRuntime({ image: "node:20", containerName: "mux-lsp-test" }),
+        workspacePath,
+        remoteEnv,
+        UNTRUSTED_AUTO_POLICY_CONTEXT
+      );
+      expect(dockerEnv).toEqual(remoteEnv);
+    } finally {
       await fs.rm(externalBinDir, { recursive: true, force: true });
     }
   });

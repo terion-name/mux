@@ -1,5 +1,7 @@
 import * as path from "node:path";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
+import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
 import {
   ensureManagedGoTool,
@@ -119,6 +121,7 @@ async function resolveProvisionedLaunchPlan(
 
       case "pathCommand": {
         const pathCommandEnv = getPathCommandEnv(
+          options.runtime,
           options.rootPath,
           launchPolicy.env,
           options.policyContext
@@ -268,12 +271,16 @@ async function resolveManualCommand(
   return (await probeCommandOnPath(runtime, command, launchCwd, env)) ?? command;
 }
 
-function getPathCommandEnv(
+export function getPathCommandEnv(
+  runtime: Runtime,
   rootPath: string,
   env: Readonly<Record<string, string>> | undefined,
   policyContext: LspPolicyContext
 ): Readonly<Record<string, string>> | undefined {
-  if (policyContext.trustedWorkspaceExecution) {
+  if (
+    policyContext.trustedWorkspaceExecution ||
+    !(runtime instanceof LocalRuntime || runtime instanceof WorktreeRuntime)
+  ) {
     return env;
   }
 
@@ -297,8 +304,8 @@ function getPathCommandEnv(
 
   return {
     ...env,
-    // Untrusted workspaces must not influence PATH-based binary resolution or the final
-    // launch environment with repo-local or relative PATH entries.
+    // Only local/worktree runtimes merge env on the host, so they need a sanitized PATH override
+    // to keep untrusted workspaces from contributing repo-local entries to PATH resolution.
     PATH: sanitizedPath,
   };
 }
