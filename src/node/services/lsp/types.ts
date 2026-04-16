@@ -148,6 +148,7 @@ export interface LspNodePackageExecStrategy {
   packageName: string;
   binaryName: string;
   packageManagers?: readonly LspNodePackageManager[];
+  fallbackPackageNames?: readonly string[];
 }
 
 export interface LspGoManagedInstallStrategy {

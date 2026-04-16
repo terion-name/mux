@@ -5,7 +5,7 @@ import {
   ensureManagedGoTool,
   probeCommandOnPath,
   probeWorkspaceLocalExecutable,
-  probeWorkspaceLocalPath,
+  probeWorkspaceLocalPathInAncestors,
   resolveExecutablePathCandidate,
   resolveNodePackageExecCommand,
 } from "./lspLaunchProvisioning";
@@ -23,6 +23,7 @@ export interface ResolveLspLaunchPlanOptions {
   descriptor: LspServerDescriptor;
   runtime: Runtime;
   rootPath: string;
+  workspacePath?: string;
   policyContext: LspPolicyContext;
 }
 
@@ -71,10 +72,12 @@ async function resolveProvisionedLaunchPlan(
     throw new Error(`Expected a provisioned launch policy for ${options.descriptor.id}`);
   }
 
+  const workspacePath = options.workspacePath ?? options.rootPath;
   const launchCwd = await resolveLaunchCwd(options.runtime, options.rootPath, launchPolicy.cwd);
   const workspaceTsserverPath = await resolveWorkspaceTsserverPath(
     options.runtime,
     options.rootPath,
+    workspacePath,
     launchPolicy,
     options.policyContext
   );
@@ -158,10 +161,12 @@ async function resolveProvisionedLaunchPlan(
         const result = await resolveNodePackageExecCommand(
           options.runtime,
           options.rootPath,
+          workspacePath,
           launchCwd,
           launchPolicy.env,
           strategy,
-          options.policyContext
+          options.policyContext,
+          workspaceTsserverPath == null ? strategy.fallbackPackageNames : undefined
         );
         if ("command" in result) {
           return {
@@ -211,6 +216,7 @@ async function resolveProvisionedLaunchPlan(
 async function resolveWorkspaceTsserverPath(
   runtime: Runtime,
   rootPath: string,
+  workspacePath: string,
   launchPolicy: LspProvisionedLaunchPolicy,
   policyContext: LspPolicyContext
 ): Promise<string | undefined> {
@@ -222,9 +228,10 @@ async function resolveWorkspaceTsserverPath(
   }
 
   return (
-    (await probeWorkspaceLocalPath(
+    (await probeWorkspaceLocalPathInAncestors(
       runtime,
       rootPath,
+      workspacePath,
       launchPolicy.workspaceTsserverPathCandidates
     )) ?? undefined
   );

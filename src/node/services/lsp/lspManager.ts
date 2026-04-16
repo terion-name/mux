@@ -579,6 +579,7 @@ export class LspManager {
       descriptor,
       runtime,
       rootPath,
+      pathMapper.getWorkspaceRuntimePath(),
       policyContext
     );
 
@@ -652,6 +653,7 @@ export class LspManager {
     descriptor: LspServerDescriptor,
     runtime: Runtime,
     rootPath: string,
+    workspacePath: string,
     policyContext: LspPolicyContext
   ): Promise<ResolvedLspLaunchPlan> {
     const existingLaunchPlan = workspaceEntry.launchPlans.get(clientKey);
@@ -663,6 +665,7 @@ export class LspManager {
       descriptor,
       runtime,
       rootPath,
+      workspacePath,
       policyContext,
     }).catch((error) => {
       workspaceEntry.launchPlans.delete(clientKey);

@@ -251,6 +251,120 @@ describe("resolveLspLaunchPlan", () => {
     });
   });
 
+  it("finds ancestor TypeScript metadata and package-manager hints for nested package roots", async () => {
+    const packageRoot = path.join(workspacePath, "web", "packages", "teleport");
+    const repoTypescriptLib = path.join(workspacePath, "node_modules", "typescript", "lib");
+
+    await fs.mkdir(packageRoot, { recursive: true });
+    await fs.writeFile(path.join(packageRoot, "package.json"), "{}\n");
+    await fs.writeFile(
+      path.join(workspacePath, "package.json"),
+      JSON.stringify({ packageManager: "pnpm@9.0.0" })
+    );
+    await fs.writeFile(path.join(workspacePath, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+    await fs.mkdir(repoTypescriptLib, { recursive: true });
+    await fs.writeFile(path.join(repoTypescriptLib, "tsserver.js"), "module.exports = {};\n");
+    await writeExecutable(path.join(binDir, "pnpm"), "#!/bin/sh\nexit 0\n");
+
+    const launchPlan = await resolveLspLaunchPlan({
+      descriptor: {
+        id: "typescript",
+        extensions: [".ts"],
+        launch: {
+          type: "provisioned",
+          args: ["--stdio"],
+          env: { PATH: prependToPath(binDir) },
+          workspaceTsserverPathCandidates: ["node_modules/typescript/lib"],
+          strategies: [
+            {
+              type: "nodePackageExec",
+              packageName: "typescript-language-server",
+              binaryName: "typescript-language-server",
+              fallbackPackageNames: ["typescript"],
+            },
+          ],
+        },
+        rootMarkers: ["package.json", ".git"],
+        languageIdForPath: () => "typescript",
+      },
+      runtime,
+      rootPath: packageRoot,
+      workspacePath,
+      policyContext: TRUSTED_AUTO_POLICY_CONTEXT,
+    });
+
+    expect(launchPlan).toEqual({
+      command: path.join(binDir, "pnpm"),
+      args: [
+        "--package",
+        "typescript-language-server",
+        "dlx",
+        "typescript-language-server",
+        "--stdio",
+      ],
+      cwd: packageRoot,
+      env: { PATH: prependToPath(binDir) },
+      initializationOptions: {
+        tsserver: {
+          path: repoTypescriptLib,
+        },
+      },
+    });
+  });
+
+  it("adds a fallback TypeScript package when package-manager exec has no ancestor tsserver", async () => {
+    const packageRoot = path.join(workspacePath, "web", "packages", "teleport");
+
+    await fs.mkdir(packageRoot, { recursive: true });
+    await fs.writeFile(path.join(packageRoot, "package.json"), "{}\n");
+    await fs.writeFile(path.join(workspacePath, "package.json"), "{}\n");
+    await fs.writeFile(path.join(workspacePath, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+    await writeExecutable(path.join(binDir, "pnpm"), "#!/bin/sh\nexit 0\n");
+
+    const launchPlan = await resolveLspLaunchPlan({
+      descriptor: {
+        id: "typescript",
+        extensions: [".ts"],
+        launch: {
+          type: "provisioned",
+          args: ["--stdio"],
+          env: { PATH: prependToPath(binDir) },
+          workspaceTsserverPathCandidates: ["node_modules/typescript/lib"],
+          strategies: [
+            {
+              type: "nodePackageExec",
+              packageName: "typescript-language-server",
+              binaryName: "typescript-language-server",
+              fallbackPackageNames: ["typescript"],
+            },
+          ],
+        },
+        rootMarkers: ["package.json", ".git"],
+        languageIdForPath: () => "typescript",
+      },
+      runtime,
+      rootPath: packageRoot,
+      workspacePath,
+      policyContext: TRUSTED_AUTO_POLICY_CONTEXT,
+    });
+
+    expect(launchPlan).toEqual({
+      command: path.join(binDir, "pnpm"),
+      args: [
+        "--package",
+        "typescript-language-server",
+        "--package",
+        "typescript",
+        "dlx",
+        "typescript-language-server",
+        "--stdio",
+      ],
+      cwd: packageRoot,
+      env: { PATH: prependToPath(binDir) },
+      initializationOptions: undefined,
+    });
+  });
+
   it("disables automatic provisioning strategies for untrusted workspaces", async () => {
     try {
       await resolveLspLaunchPlan({

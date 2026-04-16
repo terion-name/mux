@@ -35,6 +35,9 @@ const typescriptServer: LspServerDescriptor = {
         type: "nodePackageExec",
         packageName: "typescript-language-server",
         binaryName: "typescript-language-server",
+        // typescript-language-server still needs a resolvable tsserver when we fall back to
+        // package-manager exec, so provision TypeScript only when the workspace has none.
+        fallbackPackageNames: ["typescript"],
       },
     ],
   },
@@ -107,7 +110,8 @@ const rustServer: LspServerDescriptor = {
       },
       {
         type: "unsupported",
-        message: "rust-analyzer is not available on PATH and automatic installation is not supported yet",
+        message:
+          "rust-analyzer is not available on PATH and automatic installation is not supported yet",
       },
     ],
   },

@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import { shellQuote } from "@/common/utils/shell";
 import type { ExecOptions, Runtime } from "@/node/runtime/Runtime";
+import { isPathInsideDir } from "@/node/utils/pathUtils";
 import { readFileString } from "@/node/utils/runtime/helpers";
 import type {
   LspGoManagedInstallStrategy,
@@ -109,6 +110,26 @@ export async function probeWorkspaceLocalPath(
   return null;
 }
 
+export async function probeWorkspaceLocalPathInAncestors(
+  runtime: Runtime,
+  rootPath: string,
+  workspacePath: string,
+  relativeCandidates: readonly string[]
+): Promise<string | null> {
+  for (const searchPath of getAncestorSearchPaths(rootPath, workspacePath)) {
+    const resolvedCandidatePath = await probeWorkspaceLocalPath(
+      runtime,
+      searchPath,
+      relativeCandidates
+    );
+    if (resolvedCandidatePath) {
+      return resolvedCandidatePath;
+    }
+  }
+
+  return null;
+}
+
 export function getManagedLspToolsDir(runtime: Runtime, ...segments: string[]): string {
   return joinRuntimePath(runtime.getMuxHome(), "tools", "lsp", ...segments);
 }
@@ -125,6 +146,7 @@ export async function ensureManagedLspToolsDir(
 export async function resolveNodePackageManagerOrder(
   runtime: Runtime,
   rootPath: string,
+  workspacePath: string,
   explicitManagers?: readonly LspNodePackageManager[]
 ): Promise<readonly LspNodePackageManager[]> {
   if (explicitManagers && explicitManagers.length > 0) {
@@ -132,19 +154,21 @@ export async function resolveNodePackageManagerOrder(
   }
 
   const preferredManagers: LspNodePackageManager[] = [];
-  const packageManagerField = await readWorkspacePackageManagerField(runtime, rootPath);
-  if (packageManagerField) {
-    preferredManagers.push(packageManagerField);
-  }
+  for (const searchPath of getAncestorSearchPaths(rootPath, workspacePath)) {
+    const packageManagerField = await readWorkspacePackageManagerField(runtime, searchPath);
+    if (packageManagerField) {
+      preferredManagers.push(packageManagerField);
+    }
 
-  for (const [lockfileName, manager] of [
-    ["bun.lock", "bunx"],
-    ["bun.lockb", "bunx"],
-    ["pnpm-lock.yaml", "pnpm"],
-    ["package-lock.json", "npm"],
-  ] as const) {
-    if (await pathExists(runtime, runtime.normalizePath(lockfileName, rootPath))) {
-      preferredManagers.push(manager);
+    for (const [lockfileName, manager] of [
+      ["bun.lock", "bunx"],
+      ["bun.lockb", "bunx"],
+      ["pnpm-lock.yaml", "pnpm"],
+      ["package-lock.json", "npm"],
+    ] as const) {
+      if (await pathExists(runtime, runtime.normalizePath(lockfileName, searchPath))) {
+        preferredManagers.push(manager);
+      }
     }
   }
 
@@ -154,10 +178,12 @@ export async function resolveNodePackageManagerOrder(
 export async function resolveNodePackageExecCommand(
   runtime: Runtime,
   rootPath: string,
+  workspacePath: string,
   cwd: string,
   env: Readonly<Record<string, string>> | undefined,
   strategy: LspNodePackageExecStrategy,
-  policyContext: LspPolicyContext
+  policyContext: LspPolicyContext,
+  fallbackPackageNames?: readonly string[]
 ): Promise<{ command: string; args: readonly string[] } | { reason: string }> {
   if (!policyContext.trustedWorkspaceExecution) {
     return {
@@ -173,6 +199,7 @@ export async function resolveNodePackageExecCommand(
   const packageManagers = await resolveNodePackageManagerOrder(
     runtime,
     rootPath,
+    workspacePath,
     strategy.packageManagers
   );
 
@@ -189,7 +216,7 @@ export async function resolveNodePackageExecCommand(
 
     return {
       command: packageManagerCommand,
-      args: buildNodePackageManagerExecArgs(packageManager, strategy),
+      args: buildNodePackageManagerExecArgs(packageManager, strategy, fallbackPackageNames),
     };
   }
 
@@ -311,15 +338,30 @@ async function resolveNodePackageManagerCommand(
 
 function buildNodePackageManagerExecArgs(
   packageManager: LspNodePackageManager,
-  strategy: LspNodePackageExecStrategy
+  strategy: LspNodePackageExecStrategy,
+  fallbackPackageNames?: readonly string[]
 ): readonly string[] {
+  const packageNames = dedupePackageNames([strategy.packageName, ...(fallbackPackageNames ?? [])]);
+
   switch (packageManager) {
     case "bunx":
-      return ["--package", strategy.packageName, strategy.binaryName];
+      return [
+        ...packageNames.flatMap((packageName) => ["--package", packageName]),
+        strategy.binaryName,
+      ];
     case "pnpm":
-      return ["--package", strategy.packageName, "dlx", strategy.binaryName];
+      return [
+        ...packageNames.flatMap((packageName) => ["--package", packageName]),
+        "dlx",
+        strategy.binaryName,
+      ];
     case "npm":
-      return ["exec", `--package=${strategy.packageName}`, "--", strategy.binaryName];
+      return [
+        "exec",
+        ...packageNames.map((packageName) => `--package=${packageName}`),
+        "--",
+        strategy.binaryName,
+      ];
   }
 }
 
@@ -370,6 +412,39 @@ function dedupeNodePackageManagers(
     }
   }
   return deduped;
+}
+
+function dedupePackageNames(packageNames: readonly string[]): readonly string[] {
+  const deduped: string[] = [];
+  for (const packageName of packageNames) {
+    if (!deduped.includes(packageName)) {
+      deduped.push(packageName);
+    }
+  }
+  return deduped;
+}
+
+function getAncestorSearchPaths(rootPath: string, workspacePath: string): readonly string[] {
+  const resolvedRootPath = path.resolve(rootPath);
+  const resolvedWorkspacePath = path.resolve(workspacePath);
+  if (!isPathInsideDir(resolvedWorkspacePath, resolvedRootPath)) {
+    return [resolvedRootPath];
+  }
+
+  const searchPaths: string[] = [];
+  let currentPath = resolvedRootPath;
+  while (true) {
+    searchPaths.push(currentPath);
+    if (currentPath === resolvedWorkspacePath) {
+      return searchPaths;
+    }
+
+    const parentPath = path.dirname(currentPath);
+    if (parentPath === currentPath) {
+      return searchPaths;
+    }
+    currentPath = parentPath;
+  }
 }
 
 async function execProbe(
