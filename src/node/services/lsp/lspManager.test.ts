@@ -742,6 +742,224 @@ describe("LspManager", () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 
+  test("clears stale diagnostics and stops polling files that disappear out of band", async () => {
+    const trackedFiles = new Map<
+      string,
+      {
+        fileHandle: Parameters<LspClientInstance["ensureFile"]>[0];
+        text: string;
+        version: number;
+      }
+    >();
+    const ensureFileCalls = new Map<string, number>();
+    let clientOptions: CreateLspClientOptions | undefined;
+    const ensureFile = mock(async (file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+      ensureFileCalls.set(file.uri, (ensureFileCalls.get(file.uri) ?? 0) + 1);
+
+      const text = await fs.readFile(file.readablePath, "utf8");
+      const existing = trackedFiles.get(file.uri);
+      const nextVersion = existing?.text === text ? existing.version : (existing?.version ?? 0) + 1;
+      trackedFiles.set(file.uri, {
+        fileHandle: { ...file },
+        text,
+        version: nextVersion,
+      });
+
+      if (existing?.text !== text) {
+        const diagnostics = text.includes('"oops"') ? [createDiagnostic("stale diagnostic")] : [];
+        clientOptions?.onPublishDiagnostics?.({
+          uri: file.uri,
+          version: nextVersion,
+          diagnostics,
+          rawDiagnosticCount: diagnostics.length,
+        });
+      }
+
+      return nextVersion;
+    });
+    const closeTrackedFile = mock((uri: string) => {
+      trackedFiles.delete(uri);
+      return Promise.resolve();
+    });
+    const close = mock(() => Promise.resolve(undefined));
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      clientOptions = options;
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile,
+        closeTrackedFile,
+        getTrackedFiles: () =>
+          [...trackedFiles.values()].map(({ fileHandle }) => ({
+            ...fileHandle,
+          })),
+        query: mock(() => Promise.resolve({ operation: "hover" as const, hover: "unused" })),
+        close,
+      });
+    });
+
+    const manager = new LspManager({
+      registry: createRegistry(),
+      clientFactory,
+      diagnosticPollIntervalMs: 10,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+    const filePath = path.join(workspacePath, "src", "example.ts");
+
+    await fs.writeFile(filePath, 'const value: number = "oops";\n');
+    await manager.query({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePath: "src/example.ts",
+      policyContext: TEST_LSP_POLICY_CONTEXT,
+      operation: "hover",
+      line: 1,
+      column: 1,
+    });
+
+    expect(
+      manager.getWorkspaceDiagnosticsSnapshot("ws-1").diagnostics[0]?.diagnostics[0]?.message
+    ).toBe("stale diagnostic");
+
+    const trackedFile = trackedFiles.values().next().value?.fileHandle;
+    if (!trackedFile) {
+      throw new Error("Expected the test client to track the opened file");
+    }
+
+    await fs.rm(filePath);
+
+    const staleDiagnosticsCleared = await waitUntil(() => {
+      return manager.getWorkspaceDiagnosticsSnapshot("ws-1").diagnostics.length === 0;
+    }, 500);
+    expect(staleDiagnosticsCleared).toBe(true);
+    expect(closeTrackedFile).toHaveBeenCalledTimes(1);
+
+    const ensureCallsAfterCleanup = ensureFileCalls.get(trackedFile.uri) ?? 0;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(ensureFileCalls.get(trackedFile.uri) ?? 0).toBe(ensureCallsAfterCleanup);
+
+    await manager.dispose();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  test("serializes poll-driven and explicit refreshes for the same tracked file", async () => {
+    const trackedFiles = new Map<
+      string,
+      {
+        fileHandle: Parameters<LspClientInstance["ensureFile"]>[0];
+        text: string;
+        version: number;
+      }
+    >();
+    const releaseEnsure = createDeferred<void>();
+    const ensureStarted = createDeferred<void>();
+    let shouldBlockEnsure = false;
+    let blockedEnsureStarted = false;
+    let activeEnsureCalls = 0;
+    let maxActiveEnsureCalls = 0;
+    let clientOptions: CreateLspClientOptions | undefined;
+    const ensureFile = mock(async (file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+      activeEnsureCalls += 1;
+      maxActiveEnsureCalls = Math.max(maxActiveEnsureCalls, activeEnsureCalls);
+
+      try {
+        const text = await fs.readFile(file.readablePath, "utf8");
+        const existing = trackedFiles.get(file.uri);
+        if (shouldBlockEnsure && !blockedEnsureStarted) {
+          blockedEnsureStarted = true;
+          ensureStarted.resolve();
+          await releaseEnsure.promise;
+        }
+
+        const nextVersion =
+          existing?.text === text ? existing.version : (existing?.version ?? 0) + 1;
+        trackedFiles.set(file.uri, {
+          fileHandle: { ...file },
+          text,
+          version: nextVersion,
+        });
+
+        if (existing?.text !== text) {
+          const diagnostics = text.includes('"oops"')
+            ? [createDiagnostic("serialized refresh")]
+            : [];
+          clientOptions?.onPublishDiagnostics?.({
+            uri: file.uri,
+            version: nextVersion,
+            diagnostics,
+            rawDiagnosticCount: diagnostics.length,
+          });
+        }
+
+        return nextVersion;
+      } finally {
+        activeEnsureCalls -= 1;
+      }
+    });
+    const close = mock(() => Promise.resolve(undefined));
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      clientOptions = options;
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile,
+        closeTrackedFile: mock((uri: string) => {
+          trackedFiles.delete(uri);
+          return Promise.resolve();
+        }),
+        getTrackedFiles: () =>
+          [...trackedFiles.values()].map(({ fileHandle }) => ({
+            ...fileHandle,
+          })),
+        query: mock(() => Promise.resolve({ operation: "hover" as const, hover: "unused" })),
+        close,
+      });
+    });
+
+    const manager = new LspManager({
+      registry: createRegistry(),
+      clientFactory,
+      diagnosticPollIntervalMs: 10,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+    const filePath = path.join(workspacePath, "src", "example.ts");
+
+    await manager.query({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePath: "src/example.ts",
+      policyContext: TEST_LSP_POLICY_CONTEXT,
+      operation: "hover",
+      line: 1,
+      column: 1,
+    });
+    await fs.writeFile(filePath, 'const value: number = "oops";\n');
+
+    shouldBlockEnsure = true;
+    const diagnosticsPromise = manager.collectPostMutationDiagnostics({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePaths: ["src/example.ts"],
+      policyContext: TEST_LSP_POLICY_CONTEXT,
+      timeoutMs: 200,
+    });
+
+    await ensureStarted.promise;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(maxActiveEnsureCalls).toBe(1);
+
+    shouldBlockEnsure = false;
+    releaseEnsure.resolve();
+
+    const diagnostics = await diagnosticsPromise;
+    expect(maxActiveEnsureCalls).toBe(1);
+    expect(diagnostics[0]?.diagnostics[0]?.message).toBe("serialized refresh");
+
+    await manager.dispose();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
   test("continues polling other tracked files after one file disappears", async () => {
     const secondFilePath = path.join(workspacePath, "src", "second.ts");
     await fs.writeFile(secondFilePath, "export const second = 1;\n");

@@ -220,6 +220,46 @@ describe("LspClient tracked files", () => {
   });
 });
 
+describe("LspClient tracked file cleanup", () => {
+  it("removes closed tracked files and notifies the server", async () => {
+    const workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "mux-lsp-client-close-"));
+    try {
+      const filePath = path.join(workspacePath, "src", "example.ts");
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.writeFile(filePath, "export const value = 1;\n");
+
+      const { client, transport } = createClient({
+        runtime: new LocalRuntime(workspacePath),
+        rootPath: workspacePath,
+        rootUri: `file://${workspacePath}`,
+      });
+      (client as unknown as { initialized: boolean }).initialized = true;
+
+      const trackedFile = {
+        runtimePath: filePath,
+        readablePath: filePath,
+        uri: `file://${filePath}`,
+        languageId: "typescript",
+      };
+      await client.ensureFile(trackedFile);
+      await client.closeTrackedFile(trackedFile.uri);
+      await client.closeTrackedFile(trackedFile.uri);
+
+      expect(client.getTrackedFiles()).toEqual([]);
+      expect(transport.send).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ method: "textDocument/didOpen" })
+      );
+      expect(transport.send).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ method: "textDocument/didClose" })
+      );
+    } finally {
+      await fs.rm(workspacePath, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("LspClient publishDiagnostics handling", () => {
   it("forwards valid publishDiagnostics notifications", () => {
     const onPublishDiagnostics = mock((_params: LspPublishDiagnosticsParams) => undefined);

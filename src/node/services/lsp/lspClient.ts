@@ -115,6 +115,24 @@ export class LspClient implements LspClientInstance {
     return nextVersion;
   }
 
+  async closeTrackedFile(uri: string): Promise<void> {
+    const existingState = this.openDocuments.get(uri);
+    if (!existingState) {
+      return;
+    }
+
+    this.openDocuments.delete(uri);
+    if (!this.initialized || this.isClosed || this.transport.isClosed()) {
+      return;
+    }
+
+    await this.notify("textDocument/didClose", {
+      textDocument: {
+        uri: existingState.file.uri,
+      },
+    });
+  }
+
   getTrackedFiles(): readonly LspClientFileHandle[] {
     return [...this.openDocuments.values()].map(({ file }) => ({ ...file }));
   }

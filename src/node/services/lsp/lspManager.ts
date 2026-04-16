@@ -125,6 +125,7 @@ export class LspManager {
   private readonly idleInterval: ReturnType<typeof setInterval>;
   private readonly diagnosticPollInterval: ReturnType<typeof setInterval>;
   private readonly diagnosticPollsInFlight = new Set<string>();
+  private readonly trackedFileRefreshesInFlight = new Map<string, Promise<unknown>>();
 
   constructor(options?: LspManagerOptions) {
     this.registry = options?.registry ?? BUILTIN_LSP_SERVERS;
@@ -338,57 +339,117 @@ export class LspManager {
   }): Promise<LspFileDiagnostics[]> {
     const diagnostics = await Promise.all(
       options.fileEntries.map(async ({ filePath, fileHandle }) => {
-        try {
-          if (options.workspaceGeneration !== this.getWorkspaceGeneration(options.workspaceId)) {
-            return undefined;
+        return await this.serializeTrackedFileRefresh(
+          options.workspaceId,
+          options.clientKey,
+          fileHandle.uri,
+          async () => {
+            try {
+              if (
+                options.workspaceGeneration !== this.getWorkspaceGeneration(options.workspaceId)
+              ) {
+                return undefined;
+              }
+
+              const previousPublish = this.getLatestDiagnosticPublish(
+                options.workspaceId,
+                options.clientKey,
+                fileHandle.uri
+              );
+              const expectedVersion = await options.client.ensureFile(fileHandle);
+              if (!options.waitForDiagnostics) {
+                return undefined;
+              }
+
+              const freshPublish = await this.waitForFreshDiagnostics({
+                workspaceId: options.workspaceId,
+                workspaceGeneration: options.workspaceGeneration,
+                clientKey: options.clientKey,
+                uri: fileHandle.uri,
+                previousReceivedAtMs: previousPublish?.receivedAtMs,
+                expectedVersion,
+                timeoutMs: options.timeoutMs ?? LSP_POST_MUTATION_DIAGNOSTICS_TIMEOUT_MS,
+              });
+
+              if (!freshPublish) {
+                return undefined;
+              }
+
+              const snapshot = this.getCachedDiagnostics(
+                options.workspaceId,
+                options.clientKey,
+                fileHandle.uri
+              );
+              if (snapshot && snapshot.receivedAtMs === freshPublish.receivedAtMs) {
+                return snapshot;
+              }
+
+              return undefined;
+            } catch (error) {
+              if (isTrackedFileMissingError(error)) {
+                await this.handleMissingTrackedFile({
+                  workspaceId: options.workspaceId,
+                  clientKey: options.clientKey,
+                  client: options.client,
+                  filePath,
+                  fileHandle,
+                });
+                return undefined;
+              }
+
+              log.debug(`Skipping ${options.logReason} for file`, {
+                workspaceId: options.workspaceId,
+                filePath,
+                error,
+              });
+              return undefined;
+            }
           }
-
-          const previousPublish = this.getLatestDiagnosticPublish(
-            options.workspaceId,
-            options.clientKey,
-            fileHandle.uri
-          );
-          const expectedVersion = await options.client.ensureFile(fileHandle);
-          if (!options.waitForDiagnostics) {
-            return undefined;
-          }
-
-          const freshPublish = await this.waitForFreshDiagnostics({
-            workspaceId: options.workspaceId,
-            workspaceGeneration: options.workspaceGeneration,
-            clientKey: options.clientKey,
-            uri: fileHandle.uri,
-            previousReceivedAtMs: previousPublish?.receivedAtMs,
-            expectedVersion,
-            timeoutMs: options.timeoutMs ?? LSP_POST_MUTATION_DIAGNOSTICS_TIMEOUT_MS,
-          });
-
-          if (!freshPublish) {
-            return undefined;
-          }
-
-          const snapshot = this.getCachedDiagnostics(
-            options.workspaceId,
-            options.clientKey,
-            fileHandle.uri
-          );
-          if (snapshot && snapshot.receivedAtMs === freshPublish.receivedAtMs) {
-            return snapshot;
-          }
-
-          return undefined;
-        } catch (error) {
-          log.debug(`Skipping ${options.logReason} for file`, {
-            workspaceId: options.workspaceId,
-            filePath,
-            error,
-          });
-          return undefined;
-        }
+        );
       })
     );
 
     return diagnostics.filter((snapshot): snapshot is LspFileDiagnostics => snapshot !== undefined);
+  }
+
+  private async serializeTrackedFileRefresh<T>(
+    workspaceId: string,
+    clientKey: string,
+    uri: string,
+    refresh: () => Promise<T>
+  ): Promise<T> {
+    const refreshKey = `${workspaceId}:${clientKey}:${uri}`;
+    const previousRefresh = this.trackedFileRefreshesInFlight.get(refreshKey) ?? Promise.resolve();
+    const nextRefresh = previousRefresh.catch(() => undefined).then(refresh);
+    this.trackedFileRefreshesInFlight.set(refreshKey, nextRefresh);
+
+    try {
+      return await nextRefresh;
+    } finally {
+      if (this.trackedFileRefreshesInFlight.get(refreshKey) === nextRefresh) {
+        this.trackedFileRefreshesInFlight.delete(refreshKey);
+      }
+    }
+  }
+
+  private async handleMissingTrackedFile(options: {
+    workspaceId: string;
+    clientKey: string;
+    client: LspClientInstance;
+    filePath: string;
+    fileHandle: LspClientFileHandle;
+  }): Promise<void> {
+    try {
+      await options.client.closeTrackedFile?.(options.fileHandle.uri);
+    } catch (error) {
+      log.debug("Failed to close disappeared tracked LSP file", {
+        workspaceId: options.workspaceId,
+        filePath: options.filePath,
+        error,
+      });
+    }
+
+    this.clearCachedDiagnostics(options.workspaceId, options.clientKey, options.fileHandle.uri);
   }
 
   async disposeWorkspace(workspaceId: string): Promise<void> {
@@ -711,6 +772,14 @@ export class LspManager {
       return;
     }
 
+    const trackedFiles = this.workspaceClients
+      .get(context.workspaceId)
+      ?.clients.get(context.clientKey)
+      ?.getTrackedFiles?.();
+    if (trackedFiles && !trackedFiles.some((fileHandle) => fileHandle.uri === context.params.uri)) {
+      return;
+    }
+
     if (isMalformedDiagnosticPublish(context.params)) {
       return;
     }
@@ -796,6 +865,36 @@ export class LspManager {
     uri: string
   ): LspDiagnosticPublishReceipt | undefined {
     return this.workspaceDiagnosticPublishes.get(workspaceId)?.get(clientKey)?.get(uri);
+  }
+
+  private clearCachedDiagnostics(workspaceId: string, clientKey: string, uri: string): void {
+    let snapshotChanged = false;
+
+    const workspaceDiagnostics = this.workspaceDiagnostics.get(workspaceId);
+    const clientDiagnostics = workspaceDiagnostics?.get(clientKey);
+    if (clientDiagnostics?.delete(uri)) {
+      snapshotChanged = true;
+      if (clientDiagnostics.size === 0) {
+        workspaceDiagnostics?.delete(clientKey);
+      }
+      if (workspaceDiagnostics?.size === 0) {
+        this.workspaceDiagnostics.delete(workspaceId);
+      }
+    }
+
+    const workspacePublishes = this.workspaceDiagnosticPublishes.get(workspaceId);
+    const clientPublishes = workspacePublishes?.get(clientKey);
+    if (clientPublishes?.delete(uri) && clientPublishes.size === 0) {
+      workspacePublishes?.delete(clientKey);
+    }
+    if (workspacePublishes?.size === 0) {
+      this.workspaceDiagnosticPublishes.delete(workspaceId);
+    }
+
+    this.settleDiagnosticWaitersForUri(workspaceId, clientKey, uri);
+    if (snapshotChanged) {
+      this.notifyWorkspaceDiagnosticsListeners(workspaceId);
+    }
   }
 
   private async waitForFreshDiagnostics(params: {
@@ -927,6 +1026,17 @@ export class LspManager {
           waiter(undefined);
         }
       }
+    }
+  }
+
+  private settleDiagnosticWaitersForUri(workspaceId: string, clientKey: string, uri: string): void {
+    const waiters = this.diagnosticWaiters.get(workspaceId)?.get(clientKey)?.get(uri);
+    if (!waiters || waiters.size === 0) {
+      return;
+    }
+
+    for (const waiter of [...waiters]) {
+      waiter(undefined);
     }
   }
 
@@ -1149,6 +1259,10 @@ function cloneRange(range: LspRange): LspRange {
     start: { ...range.start },
     end: { ...range.end },
   };
+}
+
+function isTrackedFileMissingError(error: unknown): boolean {
+  return typeof error === "object" && error != null && "code" in error && error.code === "ENOENT";
 }
 
 function isFreshDiagnosticPublish(
