@@ -2,6 +2,7 @@ import * as path from "node:path";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
+import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
 import {
   ensureManagedGoTool,
@@ -122,7 +123,7 @@ async function resolveProvisionedLaunchPlan(
       case "pathCommand": {
         const pathCommandEnv = getPathCommandEnv(
           options.runtime,
-          options.rootPath,
+          workspacePath,
           launchPolicy.env,
           options.policyContext
         );
@@ -273,13 +274,14 @@ async function resolveManualCommand(
 
 export function getPathCommandEnv(
   runtime: Runtime,
-  rootPath: string,
+  workspacePath: string,
   env: Readonly<Record<string, string>> | undefined,
   policyContext: LspPolicyContext
 ): Readonly<Record<string, string>> | undefined {
+  const effectiveRuntime = unwrapPrimaryRuntime(runtime);
   if (
     policyContext.trustedWorkspaceExecution ||
-    !(runtime instanceof LocalRuntime || runtime instanceof WorktreeRuntime)
+    !(effectiveRuntime instanceof LocalRuntime || effectiveRuntime instanceof WorktreeRuntime)
   ) {
     return env;
   }
@@ -294,7 +296,7 @@ export function getPathCommandEnv(
         return false;
       }
       const resolvedEntry = path.resolve(entry);
-      return !isPathInsideDir(rootPath, resolvedEntry);
+      return !isPathInsideDir(workspacePath, resolvedEntry);
     })
     .join(path.delimiter);
 
@@ -308,6 +310,10 @@ export function getPathCommandEnv(
     // to keep untrusted workspaces from contributing repo-local entries to PATH resolution.
     PATH: sanitizedPath,
   };
+}
+
+function unwrapPrimaryRuntime(runtime: Runtime): Runtime {
+  return runtime instanceof MultiProjectRuntime ? runtime.getPrimaryRuntime() : runtime;
 }
 
 async function resolvesInsideWorkspace(

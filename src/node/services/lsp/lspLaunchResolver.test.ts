@@ -6,6 +6,8 @@ import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { DockerRuntime } from "@/node/runtime/DockerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
+import { ContainerManager } from "@/node/multiProject/containerManager";
+import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import {
   getManagedLspToolsDir,
   probeWorkspaceLocalExecutable,
@@ -318,6 +320,62 @@ describe("resolveLspLaunchPlan", () => {
     }
   });
 
+  it("sanitizes untrusted inherited PATH entries from the full workspace for nested package roots", async () => {
+    const packageRoot = path.join(workspacePath, "apps", "web");
+    const externalBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-lsp-global-bin-"));
+    const repoBinDir = path.join(workspacePath, "node_modules", ".bin");
+    const originalPath = process.env.PATH;
+
+    try {
+      await fs.mkdir(packageRoot, { recursive: true });
+      await fs.writeFile(path.join(packageRoot, "package.json"), "{}\n");
+      await writeExecutable(
+        path.join(repoBinDir, "mux-nested-path-command"),
+        "#!/bin/sh\nexit 0\n"
+      );
+      await writeExecutable(
+        path.join(externalBinDir, "mux-nested-path-command"),
+        "#!/bin/sh\nexit 0\n"
+      );
+
+      process.env.PATH = [repoBinDir, externalBinDir, originalPath]
+        .filter((value): value is string => value != null && value.length > 0)
+        .join(path.delimiter);
+
+      const launchPlan = await resolveLspLaunchPlan({
+        descriptor: {
+          id: "typescript",
+          extensions: [".ts"],
+          launch: {
+            type: "provisioned",
+            args: ["--stdio"],
+            strategies: [{ type: "pathCommand", command: "mux-nested-path-command" }],
+          },
+          rootMarkers: ["package.json", ".git"],
+          languageIdForPath: () => "typescript",
+        },
+        runtime,
+        rootPath: packageRoot,
+        workspacePath,
+        policyContext: UNTRUSTED_AUTO_POLICY_CONTEXT,
+      });
+
+      expect(launchPlan.command).toBe(path.join(externalBinDir, "mux-nested-path-command"));
+      expect(launchPlan.env).toEqual({
+        PATH: [externalBinDir, originalPath]
+          .filter((value): value is string => value != null && value.length > 0)
+          .join(path.delimiter),
+      });
+    } finally {
+      if (originalPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = originalPath;
+      }
+      await fs.rm(externalBinDir, { recursive: true, force: true });
+    }
+  });
+
   it("sanitizes untrusted PATH env only for local and worktree runtimes", async () => {
     const externalBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-lsp-global-bin-"));
     const workspaceBinDir = path.join(workspacePath, "node_modules", ".bin");
@@ -349,8 +407,47 @@ describe("resolveLspLaunchPlan", () => {
         PATH: expectedSanitizedPath,
       });
 
+      const wrappedWorktreeEnv = getPathCommandEnv(
+        new MultiProjectRuntime(
+          new ContainerManager(os.tmpdir()),
+          [
+            {
+              projectPath: workspacePath,
+              projectName: "project",
+              runtime: new WorktreeRuntime(os.tmpdir()),
+            },
+          ],
+          "shared-workspace"
+        ),
+        workspacePath,
+        { LSP_TRACE: "verbose", PATH: explicitPath },
+        UNTRUSTED_AUTO_POLICY_CONTEXT
+      );
+      expect(wrappedWorktreeEnv).toEqual({
+        LSP_TRACE: "verbose",
+        PATH: expectedSanitizedPath,
+      });
+
       const remotePath = ["node_modules/.bin", "/usr/local/bin"].join(path.delimiter);
       const remoteEnv = { LSP_TRACE: "verbose", PATH: remotePath };
+
+      const wrappedDockerEnv = getPathCommandEnv(
+        new MultiProjectRuntime(
+          new ContainerManager(os.tmpdir()),
+          [
+            {
+              projectPath: workspacePath,
+              projectName: "project",
+              runtime: new DockerRuntime({ image: "node:20", containerName: "mux-lsp-test" }),
+            },
+          ],
+          "shared-workspace"
+        ),
+        workspacePath,
+        remoteEnv,
+        UNTRUSTED_AUTO_POLICY_CONTEXT
+      );
+      expect(wrappedDockerEnv).toEqual(remoteEnv);
 
       const devcontainerEnv = getPathCommandEnv(
         new DevcontainerRuntime({
