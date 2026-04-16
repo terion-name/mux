@@ -202,8 +202,63 @@ describe("resolveLspLaunchPlan", () => {
       });
 
       expect(launchPlan.command).toBe(path.join(externalBinDir, "typescript-language-server"));
+      expect(launchPlan.env).toEqual({ PATH: prependToPath(externalBinDir) });
       expect(launchPlan.initializationOptions).toBeUndefined();
     } finally {
+      await fs.rm(externalBinDir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses an explicit sanitized inherited PATH for untrusted pathCommand launches", async () => {
+    const externalBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-lsp-global-bin-"));
+    const workspaceBinDir = path.join(workspacePath, "node_modules", ".bin");
+    const originalPath = process.env.PATH;
+
+    try {
+      await writeExecutable(
+        path.join(workspaceBinDir, "mux-untrusted-path-command"),
+        "#!/bin/sh\nexit 0\n"
+      );
+      await writeExecutable(
+        path.join(externalBinDir, "mux-untrusted-path-command"),
+        "#!/bin/sh\nexit 0\n"
+      );
+
+      process.env.PATH = [workspaceBinDir, externalBinDir, originalPath]
+        .filter((value): value is string => value != null && value.length > 0)
+        .join(path.delimiter);
+
+      const launchPlan = await resolveLspLaunchPlan({
+        descriptor: {
+          id: "typescript",
+          extensions: [".ts"],
+          launch: {
+            type: "provisioned",
+            args: ["--stdio"],
+            env: { LSP_TRACE: "verbose" },
+            strategies: [{ type: "pathCommand", command: "mux-untrusted-path-command" }],
+          },
+          rootMarkers: ["package.json", ".git"],
+          languageIdForPath: () => "typescript",
+        },
+        runtime,
+        rootPath: workspacePath,
+        policyContext: UNTRUSTED_AUTO_POLICY_CONTEXT,
+      });
+
+      expect(launchPlan.command).toBe(path.join(externalBinDir, "mux-untrusted-path-command"));
+      expect(launchPlan.env).toEqual({
+        LSP_TRACE: "verbose",
+        PATH: [externalBinDir, originalPath]
+          .filter((value): value is string => value != null && value.length > 0)
+          .join(path.delimiter),
+      });
+    } finally {
+      if (originalPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = originalPath;
+      }
       await fs.rm(externalBinDir, { recursive: true, force: true });
     }
   });

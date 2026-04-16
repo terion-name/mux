@@ -118,7 +118,7 @@ async function resolveProvisionedLaunchPlan(
       }
 
       case "pathCommand": {
-        const pathCommandProbeEnv = getPathCommandProbeEnv(
+        const pathCommandEnv = getPathCommandEnv(
           options.rootPath,
           launchPolicy.env,
           options.policyContext
@@ -127,7 +127,7 @@ async function resolveProvisionedLaunchPlan(
           options.runtime,
           strategy.command,
           launchCwd,
-          pathCommandProbeEnv
+          pathCommandEnv
         );
         if (resolvedCommand) {
           if (
@@ -149,7 +149,7 @@ async function resolveProvisionedLaunchPlan(
             command: resolvedCommand,
             args: launchPolicy.args ?? [],
             cwd: launchCwd,
-            env: launchPolicy.env,
+            env: pathCommandEnv,
             initializationOptions,
           };
         }
@@ -265,18 +265,18 @@ async function resolveManualCommand(
   return (await probeCommandOnPath(runtime, command, launchCwd, env)) ?? command;
 }
 
-function getPathCommandProbeEnv(
+function getPathCommandEnv(
   rootPath: string,
   env: Readonly<Record<string, string>> | undefined,
   policyContext: LspPolicyContext
 ): Readonly<Record<string, string>> | undefined {
-  if (policyContext.trustedWorkspaceExecution || env?.PATH == null) {
+  if (policyContext.trustedWorkspaceExecution) {
     return env;
   }
 
-  // Untrusted workspaces must not influence PATH-based binary resolution with
-  // repo-local or relative entries that resolve under the workspace root.
-  const sanitizedPath = env.PATH.split(path.delimiter)
+  const sourcePath = env?.PATH ?? process.env.PATH ?? "";
+  const sanitizedPath = sourcePath
+    .split(path.delimiter)
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0)
     .filter((entry) => {
@@ -288,12 +288,14 @@ function getPathCommandProbeEnv(
     })
     .join(path.delimiter);
 
-  if (sanitizedPath === env.PATH) {
+  if (env?.PATH != null && sanitizedPath === env.PATH) {
     return env;
   }
 
   return {
     ...env,
+    // Untrusted workspaces must not influence PATH-based binary resolution or the final
+    // launch environment with repo-local or relative PATH entries.
     PATH: sanitizedPath,
   };
 }
