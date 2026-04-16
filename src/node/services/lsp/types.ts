@@ -223,6 +223,7 @@ export interface LspClientQueryResult {
 export interface LspClientInstance {
   readonly isClosed: boolean;
   ensureFile(file: LspClientFileHandle): Promise<number>;
+  getTrackedFiles?(): readonly LspClientFileHandle[];
   query(request: LspClientQueryRequest): Promise<LspClientQueryResult>;
   close(): Promise<void>;
 }

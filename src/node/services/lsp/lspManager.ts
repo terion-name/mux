@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import { readFileString } from "@/node/utils/runtime/helpers";
 import {
+  LSP_DIAGNOSTICS_POLL_INTERVAL_MS,
   LSP_IDLE_CHECK_INTERVAL_MS,
   LSP_IDLE_TIMEOUT_MS,
   LSP_MAX_LOCATIONS,
@@ -50,6 +51,11 @@ interface ResolvedLspClientContext {
   rootUri: string;
 }
 
+interface LspTrackedFileRefreshEntry {
+  filePath: string;
+  fileHandle: LspClientFileHandle;
+}
+
 interface LspDiagnosticPublishReceipt {
   version?: number;
   receivedAtMs: number;
@@ -64,6 +70,7 @@ export interface LspManagerOptions {
   clientFactory?: LspClientFactory;
   idleTimeoutMs?: number;
   idleCheckIntervalMs?: number;
+  diagnosticPollIntervalMs?: number;
 }
 
 export interface LspManagerQueryOptions {
@@ -114,7 +121,10 @@ export class LspManager {
   private readonly clientFactory: LspClientFactory;
   private readonly idleTimeoutMs: number;
   private readonly idleCheckIntervalMs: number;
+  private readonly diagnosticPollIntervalMs: number;
   private readonly idleInterval: ReturnType<typeof setInterval>;
+  private readonly diagnosticPollInterval: ReturnType<typeof setInterval>;
+  private readonly diagnosticPollsInFlight = new Set<string>();
 
   constructor(options?: LspManagerOptions) {
     this.registry = options?.registry ?? BUILTIN_LSP_SERVERS;
@@ -122,10 +132,16 @@ export class LspManager {
       options?.clientFactory ?? ((clientOptions) => LspClient.create(clientOptions));
     this.idleTimeoutMs = options?.idleTimeoutMs ?? LSP_IDLE_TIMEOUT_MS;
     this.idleCheckIntervalMs = options?.idleCheckIntervalMs ?? LSP_IDLE_CHECK_INTERVAL_MS;
+    this.diagnosticPollIntervalMs =
+      options?.diagnosticPollIntervalMs ?? LSP_DIAGNOSTICS_POLL_INTERVAL_MS;
     this.idleInterval = setInterval(() => {
       void this.cleanupIdleWorkspaces();
     }, this.idleCheckIntervalMs);
     this.idleInterval.unref?.();
+    this.diagnosticPollInterval = setInterval(() => {
+      void this.refreshTrackedDiagnostics();
+    }, this.diagnosticPollIntervalMs);
+    this.diagnosticPollInterval.unref?.();
   }
 
   acquireLease(workspaceId: string): void {
@@ -211,7 +227,11 @@ export class LspManager {
     try {
       const fileContextsByClientKey = new Map<
         string,
-        Array<{ filePath: string; context: ResolvedLspClientContext }>
+        {
+          client: LspClientInstance;
+          workspaceGeneration: number;
+          fileEntries: LspTrackedFileRefreshEntry[];
+        }
       >();
       const uniqueFilePaths = [...new Set(options.filePaths)];
 
@@ -225,8 +245,15 @@ export class LspManager {
               filePath,
               policyContext: options.policyContext,
             });
-            const entriesForClient = fileContextsByClientKey.get(context.clientKey) ?? [];
-            entriesForClient.push({ filePath, context });
+            const entriesForClient = fileContextsByClientKey.get(context.clientKey) ?? {
+              client: context.client,
+              workspaceGeneration: context.workspaceGeneration,
+              fileEntries: [],
+            };
+            entriesForClient.fileEntries.push({
+              filePath,
+              fileHandle: context.fileHandle,
+            });
             fileContextsByClientKey.set(context.clientKey, entriesForClient);
           } catch (error) {
             log.debug("Skipping post-mutation LSP diagnostics for file", {
@@ -240,62 +267,128 @@ export class LspManager {
 
       const diagnostics = (
         await Promise.all(
-          [...fileContextsByClientKey.values()].map(
-            async (fileContexts) =>
-              await Promise.all(
-                fileContexts.map(async ({ filePath, context }) => {
-                  try {
-                    const previousPublish = this.getLatestDiagnosticPublish(
-                      options.workspaceId,
-                      context.clientKey,
-                      context.fileHandle.uri
-                    );
-                    const expectedVersion = await context.client.ensureFile(context.fileHandle);
-                    const freshPublish = await this.waitForFreshDiagnostics({
-                      workspaceId: options.workspaceId,
-                      workspaceGeneration: context.workspaceGeneration,
-                      clientKey: context.clientKey,
-                      uri: context.fileHandle.uri,
-                      previousReceivedAtMs: previousPublish?.receivedAtMs,
-                      expectedVersion,
-                      timeoutMs: options.timeoutMs ?? LSP_POST_MUTATION_DIAGNOSTICS_TIMEOUT_MS,
-                    });
-
-                    if (!freshPublish) {
-                      return undefined;
-                    }
-
-                    const snapshot = this.getCachedDiagnostics(
-                      options.workspaceId,
-                      context.clientKey,
-                      context.fileHandle.uri
-                    );
-                    if (snapshot && snapshot.receivedAtMs === freshPublish.receivedAtMs) {
-                      return snapshot;
-                    }
-
-                    return undefined;
-                  } catch (error) {
-                    log.debug("Skipping post-mutation LSP diagnostics for file", {
-                      workspaceId: options.workspaceId,
-                      filePath,
-                      error,
-                    });
-                    return undefined;
-                  }
-                })
-              )
-          )
+          [...fileContextsByClientKey.entries()].map(async ([clientKey, fileContext]) => {
+            return await this.refreshTrackedFilesForClient({
+              workspaceId: options.workspaceId,
+              workspaceGeneration: fileContext.workspaceGeneration,
+              clientKey,
+              client: fileContext.client,
+              fileEntries: fileContext.fileEntries,
+              waitForDiagnostics: true,
+              timeoutMs: options.timeoutMs ?? LSP_POST_MUTATION_DIAGNOSTICS_TIMEOUT_MS,
+              logReason: "post-mutation LSP diagnostics",
+            });
+          })
         )
-      )
-        .flat()
-        .filter((snapshot): snapshot is LspFileDiagnostics => snapshot !== undefined);
+      ).flat();
 
       this.markActivity(options.workspaceId);
       return diagnostics.sort((left, right) => left.path.localeCompare(right.path));
     } finally {
       this.releaseLease(options.workspaceId);
     }
+  }
+
+  private refreshTrackedDiagnostics(): void {
+    for (const [workspaceId, entry] of this.workspaceClients) {
+      const workspaceGeneration = this.getWorkspaceGeneration(workspaceId);
+      for (const [clientKey, client] of entry.clients) {
+        if (client.isClosed) {
+          continue;
+        }
+
+        const trackedFiles = client.getTrackedFiles?.();
+        if (!trackedFiles || trackedFiles.length === 0) {
+          continue;
+        }
+
+        const pollKey = `${workspaceId}:${clientKey}`;
+        if (this.diagnosticPollsInFlight.has(pollKey)) {
+          continue;
+        }
+
+        this.diagnosticPollsInFlight.add(pollKey);
+        void this.refreshTrackedFilesForClient({
+          workspaceId,
+          workspaceGeneration,
+          clientKey,
+          client,
+          fileEntries: trackedFiles.map((fileHandle) => ({
+            filePath: fileHandle.readablePath,
+            fileHandle,
+          })),
+          waitForDiagnostics: false,
+          logReason: "polled LSP diagnostics",
+        }).finally(() => {
+          this.diagnosticPollsInFlight.delete(pollKey);
+        });
+      }
+    }
+  }
+
+  private async refreshTrackedFilesForClient(options: {
+    workspaceId: string;
+    workspaceGeneration: number;
+    clientKey: string;
+    client: LspClientInstance;
+    fileEntries: LspTrackedFileRefreshEntry[];
+    waitForDiagnostics: boolean;
+    timeoutMs?: number;
+    logReason: string;
+  }): Promise<LspFileDiagnostics[]> {
+    const diagnostics = await Promise.all(
+      options.fileEntries.map(async ({ filePath, fileHandle }) => {
+        try {
+          if (options.workspaceGeneration !== this.getWorkspaceGeneration(options.workspaceId)) {
+            return undefined;
+          }
+
+          const previousPublish = this.getLatestDiagnosticPublish(
+            options.workspaceId,
+            options.clientKey,
+            fileHandle.uri
+          );
+          const expectedVersion = await options.client.ensureFile(fileHandle);
+          if (!options.waitForDiagnostics) {
+            return undefined;
+          }
+
+          const freshPublish = await this.waitForFreshDiagnostics({
+            workspaceId: options.workspaceId,
+            workspaceGeneration: options.workspaceGeneration,
+            clientKey: options.clientKey,
+            uri: fileHandle.uri,
+            previousReceivedAtMs: previousPublish?.receivedAtMs,
+            expectedVersion,
+            timeoutMs: options.timeoutMs ?? LSP_POST_MUTATION_DIAGNOSTICS_TIMEOUT_MS,
+          });
+
+          if (!freshPublish) {
+            return undefined;
+          }
+
+          const snapshot = this.getCachedDiagnostics(
+            options.workspaceId,
+            options.clientKey,
+            fileHandle.uri
+          );
+          if (snapshot && snapshot.receivedAtMs === freshPublish.receivedAtMs) {
+            return snapshot;
+          }
+
+          return undefined;
+        } catch (error) {
+          log.debug(`Skipping ${options.logReason} for file`, {
+            workspaceId: options.workspaceId,
+            filePath,
+            error,
+          });
+          return undefined;
+        }
+      })
+    );
+
+    return diagnostics.filter((snapshot): snapshot is LspFileDiagnostics => snapshot !== undefined);
   }
 
   async disposeWorkspace(workspaceId: string): Promise<void> {
@@ -333,6 +426,7 @@ export class LspManager {
 
   async dispose(): Promise<void> {
     clearInterval(this.idleInterval);
+    clearInterval(this.diagnosticPollInterval);
     const workspaceIds = new Set([
       ...this.workspaceClients.keys(),
       ...this.workspaceDiagnostics.keys(),
@@ -341,6 +435,7 @@ export class LspManager {
     await Promise.all(
       [...workspaceIds].map(async (workspaceId) => this.disposeWorkspace(workspaceId))
     );
+    this.diagnosticPollsInFlight.clear();
     this.workspaceDiagnosticListeners.clear();
   }
 

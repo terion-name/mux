@@ -1,3 +1,6 @@
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, expect, it, mock } from "bun:test";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { LspClient } from "./lspClient";
@@ -72,64 +75,66 @@ function createClient(options?: Partial<CreateLspClientOptions>) {
 describe("LspClient", () => {
   it("launches from the resolved plan and forwards initialization options", async () => {
     const requests: Array<{ id?: number | string; method?: string; params?: unknown }> = [];
-    const exec = mock((_command: string, _options: { cwd: string; env?: Record<string, string> }) => {
-      let stdoutController!: ReadableStreamDefaultController<Uint8Array>;
-      const stdout = new ReadableStream<Uint8Array>({
-        start(controller) {
-          stdoutController = controller;
-        },
-      });
-      const stderr = new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.close();
-        },
-      });
-      let resolveExitCode!: (value: number) => void;
-      const exitCode = new Promise<number>((resolve) => {
-        resolveExitCode = resolve;
-      });
-      const decoder = new TextDecoder();
-      const encoder = new TextEncoder();
-      const stdin = new WritableStream<Uint8Array>({
-        write(chunk) {
-          const payload = decoder.decode(chunk);
-          const headerEnd = payload.indexOf("\r\n\r\n");
-          if (headerEnd === -1) {
-            throw new Error(`Missing LSP frame header: ${payload}`);
-          }
+    const exec = mock(
+      (_command: string, _options: { cwd: string; env?: Record<string, string> }) => {
+        let stdoutController!: ReadableStreamDefaultController<Uint8Array>;
+        const stdout = new ReadableStream<Uint8Array>({
+          start(controller) {
+            stdoutController = controller;
+          },
+        });
+        const stderr = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.close();
+          },
+        });
+        let resolveExitCode!: (value: number) => void;
+        const exitCode = new Promise<number>((resolve) => {
+          resolveExitCode = resolve;
+        });
+        const decoder = new TextDecoder();
+        const encoder = new TextEncoder();
+        const stdin = new WritableStream<Uint8Array>({
+          write(chunk) {
+            const payload = decoder.decode(chunk);
+            const headerEnd = payload.indexOf("\r\n\r\n");
+            if (headerEnd === -1) {
+              throw new Error(`Missing LSP frame header: ${payload}`);
+            }
 
-          const message = JSON.parse(payload.slice(headerEnd + 4)) as {
-            id?: number | string;
-            method?: string;
-            params?: unknown;
-          };
-          requests.push(message);
+            const message = JSON.parse(payload.slice(headerEnd + 4)) as {
+              id?: number | string;
+              method?: string;
+              params?: unknown;
+            };
+            requests.push(message);
 
-          if (message.id == null) {
-            return;
-          }
+            if (message.id == null) {
+              return;
+            }
 
-          const responseBody = JSON.stringify({
-            jsonrpc: "2.0",
-            id: message.id,
-            result: message.method === "initialize" ? { capabilities: {} } : null,
-          });
-          const responseFrame = `Content-Length: ${responseBody.length}\r\n\r\n${responseBody}`;
-          stdoutController.enqueue(encoder.encode(responseFrame));
-        },
-        close() {
-          resolveExitCode(0);
-        },
-      });
+            const responseBody = JSON.stringify({
+              jsonrpc: "2.0",
+              id: message.id,
+              result: message.method === "initialize" ? { capabilities: {} } : null,
+            });
+            const responseFrame = `Content-Length: ${responseBody.length}\r\n\r\n${responseBody}`;
+            stdoutController.enqueue(encoder.encode(responseFrame));
+          },
+          close() {
+            resolveExitCode(0);
+          },
+        });
 
-      return Promise.resolve({
-        stdout,
-        stderr,
-        stdin,
-        exitCode,
-        duration: Promise.resolve(0),
-      });
-    });
+        return Promise.resolve({
+          stdout,
+          stderr,
+          stdin,
+          exitCode,
+          duration: Promise.resolve(0),
+        });
+      }
+    );
     const runtime = new LocalRuntime("/tmp/workspace");
     runtime.exec = exec;
 
@@ -173,6 +178,45 @@ describe("LspClient", () => {
     await client.close();
     expect(requests.at(-2)?.method).toBe("shutdown");
     expect(requests.at(-1)?.method).toBe("exit");
+  });
+});
+
+describe("LspClient tracked files", () => {
+  it("returns the files tracked by ensureFile without exposing internal state", async () => {
+    const workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "mux-lsp-client-"));
+    try {
+      const filePath = path.join(workspacePath, "src", "example.ts");
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.writeFile(filePath, "export const value = 1;\n");
+
+      const { client } = createClient({
+        runtime: new LocalRuntime(workspacePath),
+        rootPath: workspacePath,
+        rootUri: `file://${workspacePath}`,
+      });
+      (client as unknown as { initialized: boolean }).initialized = true;
+
+      const trackedFile = {
+        runtimePath: filePath,
+        readablePath: filePath,
+        uri: `file://${filePath}`,
+        languageId: "typescript",
+      };
+      await client.ensureFile(trackedFile);
+
+      const trackedFiles = client.getTrackedFiles();
+      expect(trackedFiles).toEqual([trackedFile]);
+
+      const firstTrackedFile = trackedFiles[0];
+      expect(firstTrackedFile).toBeDefined();
+      if (!firstTrackedFile) {
+        throw new Error("Expected ensureFile to track the opened file");
+      }
+      firstTrackedFile.readablePath = "/tmp/mutated.ts";
+      expect(client.getTrackedFiles()).toEqual([trackedFile]);
+    } finally {
+      await fs.rm(workspacePath, { recursive: true, force: true });
+    }
   });
 });
 

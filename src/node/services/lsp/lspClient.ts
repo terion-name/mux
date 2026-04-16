@@ -27,6 +27,7 @@ interface PendingRequest {
 }
 
 interface OpenDocumentState {
+  file: LspClientFileHandle;
   version: number;
   text: string;
 }
@@ -78,6 +79,7 @@ export class LspClient implements LspClientInstance {
 
     if (!existingState) {
       this.openDocuments.set(file.uri, {
+        file: { ...file },
         version: 1,
         text,
       });
@@ -93,11 +95,13 @@ export class LspClient implements LspClientInstance {
     }
 
     if (existingState.text === text) {
+      existingState.file = { ...file };
       return existingState.version;
     }
 
     const nextVersion = existingState.version + 1;
     this.openDocuments.set(file.uri, {
+      file: { ...file },
       version: nextVersion,
       text,
     });
@@ -109,6 +113,10 @@ export class LspClient implements LspClientInstance {
       contentChanges: [{ text }],
     });
     return nextVersion;
+  }
+
+  getTrackedFiles(): readonly LspClientFileHandle[] {
+    return [...this.openDocuments.values()].map(({ file }) => ({ ...file }));
   }
 
   async query(request: LspClientQueryRequest): Promise<LspClientQueryResult> {
