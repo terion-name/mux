@@ -204,6 +204,24 @@ describe("Config", () => {
 
       expect(config.loadConfigOrDefault().lspProvisioningMode).toBe("manual");
     });
+    it("does not persist the env override during unrelated config edits", async () => {
+      process.env[envKey] = "auto";
+
+      await config.editConfig((cfg) => {
+        cfg.apiServerPort = 31337;
+        return cfg;
+      });
+
+      expect(config.loadConfigOrDefault().lspProvisioningMode).toBe("auto");
+
+      const raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        apiServerPort?: unknown;
+        lspProvisioningMode?: unknown;
+      };
+      expect(raw.apiServerPort).toBe(31337);
+      expect(raw.lspProvisioningMode).toBeUndefined();
+    });
+
   });
 
   describe("server GitHub owner auth setting", () => {

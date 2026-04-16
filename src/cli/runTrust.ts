@@ -27,6 +27,21 @@ function deriveMuxRunProjectPath(projectDir: string, srcDir: string): string {
   return normalizedProjectDir;
 }
 
+export function buildEphemeralRunConfig(
+  tempConfig: ProjectsConfig,
+  existingConfig: ProjectsConfig,
+  projectDir: string,
+  srcDir: string
+): ProjectsConfig {
+  return {
+    ...tempConfig,
+    // Keep mux run aligned with the desktop app's effective LSP provisioning mode,
+    // including read-time env overrides, without importing unrelated workspace/task state.
+    lspProvisioningMode: existingConfig.lspProvisioningMode,
+    projects: buildTrustOnlyProjectsForRun(existingConfig.projects, projectDir, srcDir),
+  };
+}
+
 export function buildTrustOnlyProjectsForRun(
   projects: ProjectsConfig["projects"],
   projectDir: string,

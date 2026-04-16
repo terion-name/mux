@@ -464,7 +464,19 @@ export class Config {
     return priority.length > 1 ? priority : undefined;
   }
 
-  loadConfigOrDefault(): ProjectsConfig {
+  private applyLspProvisioningModeEnvOverride(config: ProjectsConfig): ProjectsConfig {
+    const lspProvisioningMode = getLspProvisioningModeEnvOverride();
+    if (lspProvisioningMode == null) {
+      return config;
+    }
+
+    return {
+      ...config,
+      lspProvisioningMode,
+    };
+  }
+
+  private loadPersistedConfigOrDefault(): ProjectsConfig {
     try {
       if (fs.existsSync(this.configFile)) {
         const data = fs.readFileSync(this.configFile, "utf-8");
@@ -693,9 +705,7 @@ export class Config {
 
         const runtimeEnablement = normalizeRuntimeEnablementOverrides(parsed.runtimeEnablement);
         const defaultRuntime = normalizeRuntimeEnablementId(parsed.defaultRuntime);
-        const lspProvisioningMode =
-          getLspProvisioningModeEnvOverride() ??
-          parseLspProvisioningMode(parsed.lspProvisioningMode);
+        const lspProvisioningMode = parseLspProvisioningMode(parsed.lspProvisioningMode);
 
         const agentAiDefaults =
           parsed.agentAiDefaults !== undefined
@@ -751,7 +761,6 @@ export class Config {
     }
 
     // Return default config
-    const lspProvisioningMode = getLspProvisioningModeEnvOverride();
     return {
       projects: new Map(),
       taskSettings: DEFAULT_TASK_SETTINGS,
@@ -761,8 +770,11 @@ export class Config {
       coderWorkspaceArchiveBehavior: DEFAULT_CODER_ARCHIVE_BEHAVIOR,
       worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
       deleteWorktreeOnArchive: false,
-      lspProvisioningMode,
     };
+  }
+
+  loadConfigOrDefault(): ProjectsConfig {
+    return this.applyLspProvisioningModeEnvOverride(this.loadPersistedConfigOrDefault());
   }
 
   async saveConfig(config: ProjectsConfig): Promise<void> {
@@ -956,7 +968,7 @@ export class Config {
    * @param fn Function that takes current config and returns modified config
    */
   async editConfig(fn: (config: ProjectsConfig) => ProjectsConfig): Promise<void> {
-    const config = this.loadConfigOrDefault();
+    const config = this.loadPersistedConfigOrDefault();
     const newConfig = fn(config);
     await this.saveConfig(newConfig);
     // Backend-initiated config edits (for example gateway auth changes) use this signal
@@ -1246,7 +1258,7 @@ export class Config {
    * saved to config for subsequent loads.
    */
   async getAllWorkspaceMetadata(): Promise<FrontendWorkspaceMetadata[]> {
-    const config = this.loadConfigOrDefault();
+    const config = this.loadPersistedConfigOrDefault();
     const workspaceMetadata: FrontendWorkspaceMetadata[] = [];
     let configModified = false;
 

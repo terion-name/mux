@@ -75,7 +75,7 @@ import { execSync } from "child_process";
 import { getParseOptions } from "./argv";
 import { EXPERIMENT_IDS } from "../common/constants/experiments";
 import { getErrorMessage } from "@/common/utils/errors";
-import { buildTrustOnlyProjectsForRun } from "./runTrust";
+import { buildEphemeralRunConfig } from "./runTrust";
 import { resolveConfiguredProjectPathForTrust } from "../node/utils/projectTrust";
 import { buildExperimentsObject } from "./runOptions";
 
@@ -351,18 +351,17 @@ async function main(): Promise<number> {
   // Avoid importing workspace/task metadata into ephemeral CLI config because
   // stale queued/running records can incorrectly throttle sub-agent tasks.
   const existingConfig = realConfig.loadConfigOrDefault();
-  if (existingConfig.projects.size > 0) {
-    const trustOnlyProjects = buildTrustOnlyProjectsForRun(
-      existingConfig.projects,
-      projectDir,
-      config.srcDir
-    );
-    if (trustOnlyProjects.size > 0) {
-      await config.saveConfig({
-        ...config.loadConfigOrDefault(),
-        projects: trustOnlyProjects,
-      });
-    }
+  const ephemeralRunConfig = buildEphemeralRunConfig(
+    config.loadConfigOrDefault(),
+    existingConfig,
+    projectDir,
+    config.srcDir
+  );
+  if (
+    ephemeralRunConfig.projects.size > 0 ||
+    ephemeralRunConfig.lspProvisioningMode === "auto"
+  ) {
+    await config.saveConfig(ephemeralRunConfig);
   }
 
   const model: string = resolveModelAlias(opts.model);
