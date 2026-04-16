@@ -292,6 +292,10 @@ export class LspManager {
 
   private refreshTrackedDiagnostics(): void {
     for (const [workspaceId, entry] of this.workspaceClients) {
+      if (!this.hasWorkspaceDiagnosticsListeners(workspaceId)) {
+        continue;
+      }
+
       const workspaceGeneration = this.getWorkspaceGeneration(workspaceId);
       for (const [clientKey, client] of entry.clients) {
         if (client.isClosed) {
@@ -530,6 +534,10 @@ export class LspManager {
     return [...this.diagnosticPollsInFlight.keys()].some((pollKey) =>
       pollKey.startsWith(workspaceKeyPrefix)
     );
+  }
+
+  private hasWorkspaceDiagnosticsListeners(workspaceId: string): boolean {
+    return (this.workspaceDiagnosticListeners.get(workspaceId)?.size ?? 0) > 0;
   }
 
   private async getOrCreateClient(

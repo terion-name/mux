@@ -742,6 +742,69 @@ describe("LspManager", () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 
+  test("does not keep tracked workspaces warm when no diagnostics listeners are active", async () => {
+    const trackedFiles = new Map<
+      string,
+      {
+        fileHandle: Parameters<LspClientInstance["ensureFile"]>[0];
+        version: number;
+      }
+    >();
+    const ensureFile = mock((file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+      const nextVersion = (trackedFiles.get(file.uri)?.version ?? 0) + 1;
+      trackedFiles.set(file.uri, {
+        fileHandle: { ...file },
+        version: nextVersion,
+      });
+      return Promise.resolve(nextVersion);
+    });
+    const close = mock(() => Promise.resolve(undefined));
+    const clientFactory = mock((_options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile,
+        getTrackedFiles: () =>
+          [...trackedFiles.values()].map(({ fileHandle }) => ({
+            ...fileHandle,
+          })),
+        query: mock(() => Promise.resolve({ operation: "hover" as const, hover: "unused" })),
+        close,
+      });
+    });
+
+    const manager = new LspManager({
+      registry: createRegistry(),
+      clientFactory,
+      idleTimeoutMs: 20,
+      idleCheckIntervalMs: 5,
+      diagnosticPollIntervalMs: 10,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+    const workspaceClients = (
+      manager as unknown as {
+        workspaceClients: Map<string, unknown>;
+      }
+    ).workspaceClients;
+
+    await manager.query({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePath: "src/example.ts",
+      policyContext: TEST_LSP_POLICY_CONTEXT,
+      operation: "hover",
+      line: 1,
+      column: 1,
+    });
+
+    const disposed = await waitUntil(() => !workspaceClients.has("ws-1"), 200);
+    expect(disposed).toBe(true);
+    expect(ensureFile).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledTimes(1);
+
+    await manager.dispose();
+  });
+
   test("clears stale diagnostics and stops polling files that disappear out of band", async () => {
     const trackedFiles = new Map<
       string,
@@ -804,6 +867,7 @@ describe("LspManager", () => {
     });
     const runtime = new LocalRuntime(workspacePath);
     const filePath = path.join(workspacePath, "src", "example.ts");
+    const unsubscribe = manager.subscribeWorkspaceDiagnostics("ws-1", () => undefined);
 
     await fs.writeFile(filePath, 'const value: number = "oops";\n');
     await manager.query({
@@ -838,6 +902,7 @@ describe("LspManager", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(ensureFileCalls.get(trackedFile.uri) ?? 0).toBe(ensureCallsAfterCleanup);
 
+    unsubscribe();
     await manager.dispose();
     expect(close).toHaveBeenCalledTimes(1);
   });
@@ -922,6 +987,7 @@ describe("LspManager", () => {
     });
     const runtime = new LocalRuntime(workspacePath);
     const filePath = path.join(workspacePath, "src", "example.ts");
+    const unsubscribe = manager.subscribeWorkspaceDiagnostics("ws-1", () => undefined);
 
     await manager.query({
       workspaceId: "ws-1",
@@ -956,6 +1022,7 @@ describe("LspManager", () => {
     expect(maxActiveEnsureCalls).toBe(1);
     expect(diagnostics[0]?.diagnostics[0]?.message).toBe("serialized refresh");
 
+    unsubscribe();
     await manager.dispose();
     expect(close).toHaveBeenCalledTimes(1);
   });
@@ -1009,6 +1076,7 @@ describe("LspManager", () => {
       diagnosticPollIntervalMs: 10,
     });
     const runtime = new LocalRuntime(workspacePath);
+    const unsubscribe = manager.subscribeWorkspaceDiagnostics("ws-1", () => undefined);
     const workspaceClients = (
       manager as unknown as {
         workspaceClients: Map<string, unknown>;
@@ -1034,6 +1102,7 @@ describe("LspManager", () => {
     expect(workspaceClients.has("ws-1")).toBe(true);
 
     releaseEnsure.resolve();
+    unsubscribe();
     await manager.dispose();
     expect(close).toHaveBeenCalledTimes(1);
   });
@@ -1123,6 +1192,7 @@ describe("LspManager", () => {
       diagnosticPollIntervalMs: 10,
     });
     const runtime = new LocalRuntime(workspacePath);
+    const unsubscribe = manager.subscribeWorkspaceDiagnostics("ws-1", () => undefined);
     const managerWithInternals = manager as unknown as {
       diagnosticPollsInFlight: Map<string, symbol>;
       trackedFileRefreshesInFlight: Map<string, Promise<unknown>>;
@@ -1201,6 +1271,7 @@ describe("LspManager", () => {
     expect(completion.diagnostics).toEqual([]);
 
     releaseFirstPoll.resolve();
+    unsubscribe();
     await manager.dispose();
     expect(firstClose).toHaveBeenCalledTimes(1);
     expect(secondClose).toHaveBeenCalledTimes(1);
@@ -1262,6 +1333,7 @@ describe("LspManager", () => {
       diagnosticPollIntervalMs: 10,
     });
     const runtime = new LocalRuntime(workspacePath);
+    const unsubscribe = manager.subscribeWorkspaceDiagnostics("ws-1", () => undefined);
 
     await manager.query({
       workspaceId: "ws-1",
@@ -1295,6 +1367,7 @@ describe("LspManager", () => {
     }, 500);
     expect(sawHealthyRefresh).toBe(true);
 
+    unsubscribe();
     await manager.dispose();
     expect(close).toHaveBeenCalledTimes(1);
   });
