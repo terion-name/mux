@@ -2,13 +2,19 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { cleanup, render } from "@testing-library/react";
 
-import type { WorkspaceLspDiagnosticsSnapshot } from "@/common/orpc/types";
+import type { WorkspaceLspDiagnosticsViewState } from "@/browser/stores/WorkspaceStore";
 
-let currentSnapshot: WorkspaceLspDiagnosticsSnapshot | null = null;
+let currentDiagnosticsViewState: WorkspaceLspDiagnosticsViewState = {
+  snapshot: null,
+  connection: {
+    status: "loading",
+    errorMessage: null,
+  },
+};
 
 void mock.module("@/browser/stores/WorkspaceStore", () => ({
   useWorkspaceStatsSnapshot: () => null,
-  useWorkspaceLspDiagnosticsSnapshot: () => currentSnapshot,
+  useWorkspaceLspDiagnosticsViewState: () => currentDiagnosticsViewState,
 }));
 
 import { DiagnosticsPanel } from "./StatsTab";
@@ -27,7 +33,13 @@ describe("DiagnosticsPanel", () => {
 
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
-    currentSnapshot = null;
+    currentDiagnosticsViewState = {
+      snapshot: null,
+      connection: {
+        status: "loading",
+        errorMessage: null,
+      },
+    };
     console.error = (...args: unknown[]) => {
       consoleErrorCalls.push(args);
     };
@@ -35,7 +47,13 @@ describe("DiagnosticsPanel", () => {
 
   afterEach(() => {
     cleanup();
-    currentSnapshot = null;
+    currentDiagnosticsViewState = {
+      snapshot: null,
+      connection: {
+        status: "loading",
+        errorMessage: null,
+      },
+    };
     console.error = originalConsoleError;
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
@@ -48,9 +66,15 @@ describe("DiagnosticsPanel", () => {
   });
 
   test("shows an empty state when the diagnostics snapshot contains no entries", () => {
-    currentSnapshot = {
-      workspaceId: "workspace-1",
-      diagnostics: [],
+    currentDiagnosticsViewState = {
+      snapshot: {
+        workspaceId: "workspace-1",
+        diagnostics: [],
+      },
+      connection: {
+        status: "ready",
+        errorMessage: null,
+      },
     };
 
     const view = render(<DiagnosticsPanel workspaceId="workspace-1" />);
@@ -59,78 +83,84 @@ describe("DiagnosticsPanel", () => {
   });
 
   test("renders multi-server diagnostics and includes unknown severities in the summary", () => {
-    currentSnapshot = {
-      workspaceId: "workspace-1",
-      diagnostics: [
-        {
-          uri: "file:///workspace/src/example.ts",
-          path: "/workspace/src/example.ts",
-          serverId: "typescript",
-          rootUri: "file:///workspace",
-          version: 3,
-          diagnostics: [
-            {
-              range: {
-                start: { line: 1, character: 4 },
-                end: { line: 1, character: 10 },
+    currentDiagnosticsViewState = {
+      snapshot: {
+        workspaceId: "workspace-1",
+        diagnostics: [
+          {
+            uri: "file:///workspace/src/example.ts",
+            path: "/workspace/src/example.ts",
+            serverId: "typescript",
+            rootUri: "file:///workspace",
+            version: 3,
+            diagnostics: [
+              {
+                range: {
+                  start: { line: 1, character: 4 },
+                  end: { line: 1, character: 10 },
+                },
+                severity: 1,
+                source: "tsserver",
+                code: 2322,
+                message: "Type 'string' is not assignable to type 'number'.",
               },
-              severity: 1,
-              source: "tsserver",
-              code: 2322,
-              message: "Type 'string' is not assignable to type 'number'.",
-            },
-            {
-              range: {
-                start: { line: 4, character: 2 },
-                end: { line: 4, character: 8 },
+              {
+                range: {
+                  start: { line: 4, character: 2 },
+                  end: { line: 4, character: 8 },
+                },
+                severity: 2,
+                source: "eslint",
+                code: "no-console",
+                message: "Unexpected console statement.",
               },
-              severity: 2,
-              source: "eslint",
-              code: "no-console",
-              message: "Unexpected console statement.",
-            },
-          ],
-          receivedAtMs: 1,
-        },
-        {
-          uri: "file:///workspace/src/example.ts",
-          path: "/workspace/src/example.ts",
-          serverId: "eslint",
-          rootUri: "file:///workspace",
-          version: 3,
-          diagnostics: [
-            {
-              range: {
-                start: { line: 6, character: 1 },
-                end: { line: 6, character: 12 },
+            ],
+            receivedAtMs: 1,
+          },
+          {
+            uri: "file:///workspace/src/example.ts",
+            path: "/workspace/src/example.ts",
+            serverId: "eslint",
+            rootUri: "file:///workspace",
+            version: 3,
+            diagnostics: [
+              {
+                range: {
+                  start: { line: 6, character: 1 },
+                  end: { line: 6, character: 12 },
+                },
+                source: "eslint",
+                code: "custom/rule",
+                message: "Use the shared logger helper.",
               },
-              source: "eslint",
-              code: "custom/rule",
-              message: "Use the shared logger helper.",
-            },
-          ],
-          receivedAtMs: 1,
-        },
-        {
-          uri: "file:///workspace/src/utils.ts",
-          path: "/workspace/src/utils.ts",
-          serverId: "typescript",
-          rootUri: "file:///workspace",
-          version: 1,
-          diagnostics: [
-            {
-              range: {
-                start: { line: 9, character: 0 },
-                end: { line: 9, character: 4 },
+            ],
+            receivedAtMs: 1,
+          },
+          {
+            uri: "file:///workspace/src/utils.ts",
+            path: "/workspace/src/utils.ts",
+            serverId: "typescript",
+            rootUri: "file:///workspace",
+            version: 1,
+            diagnostics: [
+              {
+                range: {
+                  start: { line: 9, character: 0 },
+                  end: { line: 9, character: 4 },
+                },
+                severity: 3,
+                source: "tsserver",
+                message: "'helper' is declared but its value is never read.",
               },
-              severity: 3,
-              source: "tsserver",
-              message: "'helper' is declared but its value is never read.",
-            },
-          ],
-          receivedAtMs: 2,
-        },
-      ],
+            ],
+            receivedAtMs: 2,
+          },
+        ],
+      },
+      connection: {
+        status: "ready",
+        errorMessage: null,
+      },
     };
 
     const view = render(<DiagnosticsPanel workspaceId="workspace-1" />);
@@ -164,5 +194,60 @@ describe("DiagnosticsPanel", () => {
         )
       )
     ).toBe(false);
+  });
+
+  test("shows a retrying state when the diagnostics subscription has not produced a snapshot yet", () => {
+    currentDiagnosticsViewState = {
+      snapshot: null,
+      connection: {
+        status: "retrying",
+        errorMessage: "socket dropped",
+      },
+    };
+
+    const view = render(<DiagnosticsPanel workspaceId="workspace-1" />);
+
+    expect(view.getByText("Retrying diagnostics subscription...")).toBeTruthy();
+    expect(view.getByText("Last error: socket dropped")).toBeTruthy();
+    expect(view.queryByText("Loading diagnostics...")).toBeNull();
+  });
+
+  test("renders a retry banner while continuing to show the last diagnostics snapshot", () => {
+    currentDiagnosticsViewState = {
+      snapshot: {
+        workspaceId: "workspace-1",
+        diagnostics: [
+          {
+            uri: "file:///workspace/src/example.ts",
+            path: "/workspace/src/example.ts",
+            serverId: "typescript",
+            rootUri: "file:///workspace",
+            version: 1,
+            diagnostics: [
+              {
+                range: {
+                  start: { line: 0, character: 0 },
+                  end: { line: 0, character: 5 },
+                },
+                severity: 1,
+                source: "tsserver",
+                message: "stale diagnostic",
+              },
+            ],
+            receivedAtMs: 1,
+          },
+        ],
+      },
+      connection: {
+        status: "retrying",
+        errorMessage: "stream closed unexpectedly",
+      },
+    };
+
+    const view = render(<DiagnosticsPanel workspaceId="workspace-1" />);
+
+    expect(view.getByText("Retrying diagnostics subscription...")).toBeTruthy();
+    expect(view.getByText("Last error: stream closed unexpectedly")).toBeTruthy();
+    expect(view.getByText("stale diagnostic")).toBeTruthy();
   });
 });

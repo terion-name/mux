@@ -58,6 +58,7 @@ const mockActivityList = mock(() => Promise.resolve<Record<string, WorkspaceActi
 interface ControlledAsyncIterator<T> {
   iterator: AsyncGenerator<T, void, unknown>;
   push: (value: T) => void;
+  fail: (error: unknown) => void;
   end: () => void;
 }
 
@@ -65,6 +66,12 @@ function createControlledAsyncIterator<T>(signal?: AbortSignal): ControlledAsync
   const queue: T[] = [];
   let ended = false;
   let resolveNext: ((result: IteratorResult<T>) => void) | null = null;
+  let rejectNext: ((error: Error) => void) | null = null;
+
+  const clearPendingNext = () => {
+    resolveNext = null;
+    rejectNext = null;
+  };
 
   const push = (value: T) => {
     if (ended) {
@@ -72,11 +79,24 @@ function createControlledAsyncIterator<T>(signal?: AbortSignal): ControlledAsync
     }
     if (resolveNext) {
       const resolve = resolveNext;
-      resolveNext = null;
+      clearPendingNext();
       resolve({ value, done: false });
       return;
     }
     queue.push(value);
+  };
+
+  const fail = (error: unknown) => {
+    if (ended) {
+      return;
+    }
+    ended = true;
+    const nextError = error instanceof Error ? error : new Error(String(error));
+    if (rejectNext) {
+      const reject = rejectNext;
+      clearPendingNext();
+      reject(nextError);
+    }
   };
 
   const end = () => {
@@ -86,7 +106,7 @@ function createControlledAsyncIterator<T>(signal?: AbortSignal): ControlledAsync
     ended = true;
     if (resolveNext) {
       const resolve = resolveNext;
-      resolveNext = null;
+      clearPendingNext();
       resolve({ value: undefined as void, done: true });
     }
   };
@@ -101,8 +121,9 @@ function createControlledAsyncIterator<T>(signal?: AbortSignal): ControlledAsync
       if (ended) {
         return { value: undefined as void, done: true };
       }
-      return await new Promise<IteratorResult<T>>((resolve) => {
+      return await new Promise<IteratorResult<T>>((resolve, reject) => {
         resolveNext = resolve;
+        rejectNext = reject;
       });
     },
     return(): Promise<IteratorResult<T>> {
@@ -122,7 +143,7 @@ function createControlledAsyncIterator<T>(signal?: AbortSignal): ControlledAsync
     },
   };
 
-  return { iterator, push, end };
+  return { iterator, push, fail, end };
 }
 
 const lspDiagnosticsSubscriptions: Array<{
@@ -4844,6 +4865,15 @@ describe("WorkspaceStore", () => {
       expect(firstReceived).toBe(true);
 
       customSubscriptions[0]?.end();
+      const showedRetryState = await waitUntil(
+        () =>
+          store.getWorkspaceLspDiagnosticsViewState(workspaceId).connection.status === "retrying"
+      );
+      expect(showedRetryState).toBe(true);
+      expect(store.getWorkspaceLspDiagnosticsViewState(workspaceId).connection.errorMessage).toBe(
+        "The diagnostics stream ended unexpectedly."
+      );
+
       const retried = await waitUntil(
         () => customSubscribeDiagnostics.mock.calls.length === 2,
         4000
@@ -4881,7 +4911,84 @@ describe("WorkspaceStore", () => {
             ?.message === "after retry"
       );
       expect(secondReceived).toBe(true);
+      expect(store.getWorkspaceLspDiagnosticsViewState(workspaceId).connection).toEqual({
+        status: "ready",
+        errorMessage: null,
+      });
       expect(customSubscriptions[1]?.signal?.aborted).toBe(false);
+
+      unsubscribe();
+    });
+
+    it("records the latest diagnostics subscription error until a fresh snapshot arrives", async () => {
+      store.setClient(null);
+
+      const customSubscriptions: Array<{
+        signal?: AbortSignal;
+        push: (snapshot: WorkspaceLspDiagnosticsSnapshot) => void;
+        fail: (error: unknown) => void;
+        end: () => void;
+      }> = [];
+      const customSubscribeDiagnostics = mock(
+        (_input: { workspaceId: string }, options?: { signal?: AbortSignal }) => {
+          const controlled = createControlledAsyncIterator<WorkspaceLspDiagnosticsSnapshot>(
+            options?.signal
+          );
+          customSubscriptions.push({
+            signal: options?.signal,
+            push: controlled.push,
+            fail: controlled.fail,
+            end: controlled.end,
+          });
+          return controlled.iterator;
+        }
+      );
+      const customClient = {
+        workspace: {
+          ...mockClient.workspace,
+          lsp: {
+            ...mockClient.workspace.lsp,
+            subscribeDiagnostics: customSubscribeDiagnostics,
+          },
+        },
+        terminal: mockClient.terminal,
+      };
+      store.setClient(customClient as unknown as WorkspaceStoreClient);
+
+      const workspaceId = "lsp-diagnostics-error";
+      createAndAddWorkspace(store, workspaceId);
+
+      const unsubscribe = store.subscribeLspDiagnostics(workspaceId, () => undefined);
+      const subscribed = await waitUntil(() => customSubscribeDiagnostics.mock.calls.length === 1);
+      expect(subscribed).toBe(true);
+
+      customSubscriptions[0]?.fail(new Error("socket dropped"));
+      const showedRetryState = await waitUntil(
+        () =>
+          store.getWorkspaceLspDiagnosticsViewState(workspaceId).connection.status === "retrying"
+      );
+      expect(showedRetryState).toBe(true);
+      expect(store.getWorkspaceLspDiagnosticsViewState(workspaceId).connection.errorMessage).toBe(
+        "socket dropped"
+      );
+
+      const retried = await waitUntil(
+        () => customSubscribeDiagnostics.mock.calls.length === 2,
+        4000
+      );
+      expect(retried).toBe(true);
+
+      customSubscriptions[1]?.push({
+        workspaceId,
+        diagnostics: [],
+      });
+      const recovered = await waitUntil(
+        () => store.getWorkspaceLspDiagnosticsViewState(workspaceId).connection.status === "ready"
+      );
+      expect(recovered).toBe(true);
+      expect(
+        store.getWorkspaceLspDiagnosticsViewState(workspaceId).connection.errorMessage
+      ).toBeNull();
 
       unsubscribe();
     });

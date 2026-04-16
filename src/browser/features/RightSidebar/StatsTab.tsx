@@ -10,7 +10,7 @@ import type {
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   useWorkspaceStatsSnapshot,
-  useWorkspaceLspDiagnosticsSnapshot,
+  useWorkspaceLspDiagnosticsViewState,
 } from "@/browser/stores/WorkspaceStore";
 import { ToggleGroup, type ToggleOption } from "@/browser/components/ToggleGroup/ToggleGroup";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
@@ -863,7 +863,18 @@ export interface DiagnosticsPanelProps {
  * Subscribes lazily so inactive Stats tabs do not hold background LSP listeners open.
  */
 export function DiagnosticsPanel(props: DiagnosticsPanelProps) {
-  const snapshot = useWorkspaceLspDiagnosticsSnapshot(props.workspaceId);
+  const diagnosticsView = useWorkspaceLspDiagnosticsViewState(props.workspaceId);
+  const snapshot = diagnosticsView.snapshot;
+  const isRetrying = diagnosticsView.connection.status === "retrying";
+
+  const retryNotice = isRetrying ? (
+    <div className="border-warning/40 bg-warning/10 text-warning mb-4 rounded border px-3 py-2 text-xs">
+      <p>Retrying diagnostics subscription...</p>
+      {diagnosticsView.connection.errorMessage ? (
+        <p className="mt-1 break-words">Last error: {diagnosticsView.connection.errorMessage}</p>
+      ) : null}
+    </div>
+  ) : null;
 
   // The workspace store uses null to mean "no snapshot yet", which is different from
   // a valid empty payload after the LSP server reports zero diagnostics.
@@ -871,7 +882,7 @@ export function DiagnosticsPanel(props: DiagnosticsPanelProps) {
     return (
       <div className="text-light font-primary text-[13px] leading-relaxed">
         <div className="text-secondary px-5 py-10 text-center">
-          <p>Loading diagnostics...</p>
+          {isRetrying ? retryNotice : <p>Loading diagnostics...</p>}
         </div>
       </div>
     );
@@ -882,6 +893,7 @@ export function DiagnosticsPanel(props: DiagnosticsPanelProps) {
   if (totalDiagnostics === 0) {
     return (
       <div className="text-light font-primary text-[13px] leading-relaxed">
+        {retryNotice}
         <div className="text-secondary px-5 py-10 text-center">
           <p>No diagnostics for this workspace.</p>
         </div>
@@ -903,6 +915,7 @@ export function DiagnosticsPanel(props: DiagnosticsPanelProps) {
 
   return (
     <div className="text-light font-primary text-[13px] leading-relaxed">
+      {retryNotice}
       <div className="mb-4 flex flex-col gap-1">
         <span className="text-foreground font-medium">Diagnostics</span>
         <p className="text-muted-light text-xs">
