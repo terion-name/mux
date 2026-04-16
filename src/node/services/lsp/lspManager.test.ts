@@ -184,6 +184,116 @@ describe("LspManager", () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 
+  test("infers a workspace_symbols server from a directory without opening a file", async () => {
+    const ensureFile = mock(() => Promise.resolve(1));
+    let lastQueryRequest: Parameters<LspClientInstance["query"]>[0] | undefined;
+    let clientFactoryOptions: CreateLspClientOptions | undefined;
+    const close = mock(() => Promise.resolve(undefined));
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      clientFactoryOptions = options;
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile,
+        query: mock((request: Parameters<LspClientInstance["query"]>[0]) => {
+          lastQueryRequest = request;
+          return Promise.resolve({
+            operation: "workspace_symbols" as const,
+            symbols: [],
+          });
+        }),
+        close,
+      });
+    });
+
+    const manager = new LspManager({
+      registry: createRegistry(),
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    const result = await manager.query({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePath: "./",
+      policyContext: TEST_LSP_POLICY_CONTEXT,
+      operation: "workspace_symbols",
+      query: "ResourceService",
+    });
+
+    expect(clientFactoryOptions).toBeDefined();
+    if (!clientFactoryOptions) {
+      throw new Error("Expected the LSP client factory to receive a call");
+    }
+    expect(result).toEqual({
+      operation: "workspace_symbols",
+      serverId: "typescript",
+      rootUri: clientFactoryOptions.rootUri,
+      symbols: [],
+    });
+    expect(clientFactoryOptions.rootPath).toBe(workspacePath);
+    expect(ensureFile).toHaveBeenCalledTimes(0);
+    expect(lastQueryRequest).toMatchObject({
+      operation: "workspace_symbols",
+      query: "ResourceService",
+    });
+    expect(lastQueryRequest?.file).toBeUndefined();
+
+    await manager.dispose();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  test("fails workspace_symbols directory inference when multiple LSP roots match", async () => {
+    await fs.writeFile(path.join(workspacePath, "pyproject.toml"), "[project]\nname = 'mixed'\n");
+
+    const pythonDescriptor: LspServerDescriptor = {
+      id: "python",
+      extensions: [".py"],
+      launch: {
+        type: "manual",
+        command: "mux-test-python-lsp",
+        args: ["--stdio"],
+      },
+      rootMarkers: ["pyproject.toml", ".git"],
+      languageIdForPath: () => "python",
+    };
+    const clientFactory = mock((_options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      throw new Error("workspace_symbols should fail before starting a client");
+    });
+
+    const manager = new LspManager({
+      registry: [...createRegistry(), pythonDescriptor],
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    try {
+      try {
+        await manager.query({
+          workspaceId: "ws-1",
+          runtime,
+          workspacePath,
+          filePath: "./",
+          policyContext: TEST_LSP_POLICY_CONTEXT,
+          operation: "workspace_symbols",
+          query: "ResourceService",
+        });
+        throw new Error("Expected workspace_symbols directory inference to fail");
+      } catch (error) {
+        expect(error).toBeInstanceOf(Error);
+        if (!(error instanceof Error)) {
+          throw error;
+        }
+        expect(error.message).toBe(
+          "Directory ./ is ambiguous for workspace_symbols; matching LSP servers: typescript (package.json), python (pyproject.toml). Provide a representative source file path to select the intended language server."
+        );
+      }
+      expect(clientFactory).toHaveBeenCalledTimes(0);
+    } finally {
+      await manager.dispose();
+    }
+  });
+
   test("reuses launch-plan probes for warm clients but re-runs them for a different root", async () => {
     const lspBinDir = path.join(workspacePath, "tools", "bin");
     const lspExecutable = path.join(lspBinDir, "fake-lsp");

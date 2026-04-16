@@ -46,9 +46,14 @@ interface ResolvedLspClientContext {
   clientKey: string;
   workspaceGeneration: number;
   descriptor: LspServerDescriptor;
-  fileHandle: LspClientFileHandle;
+  fileHandle?: LspClientFileHandle;
   pathMapper: LspPathMapper;
   rootUri: string;
+}
+
+interface ResolvedRootMatch {
+  rootPath: string;
+  matchedMarker: string | null;
 }
 
 interface LspTrackedFileRefreshEntry {
@@ -84,6 +89,15 @@ export interface LspManagerQueryOptions {
   column?: number;
   query?: string;
   includeDeclaration?: boolean;
+}
+
+interface ResolveLspClientContextOptions {
+  workspaceId: string;
+  runtime: Runtime;
+  workspacePath: string;
+  filePath: string;
+  policyContext: LspPolicyContext;
+  operation?: LspQueryOperation;
 }
 
 export interface LspManagerCollectDiagnosticsOptions {
@@ -195,11 +209,13 @@ export class LspManager {
 
     try {
       const context = await this.resolveClientContext(options);
-      await context.client.ensureFile(context.fileHandle);
+      if (context.fileHandle && shouldTrackQueryFile(options.operation)) {
+        await context.client.ensureFile(context.fileHandle);
+      }
 
       const rawResult = await context.client.query({
         operation: options.operation,
-        file: context.fileHandle,
+        ...(context.fileHandle ? { file: context.fileHandle } : {}),
         line: options.line != null ? Math.max(0, options.line - 1) : undefined,
         character: options.column != null ? Math.max(0, options.column - 1) : undefined,
         query: options.query,
@@ -253,7 +269,7 @@ export class LspManager {
             };
             entriesForClient.fileEntries.push({
               filePath,
-              fileHandle: context.fileHandle,
+              fileHandle: requireQueryFileHandle(context.fileHandle, "document_symbols"),
             });
             fileContextsByClientKey.set(context.clientKey, entriesForClient);
           } catch (error) {
@@ -684,42 +700,57 @@ export class LspManager {
     return launchPlanPromise;
   }
 
-  private async resolveClientContext(options: {
-    workspaceId: string;
-    runtime: Runtime;
-    workspacePath: string;
-    filePath: string;
-    policyContext: LspPolicyContext;
-  }): Promise<ResolvedLspClientContext> {
+  private async resolveClientContext(
+    options: ResolveLspClientContextOptions
+  ): Promise<ResolvedLspClientContext> {
     const pathMapper = new LspPathMapper({
       runtime: options.runtime,
       workspacePath: options.workspacePath,
     });
-    const runtimeFilePath = pathMapper.toRuntimePath(options.filePath);
+    const runtimeFilePath = pathMapper.toRuntimePath(options.filePath ?? "");
     if (!pathMapper.isWithinWorkspace(runtimeFilePath)) {
       throw new Error(`LSP paths must stay inside the workspace (got ${options.filePath})`);
     }
 
-    const descriptor = findLspServerForFile(runtimeFilePath, this.registry);
-    if (!descriptor) {
-      const extension = path.extname(runtimeFilePath) || "(no extension)";
-      throw new Error(`No built-in LSP server is configured for ${extension} files`);
+    const runtimePathStat = await statOrNull(options.runtime, runtimeFilePath);
+    const shouldInferFromDirectory =
+      "operation" in options &&
+      options.operation === "workspace_symbols" &&
+      runtimePathStat?.isDirectory === true;
+    const workspaceRuntimePath = pathMapper.getWorkspaceRuntimePath();
+
+    let descriptor: LspServerDescriptor;
+    let rootPath: string;
+    let fileHandle: LspClientFileHandle | undefined;
+
+    if (shouldInferFromDirectory) {
+      const inferredDescriptor = await this.inferDescriptorForDirectory(
+        options.runtime,
+        runtimeFilePath,
+        workspaceRuntimePath,
+        options.filePath
+      );
+      descriptor = inferredDescriptor.descriptor;
+      rootPath = inferredDescriptor.rootPath;
+    } else {
+      descriptor =
+        findLspServerForFile(runtimeFilePath, this.registry) ??
+        failForUnsupportedFile(runtimeFilePath);
+      rootPath = await this.resolveRootPath(
+        options.runtime,
+        runtimeFilePath,
+        workspaceRuntimePath,
+        descriptor.rootMarkers
+      );
+      fileHandle = {
+        runtimePath: runtimeFilePath,
+        readablePath: pathMapper.toReadablePath(runtimeFilePath),
+        uri: pathMapper.toUri(runtimeFilePath),
+        languageId: descriptor.languageIdForPath(runtimeFilePath),
+      };
     }
 
-    const rootPath = await this.resolveRootPath(
-      options.runtime,
-      runtimeFilePath,
-      pathMapper.getWorkspaceRuntimePath(),
-      descriptor.rootMarkers
-    );
     const rootUri = pathMapper.toUri(rootPath);
-    const fileHandle: LspClientFileHandle = {
-      runtimePath: runtimeFilePath,
-      readablePath: pathMapper.toReadablePath(runtimeFilePath),
-      uri: pathMapper.toUri(runtimeFilePath),
-      languageId: descriptor.languageIdForPath(runtimeFilePath),
-    };
-
     const clientResult = await this.getOrCreateClient(
       options.workspaceId,
       descriptor,
@@ -735,9 +766,59 @@ export class LspManager {
       clientKey: clientResult.clientKey,
       workspaceGeneration: clientResult.workspaceGeneration,
       descriptor,
-      fileHandle,
+      ...(fileHandle ? { fileHandle } : {}),
       pathMapper,
       rootUri,
+    };
+  }
+
+  private async inferDescriptorForDirectory(
+    runtime: Runtime,
+    directoryPath: string,
+    workspaceRuntimePath: string,
+    outputPath: string
+  ): Promise<{ descriptor: LspServerDescriptor; rootPath: string }> {
+    const matches = (
+      await Promise.all(
+        this.registry.map(async (descriptor) => ({
+          descriptor,
+          ...(await this.resolveRootMatch(
+            runtime,
+            directoryPath,
+            workspaceRuntimePath,
+            descriptor.rootMarkers,
+            true
+          )),
+        }))
+      )
+    ).filter((candidate) => candidate.matchedMarker != null);
+
+    const specificMatches = matches.filter(
+      (candidate) => !isGenericLspRootMarker(candidate.matchedMarker)
+    );
+    const candidateMatches = specificMatches.length > 0 ? specificMatches : matches;
+    const selectedMatch = candidateMatches[0];
+    if (!selectedMatch) {
+      throw new Error(
+        `Could not infer a built-in LSP server for directory ${outputPath}. Provide a representative source file path or use a directory with a language-specific project marker.`
+      );
+    }
+
+    if (candidateMatches.length > 1) {
+      const matchingServers = candidateMatches
+        .map((candidate) => {
+          const matchedMarker = candidate.matchedMarker ?? "workspace root";
+          return `${candidate.descriptor.id} (${matchedMarker})`;
+        })
+        .join(", ");
+      throw new Error(
+        `Directory ${outputPath} is ambiguous for workspace_symbols; matching LSP servers: ${matchingServers}. Provide a representative source file path to select the intended language server.`
+      );
+    }
+
+    return {
+      descriptor: selectedMatch.descriptor,
+      rootPath: selectedMatch.rootPath,
     };
   }
 
@@ -783,24 +864,45 @@ export class LspManager {
     workspaceRuntimePath: string,
     rootMarkers: readonly string[]
   ): Promise<string> {
-    const pathModule = selectPathModule(filePath);
-    let currentPath = pathModule.dirname(filePath);
+    return (
+      await this.resolveRootMatch(runtime, filePath, workspaceRuntimePath, rootMarkers, false)
+    ).rootPath;
+  }
+
+  private async resolveRootMatch(
+    runtime: Runtime,
+    targetPath: string,
+    workspaceRuntimePath: string,
+    rootMarkers: readonly string[],
+    treatAsDirectory: boolean
+  ): Promise<ResolvedRootMatch> {
+    const pathModule = selectPathModule(targetPath);
+    let currentPath = treatAsDirectory ? targetPath : pathModule.dirname(targetPath);
 
     while (true) {
       for (const marker of rootMarkers) {
         const markerPath = runtime.normalizePath(marker, currentPath);
         if (await pathExists(runtime, markerPath)) {
-          return currentPath;
+          return {
+            rootPath: currentPath,
+            matchedMarker: marker,
+          };
         }
       }
 
       if (currentPath === workspaceRuntimePath) {
-        return workspaceRuntimePath;
+        return {
+          rootPath: workspaceRuntimePath,
+          matchedMarker: null,
+        };
       }
 
       const parentPath = pathModule.dirname(currentPath);
       if (parentPath === currentPath) {
-        return workspaceRuntimePath;
+        return {
+          rootPath: workspaceRuntimePath,
+          matchedMarker: null,
+        };
       }
       currentPath = parentPath;
     }
@@ -1134,7 +1236,7 @@ export class LspManager {
   private async normalizeQueryResult(
     pathMapper: LspPathMapper,
     runtime: Runtime,
-    fileHandle: LspClientFileHandle,
+    fileHandle: LspClientFileHandle | undefined,
     serverId: string,
     rootUri: string,
     rawResult: LspClientQueryResult
@@ -1168,7 +1270,11 @@ export class LspManager {
         };
       }
       case "document_symbols": {
-        const flattenedSymbols = flattenDocumentSymbols(rawResult.symbols ?? [], fileHandle.uri);
+        const resolvedFileHandle = requireQueryFileHandle(fileHandle, rawResult.operation);
+        const flattenedSymbols = flattenDocumentSymbols(
+          rawResult.symbols ?? [],
+          resolvedFileHandle.uri
+        );
         const warning =
           flattenedSymbols.length > LSP_MAX_SYMBOLS
             ? `Results truncated to the first ${LSP_MAX_SYMBOLS} symbols`
@@ -1339,6 +1445,38 @@ async function pathExists(runtime: Runtime, candidatePath: string): Promise<bool
   } catch {
     return false;
   }
+}
+
+async function statOrNull(runtime: Runtime, candidatePath: string) {
+  try {
+    return await runtime.stat(candidatePath);
+  } catch {
+    return null;
+  }
+}
+
+function shouldTrackQueryFile(operation: LspQueryOperation): boolean {
+  return operation !== "workspace_symbols";
+}
+
+function requireQueryFileHandle(
+  fileHandle: LspClientFileHandle | undefined,
+  operation: LspQueryOperation
+): LspClientFileHandle {
+  if (!fileHandle) {
+    throw new Error(`${operation} requires a source file path`);
+  }
+
+  return fileHandle;
+}
+
+function isGenericLspRootMarker(marker: string | null): boolean {
+  return marker === ".git";
+}
+
+function failForUnsupportedFile(filePath: string): never {
+  const extension = path.extname(filePath) || "(no extension)";
+  throw new Error(`No built-in LSP server is configured for ${extension} files`);
 }
 
 function toOneBasedRange(range: LspRange): LspRange {

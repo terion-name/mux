@@ -207,7 +207,7 @@ export interface LspClientFileHandle {
 
 export interface LspClientQueryRequest {
   operation: LspQueryOperation;
-  file: LspClientFileHandle;
+  file?: LspClientFileHandle;
   line?: number;
   character?: number;
   query?: string;

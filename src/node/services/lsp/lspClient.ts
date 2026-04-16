@@ -191,11 +191,12 @@ export class LspClient implements LspClientInstance {
         };
       }
       case "document_symbols": {
+        const file = this.getRequiredFile(request);
         const result = (await this.request(
           "textDocument/documentSymbol",
           {
             textDocument: {
-              uri: request.file.uri,
+              uri: file.uri,
             },
           },
           LSP_REQUEST_TIMEOUT_MS
@@ -309,15 +310,24 @@ export class LspClient implements LspClientInstance {
       throw new Error(`${request.operation} requires a line and column`);
     }
 
+    const file = this.getRequiredFile(request);
     return {
       textDocument: {
-        uri: request.file.uri,
+        uri: file.uri,
       },
       position: {
         line: request.line,
         character: request.character,
       },
     };
+  }
+
+  private getRequiredFile(request: LspClientQueryRequest): LspClientFileHandle {
+    if (!request.file) {
+      throw new Error(`${request.operation} requires a file path`);
+    }
+
+    return request.file;
   }
 
   private async request(method: string, params: unknown, timeoutMs: number): Promise<unknown> {
