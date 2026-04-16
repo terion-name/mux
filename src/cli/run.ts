@@ -75,6 +75,7 @@ import { execSync } from "child_process";
 import { getParseOptions } from "./argv";
 import { EXPERIMENT_IDS } from "../common/constants/experiments";
 import { getErrorMessage } from "@/common/utils/errors";
+import { buildExperimentsObject } from "./runOptions";
 
 // Display labels for CLI help (OFF, LOW, MED, HIGH, MAX)
 const THINKING_LABELS_LIST = Object.values(THINKING_DISPLAY_LABELS).join(", ");
@@ -193,20 +194,6 @@ function collectExperiments(value: string, previous: string[]): string[] {
     return previous; // Dedupe
   }
   return [...previous, experimentId];
-}
-
-/**
- * Convert experiment ID array to the experiments object expected by SendMessageOptions.
- */
-function buildExperimentsObject(experimentIds: string[]): SendMessageOptions["experiments"] {
-  if (experimentIds.length === 0) return undefined;
-
-  return {
-    programmaticToolCalling: experimentIds.includes("programmatic-tool-calling"),
-    programmaticToolCallingExclusive: experimentIds.includes("programmatic-tool-calling-exclusive"),
-    system1: experimentIds.includes("system-1"),
-    execSubagentHardRestart: experimentIds.includes("exec-subagent-hard-restart"),
-  };
 }
 
 interface MCPServerEntry {

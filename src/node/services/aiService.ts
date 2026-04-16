@@ -102,7 +102,11 @@ import { applyToolPolicyAndExperiments, captureMcpToolTelemetry } from "./toolAs
 import { getErrorMessage } from "@/common/utils/errors";
 import { isProjectTrusted } from "@/node/utils/projectTrust";
 import type { LspManager } from "@/node/services/lsp/lspManager";
-import type { LspDiagnostic, LspFileDiagnostics, LspPolicyContext } from "@/node/services/lsp/types";
+import type {
+  LspDiagnostic,
+  LspFileDiagnostics,
+  LspPolicyContext,
+} from "@/node/services/lsp/types";
 
 const STREAM_STARTUP_DIAGNOSTIC_THRESHOLD_MS = 1_000;
 
@@ -1195,7 +1199,9 @@ export class AIService extends EventEmitter {
 
       const desktopSessionManager = this.desktopSessionManager;
       const lspQueryEnabled =
-        this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.LSP_QUERY) ?? false;
+        experiments?.lspQuery ??
+        this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.LSP_QUERY) ??
+        false;
       let desktopCapabilityPromise: ReturnType<DesktopSessionManager["getCapability"]> | undefined;
       const loadDesktopCapability =
         desktopSessionManager == null

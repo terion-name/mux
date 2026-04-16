@@ -116,6 +116,10 @@ function parseLspProvisioningMode(value: unknown): LspProvisioningMode | undefin
   return undefined;
 }
 
+function getLspProvisioningModeEnvOverride(): LspProvisioningMode | undefined {
+  return parseLspProvisioningMode(process.env.MUX_LSP_PROVISIONING_MODE);
+}
+
 function parseCoderWorkspaceArchiveBehavior(
   value: unknown
 ): CoderWorkspaceArchiveBehavior | undefined {
@@ -689,7 +693,9 @@ export class Config {
 
         const runtimeEnablement = normalizeRuntimeEnablementOverrides(parsed.runtimeEnablement);
         const defaultRuntime = normalizeRuntimeEnablementId(parsed.defaultRuntime);
-        const lspProvisioningMode = parseLspProvisioningMode(parsed.lspProvisioningMode);
+        const lspProvisioningMode =
+          getLspProvisioningModeEnvOverride() ??
+          parseLspProvisioningMode(parsed.lspProvisioningMode);
 
         const agentAiDefaults =
           parsed.agentAiDefaults !== undefined
@@ -745,6 +751,7 @@ export class Config {
     }
 
     // Return default config
+    const lspProvisioningMode = getLspProvisioningModeEnvOverride();
     return {
       projects: new Map(),
       taskSettings: DEFAULT_TASK_SETTINGS,
@@ -754,6 +761,7 @@ export class Config {
       coderWorkspaceArchiveBehavior: DEFAULT_CODER_ARCHIVE_BEHAVIOR,
       worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
       deleteWorktreeOnArchive: false,
+      lspProvisioningMode,
     };
   }
 
@@ -925,7 +933,10 @@ export class Config {
       }
 
       const lspProvisioningMode = parseLspProvisioningMode(config.lspProvisioningMode);
-      if (lspProvisioningMode !== undefined && lspProvisioningMode !== DEFAULT_LSP_PROVISIONING_MODE) {
+      if (
+        lspProvisioningMode !== undefined &&
+        lspProvisioningMode !== DEFAULT_LSP_PROVISIONING_MODE
+      ) {
         data.lspProvisioningMode = lspProvisioningMode;
       }
 

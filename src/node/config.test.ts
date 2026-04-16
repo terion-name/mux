@@ -144,6 +144,22 @@ describe("Config", () => {
   });
 
   describe("lspProvisioningMode", () => {
+    const envKey = "MUX_LSP_PROVISIONING_MODE";
+    let originalEnvValue: string | undefined;
+
+    beforeEach(() => {
+      originalEnvValue = process.env[envKey];
+      delete process.env[envKey];
+    });
+
+    afterEach(() => {
+      if (originalEnvValue === undefined) {
+        delete process.env[envKey];
+      } else {
+        process.env[envKey] = originalEnvValue;
+      }
+    });
+
     it("persists auto provisioning mode and omits the default manual mode", async () => {
       await config.editConfig((cfg) => {
         cfg.lspProvisioningMode = "auto";
@@ -170,6 +186,23 @@ describe("Config", () => {
         lspProvisioningMode?: unknown;
       };
       expect(raw.lspProvisioningMode).toBeUndefined();
+    });
+
+    it("prefers the env override over persisted config", () => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({ lspProvisioningMode: "manual" })
+      );
+
+      process.env[envKey] = "auto";
+
+      expect(config.loadConfigOrDefault().lspProvisioningMode).toBe("auto");
+    });
+
+    it("applies the env override even when config is missing", () => {
+      process.env[envKey] = "manual";
+
+      expect(config.loadConfigOrDefault().lspProvisioningMode).toBe("manual");
     });
   });
 
