@@ -124,7 +124,7 @@ export class LspManager {
   private readonly diagnosticPollIntervalMs: number;
   private readonly idleInterval: ReturnType<typeof setInterval>;
   private readonly diagnosticPollInterval: ReturnType<typeof setInterval>;
-  private readonly diagnosticPollsInFlight = new Set<string>();
+  private readonly diagnosticPollsInFlight = new Map<string, symbol>();
   private readonly trackedFileRefreshesInFlight = new Map<string, Promise<unknown>>();
 
   constructor(options?: LspManagerOptions) {
@@ -308,7 +308,11 @@ export class LspManager {
           continue;
         }
 
-        this.diagnosticPollsInFlight.add(pollKey);
+        // Poll-driven diagnostics refreshes are the only activity for already-open files,
+        // so they need to keep the workspace warm between idle-cleanup passes.
+        this.markActivity(workspaceId);
+        const pollToken = Symbol(pollKey);
+        this.diagnosticPollsInFlight.set(pollKey, pollToken);
         void this.refreshTrackedFilesForClient({
           workspaceId,
           workspaceGeneration,
@@ -321,7 +325,9 @@ export class LspManager {
           waitForDiagnostics: false,
           logReason: "polled LSP diagnostics",
         }).finally(() => {
-          this.diagnosticPollsInFlight.delete(pollKey);
+          if (this.diagnosticPollsInFlight.get(pollKey) === pollToken) {
+            this.diagnosticPollsInFlight.delete(pollKey);
+          }
         });
       }
     }
@@ -454,6 +460,7 @@ export class LspManager {
 
   async disposeWorkspace(workspaceId: string): Promise<void> {
     this.workspaceGenerations.set(workspaceId, this.getWorkspaceGeneration(workspaceId) + 1);
+    this.clearWorkspaceRefreshBookkeeping(workspaceId);
 
     const entry = this.workspaceClients.get(workspaceId);
     if (!entry) {
@@ -498,6 +505,31 @@ export class LspManager {
     );
     this.diagnosticPollsInFlight.clear();
     this.workspaceDiagnosticListeners.clear();
+  }
+
+  // Reset per-workspace refresh state on disposal so a later workspace with the same id
+  // never inherits stale poll or serialization bookkeeping from the disposed instance.
+  private clearWorkspaceRefreshBookkeeping(workspaceId: string): void {
+    const workspaceKeyPrefix = `${workspaceId}:`;
+
+    for (const pollKey of [...this.diagnosticPollsInFlight.keys()]) {
+      if (pollKey.startsWith(workspaceKeyPrefix)) {
+        this.diagnosticPollsInFlight.delete(pollKey);
+      }
+    }
+
+    for (const refreshKey of [...this.trackedFileRefreshesInFlight.keys()]) {
+      if (refreshKey.startsWith(workspaceKeyPrefix)) {
+        this.trackedFileRefreshesInFlight.delete(refreshKey);
+      }
+    }
+  }
+
+  private hasDiagnosticPollInFlight(workspaceId: string): boolean {
+    const workspaceKeyPrefix = `${workspaceId}:`;
+    return [...this.diagnosticPollsInFlight.keys()].some((pollKey) =>
+      pollKey.startsWith(workspaceKeyPrefix)
+    );
   }
 
   private async getOrCreateClient(
@@ -715,6 +747,10 @@ export class LspManager {
     const now = Date.now();
     for (const [workspaceId, entry] of this.workspaceClients) {
       if ((this.workspaceLeases.get(workspaceId) ?? 0) > 0) {
+        continue;
+      }
+
+      if (this.hasDiagnosticPollInFlight(workspaceId)) {
         continue;
       }
 

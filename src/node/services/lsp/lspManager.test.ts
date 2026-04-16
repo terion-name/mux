@@ -960,6 +960,252 @@ describe("LspManager", () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 
+  test("idle cleanup does not dispose a workspace while a poll refresh is active", async () => {
+    const trackedFiles = new Map<
+      string,
+      {
+        fileHandle: Parameters<LspClientInstance["ensureFile"]>[0];
+        version: number;
+      }
+    >();
+    const releaseEnsure = createDeferred<void>();
+    const ensureStarted = createDeferred<void>();
+    let shouldBlockEnsure = false;
+    let blockedEnsureStarted = false;
+    const ensureFile = mock(async (file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+      const existing = trackedFiles.get(file.uri);
+      if (shouldBlockEnsure && existing && !blockedEnsureStarted) {
+        blockedEnsureStarted = true;
+        ensureStarted.resolve();
+        await releaseEnsure.promise;
+      }
+
+      const nextVersion = (existing?.version ?? 0) + 1;
+      trackedFiles.set(file.uri, {
+        fileHandle: { ...file },
+        version: nextVersion,
+      });
+      return nextVersion;
+    });
+    const close = mock(() => Promise.resolve(undefined));
+    const clientFactory = mock((_options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile,
+        getTrackedFiles: () =>
+          [...trackedFiles.values()].map(({ fileHandle }) => ({
+            ...fileHandle,
+          })),
+        query: mock(() => Promise.resolve({ operation: "hover" as const, hover: "unused" })),
+        close,
+      });
+    });
+
+    const manager = new LspManager({
+      registry: createRegistry(),
+      clientFactory,
+      idleTimeoutMs: 20,
+      idleCheckIntervalMs: 5,
+      diagnosticPollIntervalMs: 10,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+    const workspaceClients = (
+      manager as unknown as {
+        workspaceClients: Map<string, unknown>;
+      }
+    ).workspaceClients;
+
+    await manager.query({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePath: "src/example.ts",
+      policyContext: TEST_LSP_POLICY_CONTEXT,
+      operation: "hover",
+      line: 1,
+      column: 1,
+    });
+
+    shouldBlockEnsure = true;
+    await ensureStarted.promise;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    expect(close).toHaveBeenCalledTimes(0);
+    expect(workspaceClients.has("ws-1")).toBe(true);
+
+    releaseEnsure.resolve();
+    await manager.dispose();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  test("disposeWorkspace clears poll bookkeeping before recreating the workspace", async () => {
+    const firstTrackedFiles = new Map<
+      string,
+      {
+        fileHandle: Parameters<LspClientInstance["ensureFile"]>[0];
+        version: number;
+      }
+    >();
+    const secondTrackedFiles = new Map<
+      string,
+      {
+        fileHandle: Parameters<LspClientInstance["ensureFile"]>[0];
+        version: number;
+      }
+    >();
+    const releaseFirstPoll = createDeferred<void>();
+    const firstPollStarted = createDeferred<void>();
+    let shouldBlockFirstPoll = false;
+    let firstPollBlocked = false;
+    let secondEnsureCalls = 0;
+    const firstEnsureFile = mock(async (file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+      const existing = firstTrackedFiles.get(file.uri);
+      if (shouldBlockFirstPoll && existing && !firstPollBlocked) {
+        firstPollBlocked = true;
+        firstPollStarted.resolve();
+        await releaseFirstPoll.promise;
+      }
+
+      const nextVersion = (existing?.version ?? 0) + 1;
+      firstTrackedFiles.set(file.uri, {
+        fileHandle: { ...file },
+        version: nextVersion,
+      });
+      return nextVersion;
+    });
+    const secondEnsureFile = mock((file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+      secondEnsureCalls += 1;
+      const existing = secondTrackedFiles.get(file.uri);
+      const nextVersion = (existing?.version ?? 0) + 1;
+      secondTrackedFiles.set(file.uri, {
+        fileHandle: { ...file },
+        version: nextVersion,
+      });
+      return Promise.resolve(nextVersion);
+    });
+    const firstClose = mock(() => Promise.resolve(undefined));
+    const secondClose = mock(() => Promise.resolve(undefined));
+    let clientCount = 0;
+    const clientFactory = mock((_options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      clientCount += 1;
+      if (clientCount === 1) {
+        return Promise.resolve({
+          isClosed: false,
+          ensureFile: firstEnsureFile,
+          getTrackedFiles: () =>
+            [...firstTrackedFiles.values()].map(({ fileHandle }) => ({
+              ...fileHandle,
+            })),
+          query: mock(() => Promise.resolve({ operation: "hover" as const, hover: "unused" })),
+          close: firstClose,
+        });
+      }
+
+      if (clientCount === 2) {
+        return Promise.resolve({
+          isClosed: false,
+          ensureFile: secondEnsureFile,
+          getTrackedFiles: () =>
+            [...secondTrackedFiles.values()].map(({ fileHandle }) => ({
+              ...fileHandle,
+            })),
+          query: mock(() => Promise.resolve({ operation: "hover" as const, hover: "unused" })),
+          close: secondClose,
+        });
+      }
+
+      throw new Error(`Unexpected client creation #${clientCount}`);
+    });
+
+    const manager = new LspManager({
+      registry: createRegistry(),
+      clientFactory,
+      diagnosticPollIntervalMs: 10,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+    const managerWithInternals = manager as unknown as {
+      diagnosticPollsInFlight: Map<string, symbol>;
+      trackedFileRefreshesInFlight: Map<string, Promise<unknown>>;
+    };
+
+    await manager.query({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePath: "src/example.ts",
+      policyContext: TEST_LSP_POLICY_CONTEXT,
+      operation: "hover",
+      line: 1,
+      column: 1,
+    });
+
+    shouldBlockFirstPoll = true;
+    await firstPollStarted.promise;
+
+    expect(
+      [...managerWithInternals.diagnosticPollsInFlight.keys()].some((key) =>
+        key.startsWith("ws-1:")
+      )
+    ).toBe(true);
+    expect(
+      [...managerWithInternals.trackedFileRefreshesInFlight.keys()].some((key) =>
+        key.startsWith("ws-1:")
+      )
+    ).toBe(true);
+
+    await manager.disposeWorkspace("ws-1");
+
+    expect(
+      [...managerWithInternals.diagnosticPollsInFlight.keys()].some((key) =>
+        key.startsWith("ws-1:")
+      )
+    ).toBe(false);
+    expect(
+      [...managerWithInternals.trackedFileRefreshesInFlight.keys()].some((key) =>
+        key.startsWith("ws-1:")
+      )
+    ).toBe(false);
+
+    await manager.query({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePath: "src/example.ts",
+      policyContext: TEST_LSP_POLICY_CONTEXT,
+      operation: "hover",
+      line: 1,
+      column: 1,
+    });
+
+    const pollRestarted = await waitUntil(() => secondEnsureCalls >= 2, 200);
+    expect(pollRestarted).toBe(true);
+
+    const diagnosticsPromise = manager.collectPostMutationDiagnostics({
+      workspaceId: "ws-1",
+      runtime,
+      workspacePath,
+      filePaths: ["src/example.ts"],
+      policyContext: TEST_LSP_POLICY_CONTEXT,
+      timeoutMs: 20,
+    });
+    const completion = await Promise.race([
+      diagnosticsPromise.then((diagnostics) => ({ type: "resolved" as const, diagnostics })),
+      new Promise<{ type: "timeout" }>((resolve) => {
+        setTimeout(() => resolve({ type: "timeout" }), 200);
+      }),
+    ]);
+    expect(completion.type).toBe("resolved");
+    if (completion.type !== "resolved") {
+      throw new Error("Expected recreated workspace refreshes to ignore stale in-flight state");
+    }
+    expect(completion.diagnostics).toEqual([]);
+
+    releaseFirstPoll.resolve();
+    await manager.dispose();
+    expect(firstClose).toHaveBeenCalledTimes(1);
+    expect(secondClose).toHaveBeenCalledTimes(1);
+  });
+
   test("continues polling other tracked files after one file disappears", async () => {
     const secondFilePath = path.join(workspacePath, "src", "second.ts");
     await fs.writeFile(secondFilePath, "export const second = 1;\n");
