@@ -14,7 +14,7 @@ import { z } from "zod";
 import * as path from "path";
 import * as fs from "fs/promises";
 import * as fsSync from "fs";
-import { Config, type ProjectConfig } from "../node/config";
+import { Config } from "../node/config";
 import { DisposableTempDir } from "../node/services/tempDir";
 import { AgentSession, type AgentSessionChatEvent } from "../node/services/agentSession";
 import { CodexOauthService } from "../node/services/codexOauthService";
@@ -75,6 +75,8 @@ import { execSync } from "child_process";
 import { getParseOptions } from "./argv";
 import { EXPERIMENT_IDS } from "../common/constants/experiments";
 import { getErrorMessage } from "@/common/utils/errors";
+import { buildTrustOnlyProjectsForRun } from "./runTrust";
+import { resolveConfiguredProjectPathForTrust } from "../node/utils/projectTrust";
 import { buildExperimentsObject } from "./runOptions";
 
 // Display labels for CLI help (OFF, LOW, MED, HIGH, MAX)
@@ -322,6 +324,10 @@ async function main(): Promise<number> {
   // Create ephemeral temp dir for session data (auto-cleaned on exit)
   using tempDir = new DisposableTempDir("mux-run");
 
+  const workspaceId = generateWorkspaceId();
+  const projectDir = path.resolve(opts.dir);
+  await ensureDirectory(projectDir);
+
   // Use real config for providers, but ephemeral temp dir for session data
   const realConfig = new Config();
   const config = new Config(tempDir.path);
@@ -346,18 +352,11 @@ async function main(): Promise<number> {
   // stale queued/running records can incorrectly throttle sub-agent tasks.
   const existingConfig = realConfig.loadConfigOrDefault();
   if (existingConfig.projects.size > 0) {
-    const trustOnlyProjects = new Map<string, ProjectConfig>();
-    for (const [projectPath, projectConfig] of existingConfig.projects) {
-      if (projectConfig.trusted === undefined) {
-        continue;
-      }
-
-      trustOnlyProjects.set(projectPath, {
-        workspaces: [],
-        trusted: projectConfig.trusted,
-      });
-    }
-
+    const trustOnlyProjects = buildTrustOnlyProjectsForRun(
+      existingConfig.projects,
+      projectDir,
+      config.srcDir
+    );
     if (trustOnlyProjects.size > 0) {
       await config.saveConfig({
         ...config.loadConfigOrDefault(),
@@ -365,10 +364,6 @@ async function main(): Promise<number> {
       });
     }
   }
-
-  const workspaceId = generateWorkspaceId();
-  const projectDir = path.resolve(opts.dir);
-  await ensureDirectory(projectDir);
 
   const model: string = resolveModelAlias(opts.model);
   const runtimeConfig = parseRuntimeConfig(opts.runtime, config.srcDir);
@@ -522,8 +517,15 @@ async function main(): Promise<number> {
       // Fallback to main
     }
 
-    // Read trust state from real config so trusted projects can run hooks
-    const trusted = realConfig.loadConfigOrDefault().projects.get(projectDir)?.trusted ?? false;
+    // Read trust state from real config so trusted canonical projects and their known worktree
+    // paths preserve hook/LSP trust in mux run's ephemeral config.
+    const trustedProjectPath = resolveConfiguredProjectPathForTrust(existingConfig.projects, {
+      projectPath: projectDir,
+      namedWorkspacePath: projectDir,
+    });
+    const trusted = trustedProjectPath
+      ? (existingConfig.projects.get(trustedProjectPath)?.trusted ?? false)
+      : false;
 
     const createEnv = Object.fromEntries(
       Object.entries(process.env).filter(
