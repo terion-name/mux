@@ -263,7 +263,7 @@ describe("resolveLspLaunchPlan", () => {
     }
   });
 
-  it("keeps inherited launch env for untrusted pathCommand probes without explicit env", async () => {
+  it("keeps a sanitized PATH override for untrusted pathCommand launches without explicit env", async () => {
     const externalBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-lsp-global-bin-"));
     const workspaceBinDir = path.join(workspacePath, "node_modules", ".bin");
     const originalPath = process.env.PATH;
@@ -300,7 +300,11 @@ describe("resolveLspLaunchPlan", () => {
       });
 
       expect(launchPlan.command).toBe(path.join(externalBinDir, "mux-inherited-path-command"));
-      expect(launchPlan.env).toBeUndefined();
+      expect(launchPlan.env).toEqual({
+        PATH: [externalBinDir, originalPath]
+          .filter((value): value is string => value != null && value.length > 0)
+          .join(path.delimiter),
+      });
     } finally {
       if (originalPath === undefined) {
         delete process.env.PATH;
