@@ -204,6 +204,105 @@ describe("LspManager", () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 
+  test("prefers config-backed TypeScript roots and warms explicit workspace_symbols file queries", async () => {
+    const resourcePath = path.join(
+      workspacePath,
+      "web",
+      "packages",
+      "teleport",
+      "src",
+      "services",
+      "resources",
+      "resource.ts"
+    );
+    await fs.mkdir(path.dirname(resourcePath), { recursive: true });
+    await fs.writeFile(
+      path.join(workspacePath, "tsconfig.json"),
+      JSON.stringify({ include: ["web/**/*.ts"] }, null, 2) + "\n"
+    );
+    await fs.writeFile(
+      path.join(workspacePath, "web", "packages", "teleport", "package.json"),
+      "{}\n"
+    );
+    await fs.writeFile(resourcePath, "export class ResourceService {}\n");
+
+    const ensureEvents: string[] = [];
+    const ensureFile = mock((file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+      ensureEvents.push(`ensure:${file.readablePath}`);
+      return Promise.resolve(1);
+    });
+    const queryEvents: string[] = [];
+    let clientFactoryOptions: CreateLspClientOptions | undefined;
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      clientFactoryOptions = options;
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile,
+        query: mock((request: Parameters<LspClientInstance["query"]>[0]) => {
+          queryEvents.push(`query:${request.file?.readablePath ?? "directory"}`);
+          return Promise.resolve({
+            operation: "workspace_symbols" as const,
+            symbols: [
+              {
+                name: "ResourceService",
+                kind: 5,
+                location: {
+                  uri: pathToFileURL(resourcePath).href,
+                  range: {
+                    start: { line: 0, character: 13 },
+                    end: { line: 0, character: 28 },
+                  },
+                },
+              },
+            ],
+          });
+        }),
+        close: mock(() => Promise.resolve(undefined)),
+      });
+    });
+
+    const manager = new LspManager({
+      registry: createRegistry(),
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    try {
+      const result = await manager.query({
+        workspaceId: "ws-1",
+        runtime,
+        workspacePath,
+        filePath: "web/packages/teleport/src/services/resources/resource.ts",
+        policyContext: TEST_LSP_POLICY_CONTEXT,
+        operation: "workspace_symbols",
+        query: "ResourceService",
+      });
+
+      expect(result).toMatchObject({
+        operation: "workspace_symbols",
+        serverId: "typescript",
+        rootUri: pathToFileURL(workspacePath).href,
+        symbols: [
+          {
+            name: "ResourceService",
+            path: resourcePath,
+          },
+        ],
+      });
+      expect(clientFactoryOptions).toBeDefined();
+      if (!clientFactoryOptions) {
+        throw new Error("Expected the LSP client factory to receive a call");
+      }
+      expect(clientFactoryOptions.rootPath).toBe(workspacePath);
+      expect(ensureEvents).toEqual([`ensure:${resourcePath}`]);
+      expect(queryEvents).toEqual([`query:${resourcePath}`]);
+      expect(ensureFile).toHaveBeenCalledTimes(1);
+      expect(clientFactory).toHaveBeenCalledTimes(1);
+    } finally {
+      await manager.dispose();
+    }
+  });
+
   test("warms a representative TypeScript file before directory workspace_symbols queries", async () => {
     const ensureFileCalls: Array<Parameters<LspClientInstance["ensureFile"]>[0]> = [];
     const ensureFile = mock((file: Parameters<LspClientInstance["ensureFile"]>[0]) => {

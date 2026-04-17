@@ -238,7 +238,7 @@ export class LspManager {
       }
 
       const context = await this.resolveClientContext(options);
-      if (context.fileHandle && shouldTrackQueryFile(options.operation)) {
+      if (context.fileHandle && shouldEnsureQueryFile(options.operation, context.descriptor)) {
         await context.client.ensureFile(context.fileHandle);
       }
 
@@ -765,11 +765,12 @@ export class LspManager {
       descriptor =
         findLspServerForFile(runtimeFilePath, this.registry) ??
         failForUnsupportedFile(runtimeFilePath);
-      rootPath = await this.resolveRootPath(
+      rootPath = await this.resolveQueryRootPath(
         options.runtime,
         runtimeFilePath,
         workspaceRuntimePath,
-        descriptor.rootMarkers
+        descriptor,
+        options.operation
       );
       fileHandle = {
         runtimePath: runtimeFilePath,
@@ -872,6 +873,7 @@ export class LspManager {
             queryRootDiscovery.matches,
             match
           ),
+          query: options.query,
         });
         const rawResult = await clientResult.client.query({
           operation: options.operation,
@@ -1018,6 +1020,7 @@ export class LspManager {
     directoryPath: string;
     rootPath: string;
     excludedRootPaths: readonly string[];
+    query?: string;
   }): Promise<void> {
     if (!isTypeScriptLspDescriptor(options.descriptor)) {
       return;
@@ -1049,6 +1052,7 @@ export class LspManager {
     directoryPath: string;
     rootPath: string;
     excludedRootPaths: readonly string[];
+    query?: string;
   }): Promise<LspClientFileHandle | undefined> {
     for (const searchPath of getWorkspaceSymbolsRepresentativeSearchPaths(
       options.rootPath,
@@ -1059,7 +1063,8 @@ export class LspManager {
         searchPath,
         options.rootPath,
         options.descriptor.extensions,
-        options.excludedRootPaths
+        options.excludedRootPaths,
+        options.query
       );
       if (!representativePath) {
         continue;
@@ -1081,7 +1086,8 @@ export class LspManager {
     searchPath: string,
     workspaceRuntimePath: string,
     extensions: readonly string[],
-    excludedRootPaths: readonly string[]
+    excludedRootPaths: readonly string[],
+    query?: string
   ): Promise<string | undefined> {
     if (extensions.length === 0) {
       return undefined;
@@ -1114,16 +1120,17 @@ export class LspManager {
       );
     }
 
+    // Broad repo-root workspace/symbol searches need a file that looks like the requested symbol,
+    // otherwise tsserver can warm an unrelated shallow file and never load the target project graph.
     const pathModule = selectPathModule(searchPath);
+    const queryTokens = getWorkspaceSymbolsQueryTokens(query);
     const representativePath = representativeFileResult.stdout
       .split("\u0000")
       .map((candidatePath) => candidatePath.trim())
       .filter((candidatePath) => candidatePath.length > 0)
-      .sort((left, right) => {
-        const leftDepth = getRelativePathDepth(pathModule, searchPath, left);
-        const rightDepth = getRelativePathDepth(pathModule, searchPath, right);
-        return leftDepth - rightDepth || left.localeCompare(right);
-      })[0];
+      .sort((left, right) =>
+        compareWorkspaceSymbolsRepresentativePaths(pathModule, searchPath, left, right, queryTokens)
+      )[0];
     return representativePath || undefined;
   }
 
@@ -1271,6 +1278,38 @@ export class LspManager {
       });
       await this.disposeWorkspace(workspaceId);
     }
+  }
+
+  private async resolveQueryRootPath(
+    runtime: Runtime,
+    filePath: string,
+    workspaceRuntimePath: string,
+    descriptor: LspServerDescriptor,
+    operation?: LspQueryOperation
+  ): Promise<string> {
+    if (operation === "workspace_symbols" && isTypeScriptLspDescriptor(descriptor)) {
+      // workspace/symbol on TypeScript needs the owning tsconfig/jsconfig project when one exists,
+      // otherwise tsserver can bind an explicit file query to a nearer package.json-only subpackage.
+      const configRootMatch = await this.resolveRootMatch(
+        runtime,
+        filePath,
+        workspaceRuntimePath,
+        descriptor.rootMarkers.filter((marker) =>
+          TYPESCRIPT_WORKSPACE_SYMBOL_PROJECT_MARKERS.has(marker)
+        ),
+        false
+      );
+      if (configRootMatch.matchedMarker != null) {
+        return configRootMatch.rootPath;
+      }
+    }
+
+    return await this.resolveRootPath(
+      runtime,
+      filePath,
+      workspaceRuntimePath,
+      descriptor.rootMarkers
+    );
   }
 
   private async resolveRootPath(
@@ -2007,6 +2046,79 @@ function isRelativeSubpath(pathModule: PathModule, relativePath: string): boolea
   );
 }
 
+function compareWorkspaceSymbolsRepresentativePaths(
+  pathModule: PathModule,
+  searchPath: string,
+  leftPath: string,
+  rightPath: string,
+  queryTokens: readonly string[]
+): number {
+  const leftSortKey = getWorkspaceSymbolsRepresentativePathSortKey(
+    pathModule,
+    searchPath,
+    leftPath,
+    queryTokens
+  );
+  const rightSortKey = getWorkspaceSymbolsRepresentativePathSortKey(
+    pathModule,
+    searchPath,
+    rightPath,
+    queryTokens
+  );
+  return (
+    rightSortKey.basenameMatches - leftSortKey.basenameMatches ||
+    rightSortKey.pathMatches - leftSortKey.pathMatches ||
+    leftSortKey.depth - rightSortKey.depth ||
+    leftPath.localeCompare(rightPath)
+  );
+}
+
+function getWorkspaceSymbolsRepresentativePathSortKey(
+  pathModule: PathModule,
+  searchPath: string,
+  candidatePath: string,
+  queryTokens: readonly string[]
+): {
+  basenameMatches: number;
+  pathMatches: number;
+  depth: number;
+} {
+  const relativePath = pathModule.relative(searchPath, candidatePath).toLowerCase();
+  const basename = pathModule.basename(candidatePath).toLowerCase();
+  return {
+    basenameMatches: queryTokens.filter((token) => basename.includes(token)).length,
+    pathMatches: queryTokens.filter((token) => relativePath.includes(token)).length,
+    depth: getRelativePathDepth(pathModule, searchPath, candidatePath),
+  };
+}
+
+function getWorkspaceSymbolsQueryTokens(query: string | undefined): string[] {
+  if (query == null) {
+    return [];
+  }
+
+  const tokens = new Set<string>();
+  const collapsedQuery = query.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  if (collapsedQuery.length > 1) {
+    tokens.add(collapsedQuery);
+  }
+
+  for (const segment of query.split(/[^A-Za-z0-9]+/)) {
+    for (const token of splitWorkspaceSymbolsQuerySegment(segment)) {
+      const normalizedToken = token.toLowerCase();
+      if (normalizedToken.length > 1) {
+        tokens.add(normalizedToken);
+      }
+    }
+  }
+
+  return [...tokens];
+}
+
+function splitWorkspaceSymbolsQuerySegment(segment: string): string[] {
+  return segment.match(/[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+/g) ?? [];
+}
+
 function getWorkspaceSymbolIdentity(symbol: LspSymbolResult): string {
   return [
     symbol.name,
@@ -2123,8 +2235,11 @@ async function statOrNull(runtime: Runtime, candidatePath: string) {
   }
 }
 
-function shouldTrackQueryFile(operation: LspQueryOperation): boolean {
-  return operation !== "workspace_symbols";
+function shouldEnsureQueryFile(
+  operation: LspQueryOperation,
+  descriptor: LspServerDescriptor
+): boolean {
+  return operation !== "workspace_symbols" || isTypeScriptLspDescriptor(descriptor);
 }
 
 function requireQueryFileHandle(
