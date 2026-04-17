@@ -273,6 +273,133 @@ describe("LspManager", () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 
+  test("prefers repo-root TypeScript files over nested child TS projects during warm-up", async () => {
+    await fs.rm(path.join(workspacePath, "src"), { recursive: true, force: true });
+    await fs.rm(path.join(workspacePath, "packages"), { recursive: true, force: true });
+
+    const rootResourcePath = path.join(
+      workspacePath,
+      "web",
+      "packages",
+      "teleport",
+      "src",
+      "services",
+      "resources",
+      "resource.ts"
+    );
+    const designComponentPath = path.join(
+      workspacePath,
+      "web",
+      "packages",
+      "design",
+      "src",
+      "button.ts"
+    );
+    const e2eSpecPath = path.join(workspacePath, "e2e", "tests", "resource.spec.ts");
+    await fs.mkdir(path.dirname(rootResourcePath), { recursive: true });
+    await fs.mkdir(path.dirname(designComponentPath), { recursive: true });
+    await fs.mkdir(path.dirname(e2eSpecPath), { recursive: true });
+    await fs.writeFile(
+      path.join(workspacePath, "tsconfig.json"),
+      JSON.stringify({ include: ["web/**/*.ts"] }, null, 2) + "\n"
+    );
+    await fs.writeFile(path.join(workspacePath, "go.mod"), "module example.com/teleport\n");
+    await fs.writeFile(
+      path.join(workspacePath, "web", "packages", "design", "tsconfig.json"),
+      "{}\n"
+    );
+    await fs.writeFile(path.join(workspacePath, "e2e", "tsconfig.json"), "{}\n");
+    await fs.writeFile(rootResourcePath, "export class ResourceService {}\n");
+    await fs.writeFile(designComponentPath, "export const Button = 1;\n");
+    await fs.writeFile(e2eSpecPath, "export const resourceSpec = 1;\n");
+
+    const goDescriptor = createManualDescriptor("go", [".go"], "mux-test-go-lsp", [
+      "go.mod",
+      ".git",
+    ]);
+    const warmupPathsByRoot = new Map<string, string[]>();
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile: mock((file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+          const warmedPaths = warmupPathsByRoot.get(options.rootPath) ?? [];
+          warmedPaths.push(file.readablePath);
+          warmupPathsByRoot.set(options.rootPath, warmedPaths);
+          return Promise.resolve(1);
+        }),
+        query: mock(() => {
+          if (
+            options.descriptor.id === "typescript" &&
+            options.rootPath === workspacePath &&
+            warmupPathsByRoot.get(options.rootPath)?.at(-1) === rootResourcePath
+          ) {
+            return Promise.resolve({
+              operation: "workspace_symbols" as const,
+              symbols: [
+                {
+                  name: "ResourceService",
+                  kind: 5,
+                  location: {
+                    uri: pathToFileURL(rootResourcePath).href,
+                    range: {
+                      start: { line: 0, character: 13 },
+                      end: { line: 0, character: 28 },
+                    },
+                  },
+                },
+              ],
+            });
+          }
+
+          return Promise.resolve({
+            operation: "workspace_symbols" as const,
+            symbols: [],
+          });
+        }),
+        close: mock(() => Promise.resolve(undefined)),
+      });
+    });
+
+    const manager = new LspManager({
+      registry: [...createRegistry(), goDescriptor],
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    try {
+      const result = await manager.query({
+        workspaceId: "ws-1",
+        runtime,
+        workspacePath,
+        filePath: ".",
+        policyContext: TEST_LSP_POLICY_CONTEXT,
+        operation: "workspace_symbols",
+        query: "ResourceService",
+      });
+
+      expect(result).toMatchObject({
+        operation: "workspace_symbols",
+        serverId: "typescript",
+        rootUri: pathToFileURL(workspacePath).href,
+        symbols: [
+          {
+            name: "ResourceService",
+            path: rootResourcePath,
+          },
+        ],
+      });
+      expect(warmupPathsByRoot).toEqual(
+        new Map([
+          [workspacePath, [rootResourcePath]],
+          [path.join(workspacePath, "e2e"), [e2eSpecPath]],
+          [path.join(workspacePath, "web", "packages", "design"), [designComponentPath]],
+        ])
+      );
+    } finally {
+      await manager.dispose();
+    }
+  });
+
   test("prefers the deepest matching workspace_symbols root for nested directories", async () => {
     const pythonWorkspacePath = path.join(workspacePath, "services", "python");
     await fs.mkdir(pythonWorkspacePath, { recursive: true });

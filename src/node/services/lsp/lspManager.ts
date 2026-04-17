@@ -868,6 +868,10 @@ export class LspManager {
           pathMapper,
           directoryPath: runtimeFilePath,
           rootPath: match.rootPath,
+          excludedRootPaths: getWorkspaceSymbolsWarmupExcludedRootPaths(
+            queryRootDiscovery.matches,
+            match
+          ),
         });
         const rawResult = await clientResult.client.query({
           operation: options.operation,
@@ -1013,6 +1017,7 @@ export class LspManager {
     pathMapper: LspPathMapper;
     directoryPath: string;
     rootPath: string;
+    excludedRootPaths: readonly string[];
   }): Promise<void> {
     if (!isTypeScriptLspDescriptor(options.descriptor)) {
       return;
@@ -1043,6 +1048,7 @@ export class LspManager {
     pathMapper: LspPathMapper;
     directoryPath: string;
     rootPath: string;
+    excludedRootPaths: readonly string[];
   }): Promise<LspClientFileHandle | undefined> {
     for (const searchPath of getWorkspaceSymbolsRepresentativeSearchPaths(
       options.rootPath,
@@ -1052,7 +1058,8 @@ export class LspManager {
         options.runtime,
         searchPath,
         options.rootPath,
-        options.descriptor.extensions
+        options.descriptor.extensions,
+        options.excludedRootPaths
       );
       if (!representativePath) {
         continue;
@@ -1073,15 +1080,19 @@ export class LspManager {
     runtime: Runtime,
     searchPath: string,
     workspaceRuntimePath: string,
-    extensions: readonly string[]
+    extensions: readonly string[],
+    excludedRootPaths: readonly string[]
   ): Promise<string | undefined> {
     if (extensions.length === 0) {
       return undefined;
     }
 
-    const ignoredDirectoryExpression = WORKSPACE_SYMBOLS_WARMUP_IGNORED_DIRECTORY_NAMES.map(
-      (directoryName) => `-name ${shellQuote(directoryName)}`
-    ).join(" -o ");
+    const ignoredDirectoryExpression = [
+      ...WORKSPACE_SYMBOLS_WARMUP_IGNORED_DIRECTORY_NAMES.map(
+        (directoryName) => `-name ${shellQuote(directoryName)}`
+      ),
+      ...excludedRootPaths.map((rootPath) => `-path ${shellQuote(rootPath)}`),
+    ].join(" -o ");
     const extensionExpression = extensions
       .map((extension) => `-name ${shellQuote(`*${extension}`)}`)
       .join(" -o ");
@@ -1913,6 +1924,28 @@ function getWorkspaceSymbolsRepresentativeSearchPaths(
   }
 
   return [rootPath];
+}
+
+// Repo-root TypeScript workspace_symbols warm-up should bind the broad project to one of
+// its own files, not to a separately-queryable nested child project like design or e2e.
+function getWorkspaceSymbolsWarmupExcludedRootPaths(
+  matches: readonly ResolvedDirectoryDescriptorMatch[],
+  match: ResolvedDirectoryDescriptorMatch
+): string[] {
+  const pathModule = selectPathModule(match.rootPath);
+  return matches
+    .filter((candidate) => {
+      if (
+        candidate.descriptor.id !== match.descriptor.id ||
+        candidate.rootPath === match.rootPath
+      ) {
+        return false;
+      }
+
+      return isRelativeSubpath(pathModule, pathModule.relative(match.rootPath, candidate.rootPath));
+    })
+    .map((candidate) => candidate.rootPath)
+    .sort((left, right) => left.localeCompare(right));
 }
 
 function sortWorkspaceSymbolsQueryRoots(
