@@ -16,6 +16,7 @@
  */
 
 import { spawn, type ChildProcess } from "child_process";
+import * as crypto from "crypto";
 import * as path from "path";
 import type {
   EnsureReadyOptions,
@@ -33,26 +34,105 @@ import { WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
 import { RemoteRuntime, type SpawnResult } from "./RemoteRuntime";
 import { log } from "@/node/services/log";
 import { runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
-import { expandTildeForSSH as expandHookPath } from "./tildeExpansion";
 import { expandTildeForSSH, cdCommandForSSH } from "./tildeExpansion";
-import { getProjectName, execBuffered } from "@/node/utils/runtime/helpers";
+import { sleepWithAbort } from "@/node/utils/abort";
+import { execBuffered } from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
-import { type SSHRuntimeConfig } from "./sshConnectionPool";
+import {
+  type SSHRuntimeConfig,
+  getControlPath,
+  appendOpenSSHHostKeyPolicyArgs,
+  sshConnectionPool,
+} from "./sshConnectionPool";
 import { getOriginUrlForBundle } from "./gitBundleSync";
 import { gitNoHooksPrefix } from "@/node/utils/gitNoHooksEnv";
+import { execFileAsync } from "@/node/utils/disposableExec";
 import { syncRuntimeGitSubmodules } from "./submoduleSync";
-import type { PtyHandle, PtySessionParams, SSHTransport } from "./transports";
+import {
+  OpenSSHTransport,
+  type PtyHandle,
+  type PtySessionParams,
+  type SSHTransport,
+} from "./transports";
+import {
+  buildRemoteProjectLayout,
+  getRemoteWorkspacePath,
+  type RemoteProjectLayout,
+} from "./remoteProjectLayout";
 import { streamToString, shescape } from "./streamUtils";
 
-/** Name of the shared bare repo directory under each project on the remote. */
-const BASE_REPO_DIR = ".mux-base.git";
-
-/** Staging namespace for bundle-imported branch refs. Branches land here instead
- *  of refs/heads/* so they don't collide with branches checked out in worktrees. */
+/** Staging namespace for synced branch refs. Branches land here instead of
+ *  refs/heads/* so they don't collide with branches checked out in worktrees. */
 const BUNDLE_REF_PREFIX = "refs/mux-bundle/";
 
 /** Small backoff for concurrent writers healing the same shared base repo config. */
 const BASE_REPO_CONFIG_LOCK_RETRY_DELAYS_MS = [50, 100, 200];
+const BASE_REPO_HEALTH_PROBE_TIMEOUT_SECONDS = 10;
+const BASE_REPO_PROMISOR_CLEANUP_TIMEOUT_SECONDS = 10;
+const BASE_REPO_MAINTENANCE_TIMEOUT_SECONDS = 120;
+const BASE_REPO_FRAGMENTED_PACK_THRESHOLD = 25;
+const PROJECT_SYNC_MAX_ATTEMPTS = 3;
+const PROJECT_SYNC_RETRYABLE_ERRORS = [
+  "pack-objects died",
+  "Connection reset",
+  "Connection closed",
+  "Broken pipe",
+  "EPIPE",
+  "Command killed by signal",
+] as const;
+
+const sharedProjectSyncTails = new Map<string, Promise<void>>();
+
+async function enqueueProjectSync(
+  projectKey: string,
+  abortSignal: AbortSignal | undefined,
+  fn: () => Promise<void>
+): Promise<void> {
+  const previous = sharedProjectSyncTails.get(projectKey) ?? Promise.resolve();
+  let releaseCurrent: (() => void) | undefined;
+  const current = new Promise<void>((resolve) => {
+    releaseCurrent = resolve;
+  });
+  const tail = previous.then(
+    () => current,
+    () => current
+  );
+  sharedProjectSyncTails.set(projectKey, tail);
+  void tail.finally(() => {
+    if (sharedProjectSyncTails.get(projectKey) === tail) {
+      sharedProjectSyncTails.delete(projectKey);
+    }
+  });
+
+  let onAbort: (() => void) | undefined;
+  const waitForPrevious = previous.catch(() => undefined);
+  const waitForTurn = abortSignal
+    ? Promise.race([
+        waitForPrevious,
+        new Promise<never>((_, reject) => {
+          onAbort = () => reject(new Error("Operation aborted"));
+          if (abortSignal.aborted) {
+            onAbort();
+            return;
+          }
+          abortSignal.addEventListener("abort", onAbort, { once: true });
+        }),
+      ])
+    : waitForPrevious;
+
+  try {
+    await waitForTurn;
+    if (abortSignal?.aborted) {
+      throw new Error("Operation aborted");
+    }
+    await fn();
+  } finally {
+    if (onAbort) {
+      abortSignal?.removeEventListener("abort", onAbort);
+    }
+    releaseCurrent?.();
+  }
+}
 
 function isGitConfigLockConflict(message: string): boolean {
   return /could not lock config file/i.test(message);
@@ -138,29 +218,52 @@ async function waitForProcessExit(proc: ChildProcess): Promise<number> {
     proc.on("error", (err) => reject(err));
   });
 }
-/** Truncate SSH stderr for error logging (keep first line, max 200 chars) */
+
+/** Truncate SSH stderr for error logging (prefer the first transport-related line, max 200 chars). */
 function truncateSSHError(stderr: string): string {
   const trimmed = stderr.trim();
   if (!trimmed) return "exit code 255";
-  // Take first line only (SSH errors are usually single-line)
-  const firstLine = trimmed.split("\n")[0];
-  if (firstLine.length <= 200) return firstLine;
-  return firstLine.slice(0, 197) + "...";
+
+  const lines = trimmed.split("\n").filter(Boolean);
+  const preferredLine =
+    lines.find((line) =>
+      /(ssh:|Could not resolve hostname|Host key verification failed|Permission denied|Connection (timed out|refused|reset)|No route to host|Network is unreachable|kex_exchange_identification|Could not read from remote repository)/i.test(
+        line
+      )
+    ) ?? lines[0];
+
+  if (preferredLine.length <= 200) return preferredLine;
+  return preferredLine.slice(0, 197) + "...";
 }
 
+function isUnsupportedAtomicPush(errorMsg: string): boolean {
+  return /atomic/i.test(errorMsg) && /(does not support|not support|unsupported)/i.test(errorMsg);
+}
+
+function isGitPushTransportFailure(exitCode: number | null, errorMsg: string): boolean {
+  if (exitCode === 255) {
+    return true;
+  }
+  if (exitCode !== 128) {
+    return false;
+  }
+
+  return /(ssh:|Could not resolve hostname|Host key verification failed|Permission denied|Connection (timed out|refused|reset)|No route to host|Network is unreachable|kex_exchange_identification|Could not read from remote repository)/i.test(
+    errorMsg
+  );
+}
 // Re-export SSHRuntimeConfig from connection pool (defined there to avoid circular deps)
 export type { SSHRuntimeConfig } from "./sshConnectionPool";
 
 /**
  * Compute the path to the shared bare base repo for a project on the remote.
- * Convention: <srcBaseDir>/<projectName>/.mux-base.git
+ * Convention: <srcBaseDir>/<projectId>/.mux-base.git
  *
  * Exported for unit testing; runtime code should use the private
  * `SSHRuntime.getBaseRepoPath()` method instead.
  */
 export function computeBaseRepoPath(srcBaseDir: string, projectPath: string): string {
-  const projectName = getProjectName(projectPath);
-  return path.posix.join(srcBaseDir, projectName, BASE_REPO_DIR);
+  return buildRemoteProjectLayout(srcBaseDir, projectPath).baseRepoPath;
 }
 
 /**
@@ -174,6 +277,7 @@ export class SSHRuntime extends RemoteRuntime {
   private readonly transport: SSHTransport;
   private readonly ensureReadyProjectPath?: string;
   private readonly ensureReadyWorkspaceName?: string;
+  private readonly currentWorkspacePath?: string;
   /** Cached resolved bgOutputDir (tilde expanded to absolute path) */
   private resolvedBgOutputDir: string | null = null;
 
@@ -183,6 +287,7 @@ export class SSHRuntime extends RemoteRuntime {
     options?: {
       projectPath?: string;
       workspaceName?: string;
+      workspacePath?: string;
     }
   ) {
     super();
@@ -192,6 +297,7 @@ export class SSHRuntime extends RemoteRuntime {
     this.transport = transport;
     this.ensureReadyProjectPath = options?.projectPath;
     this.ensureReadyWorkspaceName = options?.workspaceName;
+    this.currentWorkspacePath = options?.workspacePath;
   }
 
   /**
@@ -234,6 +340,186 @@ export class SSHRuntime extends RemoteRuntime {
     return this.config;
   }
 
+  private getProjectLayout(projectPath: string): RemoteProjectLayout {
+    return buildRemoteProjectLayout(this.config.srcBaseDir, projectPath);
+  }
+
+  private getProjectSyncKey(projectId: string): string {
+    return [
+      this.config.host,
+      this.config.port?.toString() ?? "22",
+      this.config.identityFile ?? "default",
+      this.config.srcBaseDir,
+      projectId,
+    ].join(":");
+  }
+
+  private isRetryableProjectSyncError(errorMsg: string): boolean {
+    return PROJECT_SYNC_RETRYABLE_ERRORS.some((pattern) => errorMsg.includes(pattern));
+  }
+
+  private async probeBaseRepoHealth(
+    baseRepoPathArg: string,
+    abortSignal?: AbortSignal
+  ): Promise<{ packCount: number | null }> {
+    const result = await execBuffered(this, `git -C ${baseRepoPathArg} count-objects -v`, {
+      cwd: "/tmp",
+      timeout: BASE_REPO_HEALTH_PROBE_TIMEOUT_SECONDS,
+      abortSignal,
+    });
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `Failed to inspect shared base repository health: ${result.stderr || result.stdout}`
+      );
+    }
+
+    const packCountMatch = /^packs:\s*(\d+)\s*$/m.exec(result.stdout);
+    return {
+      packCount: packCountMatch ? Number.parseInt(packCountMatch[1], 10) : null,
+    };
+  }
+
+  protected async repairBaseRepoForSync(
+    baseRepoPathArg: string,
+    repairContext: string,
+    abortSignal?: AbortSignal
+  ): Promise<void> {
+    if (abortSignal?.aborted) {
+      throw new Error("Operation aborted");
+    }
+
+    const promisorPackDirArg = `${baseRepoPathArg}/objects/pack`;
+    log.info(repairContext);
+
+    const promisorCleanupResult = await execBuffered(
+      this,
+      `find ${promisorPackDirArg} -name '*.promisor' -print -delete 2>/dev/null || true`,
+      {
+        cwd: "/tmp",
+        timeout: BASE_REPO_PROMISOR_CLEANUP_TIMEOUT_SECONDS,
+        abortSignal,
+      }
+    );
+    const removedPromisorCount = promisorCleanupResult.stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean).length;
+    if (removedPromisorCount > 0) {
+      log.info(
+        `Removed ${removedPromisorCount} stale promisor marker(s) during base repo maintenance`
+      );
+    }
+
+    const gcResult = await execBuffered(this, `git -C ${baseRepoPathArg} gc --prune=now`, {
+      cwd: "/tmp",
+      timeout: BASE_REPO_MAINTENANCE_TIMEOUT_SECONDS,
+      abortSignal,
+    });
+    if (gcResult.exitCode !== 0) {
+      log.warn(
+        `Remote git gc exited ${gcResult.exitCode} during base repo maintenance: ${gcResult.stderr || gcResult.stdout}`
+      );
+    }
+  }
+
+  protected async ensureHealthyBaseRepoForSync(
+    baseRepoPathArg: string,
+    initLogger: InitLogger,
+    abortSignal?: AbortSignal
+  ): Promise<void> {
+    if (abortSignal?.aborted) {
+      throw new Error("Operation aborted");
+    }
+
+    try {
+      const { packCount } = await this.probeBaseRepoHealth(baseRepoPathArg, abortSignal);
+      if (packCount == null || packCount < BASE_REPO_FRAGMENTED_PACK_THRESHOLD) {
+        return;
+      }
+
+      const packFileLabel = packCount === 1 ? "pack file" : "pack files";
+      initLogger.logStep(
+        `Shared base repository is fragmented (${packCount} ${packFileLabel}); running maintenance before sync...`
+      );
+      await this.repairBaseRepoForSync(
+        baseRepoPathArg,
+        `Running shared base repository maintenance before sync (${packCount} ${packFileLabel})`,
+        abortSignal
+      );
+    } catch (healthError) {
+      const healthErrorMsg = getErrorMessage(healthError);
+      if (abortSignal?.aborted || healthErrorMsg === "Operation aborted") {
+        throw healthError instanceof Error ? healthError : new Error(healthErrorMsg);
+      }
+      log.warn(`Shared base repository maintenance preflight failed: ${healthErrorMsg}`);
+    }
+  }
+
+  protected async cleanupRetryableProjectSyncFailure(
+    baseRepoPathArg: string,
+    attempt: number,
+    maxAttempts: number,
+    abortSignal?: AbortSignal
+  ): Promise<void> {
+    if (abortSignal?.aborted) {
+      throw new Error("Operation aborted");
+    }
+
+    try {
+      await this.repairBaseRepoForSync(
+        baseRepoPathArg,
+        `Running remote promisor cleanup and git gc before retrying sync push (attempt ${attempt + 1}/${maxAttempts})`,
+        abortSignal
+      );
+    } catch (cleanupError) {
+      const cleanupErrorMsg = getErrorMessage(cleanupError);
+      if (abortSignal?.aborted || cleanupErrorMsg === "Operation aborted") {
+        throw cleanupError instanceof Error ? cleanupError : new Error(cleanupErrorMsg);
+      }
+      log.warn(`Remote sync retry cleanup failed: ${cleanupErrorMsg}`);
+    }
+  }
+
+  protected async waitForProjectSyncRetryDelay(
+    ms: number,
+    abortSignal?: AbortSignal
+  ): Promise<void> {
+    await sleepWithAbort(ms, abortSignal);
+  }
+
+  private async computeSnapshotDigest(projectPath: string): Promise<string> {
+    // Workspace materialization only depends on branch tips. Tags are shared repo
+    // metadata that can legitimately drift, so they must not participate in the
+    // authoritative snapshot identity or force a resync on their own.
+    const refsOutput = await new Promise<string>((resolve, reject) => {
+      const proc = spawn("git", ["-C", projectPath, "show-ref", "--heads"], {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+      const stdoutChunks: Buffer[] = [];
+      const stderrChunks: Buffer[] = [];
+      proc.stdout?.on("data", (chunk: Buffer) => stdoutChunks.push(Buffer.from(chunk)));
+      proc.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(Buffer.from(chunk)));
+      proc.once("close", (code) => {
+        if (code === 0) {
+          resolve(Buffer.concat(stdoutChunks).toString());
+          return;
+        }
+        const stderrText = Buffer.concat(stderrChunks).toString().trim();
+        reject(
+          new Error(
+            stderrText.length > 0
+              ? stderrText
+              : `git show-ref failed with code ${code ?? "unknown"}`
+          )
+        );
+      });
+      proc.once("error", reject);
+    });
+
+    return crypto.createHash("sha256").update(refsOutput).digest("hex");
+  }
+
   // ===== RemoteRuntime abstract method implementations =====
 
   protected readonly commandPrefix: string = "SSH";
@@ -250,27 +536,15 @@ export class SSHRuntime extends RemoteRuntime {
     return cdCommandForSSH(cwd);
   }
 
-  /**
-   * Handle exit codes for SSH connection pool health tracking.
-   */
-  protected override onExitCode(exitCode: number, _options: ExecOptions, stderr: string): void {
-    // Connection-level failures should inform transport backoff. The meaning of
-    // specific exit codes (like 255) is transport-dependent.
-    if (this.transport.isConnectionFailure(exitCode, stderr)) {
-      this.transport.reportFailure(truncateSSHError(stderr));
-    } else {
-      this.transport.markHealthy();
-    }
-  }
-
   protected async spawnRemoteProcess(
     fullCommand: string,
-    options: ExecOptions
+    options: ExecOptions & { deadlineMs?: number }
   ): Promise<SpawnResult> {
     return this.transport.spawnRemoteProcess(fullCommand, {
       forcePTY: options.forcePTY,
       timeout: options.timeout,
       abortSignal: options.abortSignal,
+      deadlineMs: options.deadlineMs,
     });
   }
 
@@ -339,8 +613,15 @@ export class SSHRuntime extends RemoteRuntime {
   }
 
   getWorkspacePath(projectPath: string, workspaceName: string): string {
-    const projectName = getProjectName(projectPath);
-    return path.posix.join(this.config.srcBaseDir, projectName, workspaceName);
+    if (
+      this.currentWorkspacePath &&
+      this.ensureReadyProjectPath === projectPath &&
+      this.ensureReadyWorkspaceName === workspaceName
+    ) {
+      return this.currentWorkspacePath;
+    }
+
+    return getRemoteWorkspacePath(this.getProjectLayout(projectPath), workspaceName);
   }
 
   /**
@@ -348,7 +629,7 @@ export class SSHRuntime extends RemoteRuntime {
    * All worktree-based workspaces share this object store.
    */
   private getBaseRepoPath(projectPath: string): string {
-    return computeBaseRepoPath(this.config.srcBaseDir, projectPath);
+    return this.getProjectLayout(projectPath).baseRepoPath;
   }
 
   /**
@@ -361,7 +642,8 @@ export class SSHRuntime extends RemoteRuntime {
     initLogger: InitLogger,
     abortSignal?: AbortSignal
   ): Promise<string> {
-    const baseRepoPath = this.getBaseRepoPath(projectPath);
+    const layout = this.getProjectLayout(projectPath);
+    const baseRepoPath = layout.baseRepoPath;
     const baseRepoPathArg = expandTildeForSSH(baseRepoPath);
 
     const check = await execBuffered(this, `test -d ${baseRepoPathArg}`, {
@@ -465,6 +747,35 @@ export class SSHRuntime extends RemoteRuntime {
     return false;
   }
 
+  private async resolveWorktreeBaseRepoPath(
+    projectPath: string,
+    workspacePath: string,
+    abortSignal?: AbortSignal
+  ): Promise<string> {
+    const fallbackBaseRepoPath = this.getBaseRepoPath(projectPath);
+
+    try {
+      const result = await execBuffered(
+        this,
+        `git -C ${this.quoteForRemote(workspacePath)} rev-parse --path-format=absolute --git-common-dir`,
+        {
+          cwd: "/tmp",
+          timeout: 10,
+          abortSignal,
+        }
+      );
+      const resolvedBaseRepoPath = result.stdout.trim();
+      if (result.exitCode === 0 && resolvedBaseRepoPath.length > 0) {
+        return resolvedBaseRepoPath;
+      }
+    } catch {
+      // Fall back to the canonical hashed layout when the existing workspace cannot report its
+      // common git dir (for example, if the directory is already partially missing/corrupted).
+    }
+
+    return fallbackBaseRepoPath;
+  }
+
   /**
    * Detect whether a remote workspace is a git worktree (`.git` is a file)
    * vs a legacy full clone (`.git` is a directory).
@@ -504,115 +815,6 @@ export class SSHRuntime extends RemoteRuntime {
     }
   }
 
-  private async persistWorkspaceBranchMapping(
-    projectPath: string,
-    workspaceName: string,
-    branchName: string
-  ): Promise<void> {
-    const branchMap = await this.readWorkspaceBranchMap(projectPath);
-    branchMap[workspaceName] = branchName;
-    await this.writeWorkspaceBranchMap(projectPath, branchMap);
-  }
-
-  private async updateWorkspaceBranchMapping(
-    projectPath: string,
-    oldWorkspaceName: string,
-    newWorkspaceName: string
-  ): Promise<void> {
-    const branchMap = await this.readWorkspaceBranchMap(projectPath);
-    const branchName = branchMap[oldWorkspaceName]?.trim() || oldWorkspaceName;
-    delete branchMap[oldWorkspaceName];
-    branchMap[newWorkspaceName] = branchName;
-    await this.writeWorkspaceBranchMap(projectPath, branchMap);
-  }
-
-  private async getPersistedWorkspaceBranchName(
-    projectPath: string,
-    workspaceName: string
-  ): Promise<string | null> {
-    const branchName = (await this.readWorkspaceBranchMap(projectPath))[workspaceName]?.trim();
-    return branchName || null;
-  }
-
-  private async deletePersistedWorkspaceBranchMapping(
-    projectPath: string,
-    workspaceName: string
-  ): Promise<void> {
-    try {
-      const branchMap = await this.readWorkspaceBranchMap(projectPath);
-      if (!(workspaceName in branchMap)) {
-        return;
-      }
-      delete branchMap[workspaceName];
-      await this.writeWorkspaceBranchMap(projectPath, branchMap);
-    } catch {
-      // Best-effort cleanup after delete; future creates overwrite any stale entry.
-    }
-  }
-
-  private async readWorkspaceBranchMap(projectPath: string): Promise<Record<string, string>> {
-    try {
-      const contents = await streamToString(
-        this.readFile(this.getWorkspaceBranchMapPath(projectPath))
-      );
-      const parsed: unknown = JSON.parse(contents);
-      if (typeof parsed !== "object" || parsed === null) {
-        return {};
-      }
-      return Object.fromEntries(
-        Object.entries(parsed).filter(([workspaceName, branchName]) => {
-          return (
-            workspaceName.trim().length > 0 &&
-            typeof branchName === "string" &&
-            branchName.trim().length > 0
-          );
-        })
-      );
-    } catch {
-      return {};
-    }
-  }
-
-  private async writeWorkspaceBranchMap(
-    projectPath: string,
-    branchMap: Record<string, string>
-  ): Promise<void> {
-    const branchMapPath = this.getWorkspaceBranchMapPath(projectPath);
-    if (Object.keys(branchMap).length === 0) {
-      await execBuffered(this, `rm -f ${this.quoteForRemote(branchMapPath)}`, {
-        cwd: "/tmp",
-        timeout: 10,
-      }).catch(() => undefined);
-      return;
-    }
-
-    const parentDir = path.posix.dirname(branchMapPath);
-    const mkdirResult = await execBuffered(this, `mkdir -p ${this.quoteForRemote(parentDir)}`, {
-      cwd: "/tmp",
-      timeout: 10,
-    });
-    if (mkdirResult.exitCode !== 0) {
-      throw new Error(
-        `Failed to prepare remote workspace branch map: ${mkdirResult.stderr || mkdirResult.stdout}`
-      );
-    }
-
-    const writer = this.writeFile(branchMapPath).getWriter();
-    try {
-      await writer.write(new TextEncoder().encode(`${JSON.stringify(branchMap, null, 2)}\n`));
-    } finally {
-      await writer.close();
-    }
-  }
-
-  private getWorkspaceBranchMapPath(projectPath: string): string {
-    return path.posix.join(
-      this.config.srcBaseDir,
-      getProjectName(projectPath),
-      ".mux-workspace-branches.json"
-    );
-  }
-
   /**
    * Resolve the bundle staging ref for the trunk branch.
    * Returns refs/mux-bundle/<trunkBranch> if it exists, otherwise falls back
@@ -648,6 +850,118 @@ export class SSHRuntime extends RemoteRuntime {
     }
 
     return null;
+  }
+
+  private async resolveLocalSyncRefManifest(projectPath: string): Promise<string | null> {
+    try {
+      using proc = execFileAsync("git", ["-C", projectPath, "show-ref", "--heads"]);
+      const { stdout } = await proc.result;
+      return stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+        .sort()
+        .join("\n");
+    } catch {
+      return null;
+    }
+  }
+
+  private async resolveRemoteSyncRefManifest(
+    baseRepoPathArg: string,
+    abortSignal?: AbortSignal
+  ): Promise<string | null> {
+    const result = await execBuffered(
+      this,
+      `git -C ${baseRepoPathArg} for-each-ref --format='%(objectname) %(refname)' ${BUNDLE_REF_PREFIX}`,
+      { cwd: "/tmp", timeout: 20, abortSignal }
+    );
+    if (result.exitCode !== 0) {
+      return null;
+    }
+
+    return result.stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .map((line) => {
+        const separator = line.indexOf(" ");
+        if (separator === -1) {
+          return line;
+        }
+
+        const oid = line.slice(0, separator);
+        const refName = line.slice(separator + 1);
+        const normalizedRefName = refName.startsWith(BUNDLE_REF_PREFIX)
+          ? refName.replace(BUNDLE_REF_PREFIX, "refs/heads/")
+          : refName;
+        return `${oid} ${normalizedRefName}`;
+      })
+      .sort()
+      .join("\n");
+  }
+
+  private async refreshBaseRepoOrigin(
+    projectPath: string,
+    baseRepoPathArg: string,
+    initLogger: InitLogger,
+    abortSignal?: AbortSignal
+  ): Promise<void> {
+    const { originUrl } = await this.getOriginUrlForSync(projectPath, initLogger);
+    if (!originUrl) {
+      return;
+    }
+
+    initLogger.logStep(`Setting origin remote to ${originUrl}...`);
+    await execBuffered(
+      this,
+      `git -C ${baseRepoPathArg} remote set-url origin ${shescape.quote(originUrl)} 2>/dev/null || git -C ${baseRepoPathArg} remote add origin ${shescape.quote(originUrl)}`,
+      { cwd: "/tmp", timeout: 10, abortSignal }
+    );
+  }
+
+  /**
+   * Pre-fetch from origin on the remote host to reduce local→remote push size.
+   *
+   * When the remote bare repo has an origin configured, runs `git fetch origin`
+   * on the SSH host. The host's datacenter connection to the upstream is
+   * typically much faster than the local machine's (e.g., hotel wifi vs
+   * datacenter). After this, the subsequent local→remote `git push` only needs
+   * to transfer objects that don't exist on origin — usually just unpushed
+   * local commits.
+   *
+   * Best-effort: failures are swallowed because the push still works without
+   * the pre-populated cache (it just transfers more data).
+   */
+  private async prefetchOriginOnRemote(
+    projectPath: string,
+    baseRepoPathArg: string,
+    initLogger: InitLogger,
+    abortSignal?: AbortSignal
+  ): Promise<void> {
+    // Ensure the remote base repo knows where origin is before fetching.
+    await this.refreshBaseRepoOrigin(projectPath, baseRepoPathArg, initLogger, abortSignal);
+
+    try {
+      initLogger.logStep("Pre-fetching from origin on remote host...");
+      const result = await execBuffered(
+        this,
+        // Fetch all branches from origin into the base repo's object store.
+        // This runs entirely on the remote — only the SSH control channel
+        // traverses the local link, so it's fast even on slow connections.
+        `git -C ${baseRepoPathArg} fetch --prune origin`,
+        { cwd: "/tmp", timeout: 120, abortSignal }
+      );
+      if (result.exitCode === 0) {
+        initLogger.logStep("Pre-fetched from origin on remote host");
+      } else {
+        initLogger.logStep("Pre-fetch from origin skipped (fetch failed)");
+      }
+    } catch {
+      // Best-effort — if origin is unreachable or not configured, the local
+      // push will still transfer all required objects.
+      initLogger.logStep("Pre-fetch from origin skipped (not reachable)");
+    }
   }
 
   override async ensureReady(options?: EnsureReadyOptions): Promise<EnsureReadyResult> {
@@ -825,34 +1139,15 @@ export class SSHRuntime extends RemoteRuntime {
   }
 
   /**
-   * Sync project to remote using git bundle
-   *
-   * Uses `git bundle` to create a packfile and clones it on the remote.
-   *
-   * Benefits over git archive:
-   * - Creates a real git repository on remote (can run git commands)
-   * - Better parity with git worktrees (full .git directory with metadata)
-   * - Enables remote git operations (commit, branch, status, diff, etc.)
-   * - Only tracked files in checkout (no node_modules, build artifacts)
-   * - Includes full history for flexibility
-   *
-   * Benefits over rsync/scp:
-   * - Much faster (only tracked files)
-   * - No external dependencies (git is always available)
-   * - Simpler implementation
-   */
-  /**
    * Transfer a git bundle to the remote and return its path.
    * Callers are responsible for cleanup of the remote bundle file.
    */
   private async transferBundleToRemote(
     projectPath: string,
+    remoteBundlePath: string,
     initLogger: InitLogger,
     abortSignal?: AbortSignal
   ): Promise<string> {
-    const timestamp = Date.now();
-    const remoteBundlePath = `~/.mux-bundle-${timestamp}.bundle`;
-
     await this.transport.acquireConnection({
       abortSignal,
       onWait: (waitMs) => logSSHBackoffWait(initLogger, waitMs),
@@ -932,60 +1227,66 @@ export class SSHRuntime extends RemoteRuntime {
     return remoteBundlePath;
   }
 
-  /**
-   * Sync local project to the shared bare base repo on the remote via git bundle.
-   *
-   * Branches land in a staging namespace (refs/mux-bundle/*) to avoid colliding
-   * with branches checked out in existing worktrees. Tags go to refs/tags/*
-   * directly. Remote tracking refs are excluded entirely.
-   * Idempotent — re-running is a no-op when nothing changed.
-   */
-  protected async syncProjectToRemote(
+  private async syncProjectSnapshotViaBundle(
     projectPath: string,
-    _workspacePath: string,
+    layout: RemoteProjectLayout,
+    currentSnapshotPath: string,
+    snapshotDigest: string,
+    baseRepoPathArg: string,
     initLogger: InitLogger,
     abortSignal?: AbortSignal
   ): Promise<void> {
-    const baseRepoPathArg = await this.ensureBaseRepo(projectPath, initLogger, abortSignal);
-
-    const remoteBundlePath = await this.transferBundleToRemote(
-      projectPath,
-      initLogger,
-      abortSignal
+    // Snapshot markers stay deterministic, but the uploaded bundle itself must use
+    // a per-attempt temp path so concurrent Mux processes do not stream into the same file.
+    const remoteBundlePath = path.posix.join(
+      "~/.mux-bundles",
+      layout.projectId,
+      `${snapshotDigest}.${crypto.randomUUID()}.bundle`
     );
     const remoteBundlePathArg = this.quoteForRemote(remoteBundlePath);
+    const remoteBundleParentDir = path.posix.dirname(remoteBundlePath);
+    const prepareRemoteDirs = await execBuffered(
+      this,
+      `mkdir -p ${this.quoteForRemote(remoteBundleParentDir)} ${this.quoteForRemote(path.posix.dirname(currentSnapshotPath))}`,
+      { cwd: "/tmp", timeout: 10, abortSignal }
+    );
+    if (prepareRemoteDirs.exitCode !== 0) {
+      throw new Error(
+        `Failed to prepare remote snapshot directories: ${prepareRemoteDirs.stderr || prepareRemoteDirs.stdout}`
+      );
+    }
+
+    await this.transferBundleToRemote(projectPath, remoteBundlePath, initLogger, abortSignal);
 
     try {
-      // Import branches and tags from the bundle into the shared bare repo.
-      // Branches land in refs/mux-bundle/* (staging namespace) instead of
-      // refs/heads/* to avoid colliding with branches checked out in existing
-      // worktrees — git refuses to update any ref checked out in a worktree.
-      // Tags go directly to refs/tags/* (they're never checked out).
+      // Import authoritative branches and shared tags from the bundle into the
+      // shared bare repo. Branches land in refs/mux-bundle/* (staging namespace)
+      // instead of refs/heads/* to avoid colliding with branches checked out in
+      // existing worktrees, and they stay pruneable because branch deletion should
+      // invalidate snapshot reuse. Tags go directly to refs/tags/*, but they are
+      // fetched separately without --prune so remote-only metadata tags survive.
       initLogger.logStep("Importing bundle into shared base repository...");
-      const fetchResult = await execBuffered(
+      const branchFetchResult = await execBuffered(
         this,
-        `git -C ${baseRepoPathArg} fetch ${remoteBundlePathArg} '+refs/heads/*:${BUNDLE_REF_PREFIX}*' '+refs/tags/*:refs/tags/*'`,
+        `git -C ${baseRepoPathArg} fetch --prune ${remoteBundlePathArg} '+refs/heads/*:${BUNDLE_REF_PREFIX}*'`,
         { cwd: "/tmp", timeout: 300, abortSignal }
       );
-      if (fetchResult.exitCode !== 0) {
+      if (branchFetchResult.exitCode !== 0) {
         throw new Error(
-          `Failed to import bundle into base repo: ${fetchResult.stderr || fetchResult.stdout}`
+          `Failed to import bundle branches into base repo: ${branchFetchResult.stderr || branchFetchResult.stdout}`
         );
       }
 
-      // Set the origin remote on the bare repo so worktrees inherit it.
-      const { originUrl } = await this.getOriginUrlForSync(projectPath, initLogger);
-      if (originUrl) {
-        initLogger.logStep(`Setting origin remote to ${originUrl}...`);
-        // Use add-or-update pattern: try set-url first, fall back to add.
-        await execBuffered(
-          this,
-          `git -C ${baseRepoPathArg} remote set-url origin ${shescape.quote(originUrl)} 2>/dev/null || git -C ${baseRepoPathArg} remote add origin ${shescape.quote(originUrl)}`,
-          { cwd: "/tmp", timeout: 10, abortSignal }
+      const tagFetchResult = await execBuffered(
+        this,
+        `git -C ${baseRepoPathArg} fetch ${remoteBundlePathArg} '+refs/tags/*:refs/tags/*'`,
+        { cwd: "/tmp", timeout: 300, abortSignal }
+      );
+      if (tagFetchResult.exitCode !== 0) {
+        throw new Error(
+          `Failed to import bundle tags into base repo: ${tagFetchResult.stderr || tagFetchResult.stdout}`
         );
       }
-
-      initLogger.logStep("Repository synced to base successfully");
     } finally {
       // Best-effort cleanup of the remote bundle file.
       try {
@@ -999,6 +1300,391 @@ export class SSHRuntime extends RemoteRuntime {
     }
   }
 
+  private async hasLocalTags(projectPath: string): Promise<boolean> {
+    using proc = execFileAsync("git", [
+      "-C",
+      projectPath,
+      "for-each-ref",
+      "--count=1",
+      "--format=%(refname)",
+      "refs/tags",
+    ]);
+    const { stdout } = await proc.result;
+    return stdout.trim().length > 0;
+  }
+
+  /**
+   * Build a GIT_SSH_COMMAND that mirrors the runtime's SSH config so `git push`
+   * reuses the same multiplexed connection and auth settings.
+   */
+  private buildGitSshCommand(): string {
+    const config = this.transport.getConfig();
+    // GIT_SSH_COMMAND is interpreted as a shell command string, so values
+    // containing spaces or special characters must be quoted to prevent
+    // incorrect word-splitting (e.g., identity file paths with spaces,
+    // ControlPath under /tmp with user-generated segments).
+    const singleQuote = "'";
+    const escapedSingleQuote = `${singleQuote}\\${singleQuote}${singleQuote}`;
+    const q = (s: string) => `${singleQuote}${s.replace(/'/g, escapedSingleQuote)}${singleQuote}`;
+
+    const args: string[] = ["ssh"];
+
+    if (config.port) {
+      args.push("-p", config.port.toString());
+    }
+    if (config.identityFile) {
+      args.push("-i", q(config.identityFile));
+    }
+
+    // Reuse the runtime's ControlPath so git push piggybacks on the existing
+    // multiplexed connection instead of opening a new one.
+    const controlPath = getControlPath(config);
+    args.push("-o", "LogLevel=FATAL");
+    args.push("-o", "ControlMaster=auto");
+    args.push("-o", q(`ControlPath=${controlPath}`));
+    args.push("-o", "ControlPersist=60");
+    args.push("-o", "BatchMode=yes");
+    args.push("-o", "ConnectTimeout=15");
+    args.push("-o", "ServerAliveInterval=5");
+    args.push("-o", "ServerAliveCountMax=2");
+
+    // Match the runtime's host key policy (permissive in headless mode).
+    appendOpenSSHHostKeyPolicyArgs(args);
+
+    return args.join(" ");
+  }
+
+  private async syncProjectSnapshotViaGitPush(
+    projectPath: string,
+    layout: RemoteProjectLayout,
+    currentSnapshotPath: string,
+    initLogger: InitLogger,
+    abortSignal?: AbortSignal
+  ): Promise<void> {
+    const prepareSnapshotDir = await execBuffered(
+      this,
+      `mkdir -p ${this.quoteForRemote(path.posix.dirname(currentSnapshotPath))}`,
+      { cwd: "/tmp", timeout: 10, abortSignal }
+    );
+    if (prepareSnapshotDir.exitCode !== 0) {
+      throw new Error(
+        `Failed to prepare remote snapshot directory: ${prepareSnapshotDir.stderr || prepareSnapshotDir.stdout}`
+      );
+    }
+
+    await this.transport.acquireConnection({
+      abortSignal,
+      onWait: (waitMs) => logSSHBackoffWait(initLogger, waitMs),
+    });
+
+    if (abortSignal?.aborted) {
+      throw new Error("Sync aborted");
+    }
+
+    initLogger.logStep("Pushing to remote...");
+
+    // Build the SSH remote URL pointing to the shared bare base repo.
+    // Use ssh:// URL format (not SCP-style host:path) because:
+    //  - SCP-style breaks on IPv6 literals (first : is ambiguous)
+    //  - ssh:// handles ~/ paths natively via /~/ syntax
+    //  - ssh:// respects the port from GIT_SSH_COMMAND without -p duplication
+    const baseRepoPath = layout.baseRepoPath;
+    // ssh:// URLs: /~/ means home-relative, / means absolute, and relative
+    // paths need /~/ prefix (resolved relative to home on the remote).
+    let urlPath: string;
+    if (baseRepoPath.startsWith("~/")) {
+      urlPath = `/~/${baseRepoPath.slice(2)}`;
+    } else if (baseRepoPath.startsWith("/")) {
+      urlPath = baseRepoPath;
+    } else {
+      // Relative path (e.g., "src/project/.mux-base.git") — treat as
+      // home-relative to match the old bundle flow's shell resolution.
+      urlPath = `/~/${baseRepoPath}`;
+    }
+    // Bracket bare IPv6 addresses for URL syntax. The host field can be:
+    //   hostname        → no change
+    //   user@hostname   → no change
+    //   2001:db8::1     → [2001:db8::1]       (bare IPv6)
+    //   user@[::1]      → no change            (already bracketed)
+    //   [::1]           → no change            (already bracketed)
+    const host = this.config.host;
+    const atIdx = host.lastIndexOf("@");
+    const hostPart = atIdx >= 0 ? host.slice(atIdx + 1) : host;
+    const userPrefix = atIdx >= 0 ? host.slice(0, atIdx + 1) : "";
+    const needsBrackets = hostPart.includes(":") && !hostPart.startsWith("[");
+    const urlHost = needsBrackets ? `${userPrefix}[${hostPart}]` : host;
+    const remoteUrl = `ssh://${urlHost}${urlPath}`;
+    const gitSshCommand = this.buildGitSshCommand();
+
+    // Push authoritative branches and shared tags separately. Branches land in
+    // refs/mux-bundle/* (staging namespace) and stay pruneable because branch
+    // deletion should invalidate snapshot reuse. Tags go to refs/tags/* as
+    // shared metadata, but they must not be pruned based on this local clone's
+    // view of the repo.
+    //
+    // NOTE: This runs `git push` locally (not through the runtime's SSHTransport),
+    // so it depends on the local `ssh` CLI being available. On OpenSSH runtimes,
+    // the transport already depends on that binary and shares the same ControlPath.
+    const runPush = async (pushArgs: string[]): Promise<void> => {
+      using pushProc = execFileAsync("git", pushArgs, {
+        env: { GIT_SSH_COMMAND: gitSshCommand },
+        onStderrData: (chunk) => {
+          for (const line of chunk.split("\n").filter(Boolean)) {
+            initLogger.logStderr(line);
+          }
+        },
+      });
+
+      // Bound the push with a 300s timeout (matching the old bundle path) and
+      // wire up abort signal — disposing kills the child process.
+      const pushTimeout = setTimeout(() => pushProc[Symbol.dispose](), 300_000);
+      const onAbort = () => pushProc[Symbol.dispose]();
+      abortSignal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        await pushProc.result;
+      } finally {
+        clearTimeout(pushTimeout);
+        abortSignal?.removeEventListener("abort", onAbort);
+      }
+    };
+    const throwPushFailure = (error: unknown): never => {
+      const errorMsg = getErrorMessage(error);
+      const exitCode = (error as { code?: number | null }).code ?? null;
+      const isConnectionFailure =
+        (exitCode != null && this.transport.isConnectionFailure(exitCode, errorMsg)) ||
+        isGitPushTransportFailure(exitCode, errorMsg);
+      if (isConnectionFailure) {
+        sshConnectionPool.reportFailure(this.transport.getConfig(), truncateSSHError(errorMsg));
+      }
+      throw new Error(`Failed to push to remote: ${errorMsg}`);
+    };
+    const branchPushArgsBase = [
+      "-C",
+      projectPath,
+      "push",
+      "--force",
+      "--prune",
+      "--no-verify",
+      remoteUrl,
+      `+refs/heads/*:${BUNDLE_REF_PREFIX}*`,
+    ];
+
+    try {
+      await runPush([
+        ...branchPushArgsBase.slice(0, 4),
+        "--atomic",
+        ...branchPushArgsBase.slice(4),
+      ]);
+    } catch (error) {
+      const errorMsg = getErrorMessage(error);
+      if (!isUnsupportedAtomicPush(errorMsg)) {
+        throwPushFailure(error);
+      }
+
+      initLogger.logStep("Remote git does not support atomic push; retrying without --atomic...");
+      try {
+        await runPush(branchPushArgsBase);
+      } catch (retryError) {
+        throwPushFailure(retryError);
+      }
+    }
+
+    // Metadata propagation is a true no-op when the local repo has no tags.
+    // Guarding the tag push keeps branch sync authoritative instead of failing on
+    // Git's "no refs in common" error for an empty tag refspec.
+    if (!(await this.hasLocalTags(projectPath))) {
+      return;
+    }
+
+    try {
+      await runPush([
+        "-C",
+        projectPath,
+        "push",
+        "--force",
+        "--no-verify",
+        remoteUrl,
+        "+refs/tags/*:refs/tags/*",
+      ]);
+    } catch (error) {
+      throwPushFailure(error);
+    }
+  }
+
+  /**
+   * Sync local project to the shared bare base repo on the remote.
+   *
+   * OpenSSH runtimes use native `git push` so Git negotiates incremental object
+   * transfer automatically. SSH2 runtimes keep the bundle path so sync does not
+   * depend on a local OpenSSH CLI or local known_hosts state.
+   *
+   * Branches are the authoritative workspace-materialization state: they land in
+   * refs/mux-bundle/* so they do not collide with worktree checkouts, and they
+   * remain pruneable so branch deletions invalidate snapshot reuse. Tags still
+   * sync into refs/tags/* when a branch resync happens, but they are treated as
+   * shared metadata instead of authoritative snapshot state.
+   */
+  protected async syncProjectToRemote(
+    projectPath: string,
+    initLogger: InitLogger,
+    abortSignal?: AbortSignal
+  ): Promise<void> {
+    if (abortSignal?.aborted) {
+      throw new Error("Operation aborted");
+    }
+
+    const layout = this.getProjectLayout(projectPath);
+    const projectKey = this.getProjectSyncKey(layout.projectId);
+    const retryCleanupBaseRepoPathArg = expandTildeForSSH(layout.baseRepoPath);
+
+    // Keep retries, cancellation handling, and retry cleanup inside the project-scoped
+    // sync lock so a follow-up init cannot race the shared base repo while we are healing it.
+    await enqueueProjectSync(projectKey, abortSignal, async () => {
+      for (let attempt = 1; attempt <= PROJECT_SYNC_MAX_ATTEMPTS; attempt++) {
+        if (abortSignal?.aborted) {
+          throw new Error("Operation aborted");
+        }
+
+        try {
+          await this.syncProjectToRemoteOnce(projectPath, layout, initLogger, abortSignal);
+          return;
+        } catch (error) {
+          const errorMsg = getErrorMessage(error);
+          if (abortSignal?.aborted || errorMsg === "Operation aborted") {
+            throw error instanceof Error ? error : new Error(errorMsg);
+          }
+          if (
+            !this.isRetryableProjectSyncError(errorMsg) ||
+            attempt === PROJECT_SYNC_MAX_ATTEMPTS
+          ) {
+            throw new Error(`Failed to sync project: ${errorMsg}`);
+          }
+
+          log.info(
+            `Sync failed (attempt ${attempt}/${PROJECT_SYNC_MAX_ATTEMPTS}), will retry: ${errorMsg}`
+          );
+          await this.cleanupRetryableProjectSyncFailure(
+            retryCleanupBaseRepoPathArg,
+            attempt,
+            PROJECT_SYNC_MAX_ATTEMPTS,
+            abortSignal
+          );
+          if (abortSignal?.aborted) {
+            throw new Error("Operation aborted");
+          }
+          initLogger.logStep(
+            `Sync failed, retrying (attempt ${attempt + 1}/${PROJECT_SYNC_MAX_ATTEMPTS})...`
+          );
+          await this.waitForProjectSyncRetryDelay(attempt * 1000, abortSignal);
+        }
+      }
+    });
+  }
+
+  protected async syncProjectToRemoteOnce(
+    projectPath: string,
+    layout: RemoteProjectLayout,
+    initLogger: InitLogger,
+    abortSignal?: AbortSignal
+  ): Promise<void> {
+    if (abortSignal?.aborted) {
+      throw new Error("Operation aborted");
+    }
+
+    const currentSnapshotPath = layout.currentSnapshotPath;
+    const useNativeGitPush = this.transport instanceof OpenSSHTransport;
+    const snapshotDigest = await this.computeSnapshotDigest(projectPath);
+    const baseRepoPathArg = await this.ensureBaseRepo(projectPath, initLogger, abortSignal);
+
+    // Treat the shared bare repo as a managed cache: verify its health before
+    // we ask Git to negotiate another sync against a fragmented object store.
+    await this.ensureHealthyBaseRepoForSync(baseRepoPathArg, initLogger, abortSignal);
+
+    const snapshotStatusCheck = await execBuffered(
+      this,
+      [
+        'current_snapshot=""',
+        `if test -f ${this.quoteForRemote(currentSnapshotPath)}; then`,
+        `  current_snapshot=$(tr -d '\n' < ${this.quoteForRemote(currentSnapshotPath)})`,
+        "fi",
+        `if test "$current_snapshot" = ${shescape.quote(snapshotDigest)}; then`,
+        `  staged_ref=$(git -C ${baseRepoPathArg} for-each-ref --count=1 --format='%(refname)' ${shescape.quote(BUNDLE_REF_PREFIX)})`,
+        '  if test -n "$staged_ref"; then',
+        "    echo reusable",
+        "  else",
+        "    echo stale-current",
+        "  fi",
+        "else",
+        "  echo missing",
+        "fi",
+      ].join("\n"),
+      { cwd: "/tmp", timeout: 10, abortSignal }
+    );
+    const snapshotStatus = snapshotStatusCheck.stdout.trim();
+    if (snapshotStatus === "reusable") {
+      const localRefManifest = await this.resolveLocalSyncRefManifest(projectPath);
+      const remoteRefManifest =
+        localRefManifest == null
+          ? null
+          : await this.resolveRemoteSyncRefManifest(baseRepoPathArg, abortSignal);
+      if (localRefManifest != null && remoteRefManifest === localRefManifest) {
+        await this.refreshBaseRepoOrigin(projectPath, baseRepoPathArg, initLogger, abortSignal);
+        initLogger.logStep("Reusing existing remote project snapshot");
+        return;
+      }
+      initLogger.logStep(
+        "Remote snapshot marker drifted from synced refs; resyncing project snapshot..."
+      );
+    }
+    if (snapshotStatus === "stale-current") {
+      initLogger.logStep(
+        "Remote snapshot marker found without matching synced refs; resyncing project snapshot..."
+      );
+    }
+
+    if (useNativeGitPush) {
+      // Pre-populate the remote base repo with objects from origin before the
+      // local→remote push. The SSH host's datacenter connection is typically
+      // orders of magnitude faster than the local machine's (e.g., hotel wifi),
+      // so fetching origin on the remote first turns the subsequent push into a
+      // small incremental transfer instead of a full repo upload.
+      // Only useful for git-push sync — bundle sync uploads a fresh local bundle
+      // that can't reuse remote objects, so the prefetch would be wasted I/O.
+      await this.prefetchOriginOnRemote(projectPath, baseRepoPathArg, initLogger, abortSignal);
+
+      await this.syncProjectSnapshotViaGitPush(
+        projectPath,
+        layout,
+        currentSnapshotPath,
+        initLogger,
+        abortSignal
+      );
+    } else {
+      await this.syncProjectSnapshotViaBundle(
+        projectPath,
+        layout,
+        currentSnapshotPath,
+        snapshotDigest,
+        baseRepoPathArg,
+        initLogger,
+        abortSignal
+      );
+    }
+
+    // Keep the bare base repo's origin aligned with the local project so later
+    // fetchOriginTrunk() calls base new worktrees on the intended remote.
+    await this.refreshBaseRepoOrigin(projectPath, baseRepoPathArg, initLogger, abortSignal);
+
+    const currentSnapshotWriter = this.writeFile(currentSnapshotPath).getWriter();
+    try {
+      await currentSnapshotWriter.write(new TextEncoder().encode(`${snapshotDigest}\n`));
+    } finally {
+      await currentSnapshotWriter.close();
+    }
+
+    initLogger.logStep("Repository synced to base successfully");
+  }
+
   /** Get origin URL from local project for setting on the remote base repo. */
   private async getOriginUrlForSync(
     projectPath: string,
@@ -1010,8 +1696,9 @@ export class SSHRuntime extends RemoteRuntime {
   async createWorkspace(params: WorkspaceCreationParams): Promise<WorkspaceCreationResult> {
     try {
       const { projectPath, directoryName, initLogger, abortSignal } = params;
+      const layout = this.getProjectLayout(projectPath);
       // Workspace directories follow the persisted workspace name; branch checkout happens later.
-      const workspacePath = this.getWorkspacePath(projectPath, directoryName);
+      const workspacePath = getRemoteWorkspacePath(layout, directoryName);
 
       // Prepare parent directory for git clone (fast - returns immediately)
       // Note: git clone will create the workspace directory itself during initWorkspace,
@@ -1047,7 +1734,6 @@ export class SSHRuntime extends RemoteRuntime {
         };
       }
 
-      await this.persistWorkspaceBranchMapping(projectPath, directoryName, params.branchName);
       initLogger.logStep("Remote workspace prepared");
 
       return {
@@ -1075,7 +1761,7 @@ export class SSHRuntime extends RemoteRuntime {
       },
       runHook: async ({ muxEnv, initLogger, abortSignal }) => {
         // Expand tilde in hook path (quoted paths don't auto-expand on remote).
-        const hookPath = expandHookPath(`${params.workspacePath}/.mux/init`);
+        const hookPath = expandTildeForSSH(`${params.workspacePath}/.mux/init`);
         await runInitHookOnRuntime(
           this,
           hookPath,
@@ -1095,7 +1781,7 @@ export class SSHRuntime extends RemoteRuntime {
     // If the workspace directory already exists and contains a git repo (e.g. forked from
     // another SSH workspace via worktree add or legacy cp), skip the expensive sync step.
     const workspacePathArg = expandTildeForSSH(workspacePath);
-    let shouldSync = true;
+    let needsWorktreeCheckout = true;
 
     try {
       const dirCheck = await execBuffered(this, `test -d ${workspacePathArg}`, {
@@ -1113,48 +1799,26 @@ export class SSHRuntime extends RemoteRuntime {
             abortSignal,
           }
         );
-        shouldSync = gitCheck.exitCode !== 0;
+        needsWorktreeCheckout = gitCheck.exitCode !== 0;
       }
     } catch {
-      // Default to syncing on unexpected errors.
-      shouldSync = true;
+      // Default to materializing the workspace on unexpected errors.
+      needsWorktreeCheckout = true;
     }
 
-    if (shouldSync) {
+    if (needsWorktreeCheckout) {
       // SSH workspace initialization owns repo materialization: it syncs the project into
       // the shared base repo, checks out the worktree, and then materializes submodules
       // before repo-controlled init hooks run.
       initLogger.logStep("Syncing project files to remote...");
-      const maxSyncAttempts = 3;
-      for (let attempt = 1; attempt <= maxSyncAttempts; attempt++) {
-        try {
-          await this.syncProjectToRemote(projectPath, workspacePath, initLogger, abortSignal);
-          break;
-        } catch (error) {
-          const errorMsg = getErrorMessage(error);
-          const isRetryable =
-            errorMsg.includes("pack-objects died") ||
-            errorMsg.includes("Connection reset") ||
-            errorMsg.includes("Connection closed") ||
-            errorMsg.includes("Broken pipe") ||
-            errorMsg.includes("EPIPE");
-
-          if (!isRetryable || attempt === maxSyncAttempts) {
-            throw new Error(`Failed to sync project: ${errorMsg}`);
-          }
-
-          log.info(`Sync failed (attempt ${attempt}/${maxSyncAttempts}), will retry: ${errorMsg}`);
-          initLogger.logStep(
-            `Sync failed, retrying (attempt ${attempt + 1}/${maxSyncAttempts})...`
-          );
-          await new Promise((r) => setTimeout(r, attempt * 1000));
-        }
-      }
+      await this.syncProjectToRemote(projectPath, initLogger, abortSignal);
       initLogger.logStep("Files synced successfully");
 
-      // Create a worktree from the shared bare base repo for this workspace.
+      // A brand-new workspace still needs git worktree add so the checkout exists before init hooks
+      // or submodule sync run. Re-enter ensureBaseRepo() here so older shared repos still get their
+      // local core.bare config normalized before we reuse them for a fresh worktree checkout.
       const baseRepoPath = this.getBaseRepoPath(projectPath);
-      const baseRepoPathArg = expandTildeForSSH(baseRepoPath);
+      const baseRepoPathArg = await this.ensureBaseRepo(projectPath, initLogger, abortSignal);
 
       // Fetch latest from origin in the base repo (best-effort) so new branches
       // can start from the latest upstream state.
@@ -1385,9 +2049,8 @@ export class SSHRuntime extends RemoteRuntime {
     if (abortSignal?.aborted) {
       return { success: false, error: "Rename operation aborted" };
     }
-    // Compute workspace paths using canonical method
     const oldPath = this.getWorkspacePath(projectPath, oldName);
-    const newPath = this.getWorkspacePath(projectPath, newName);
+    const newPath = path.posix.join(path.posix.dirname(oldPath), newName);
 
     try {
       const expandedOldPath = expandTildeForSSH(oldPath);
@@ -1398,8 +2061,11 @@ export class SSHRuntime extends RemoteRuntime {
 
       let moveCommand: string;
       if (isWorktree) {
-        // Worktree: use `git worktree move` to keep base repo metadata consistent.
-        const baseRepoPathArg = expandTildeForSSH(this.getBaseRepoPath(projectPath));
+        // Worktree: use `git worktree move` to keep the workspace registered in whichever
+        // shared base repo originally created it, including upgraded legacy SSH layouts.
+        const baseRepoPathArg = expandTildeForSSH(
+          await this.resolveWorktreeBaseRepoPath(projectPath, oldPath, abortSignal)
+        );
         moveCommand = `git -C ${baseRepoPathArg} worktree move ${expandedOldPath} ${expandedNewPath}`;
       } else {
         // Legacy full clone: plain mv.
@@ -1435,7 +2101,6 @@ export class SSHRuntime extends RemoteRuntime {
         };
       }
 
-      await this.updateWorkspaceBranchMapping(projectPath, oldName, newName);
       return { success: true, oldPath, newPath };
     } catch (error) {
       return {
@@ -1460,7 +2125,6 @@ export class SSHRuntime extends RemoteRuntime {
     // Disable git hooks for untrusted projects
     const nhp = gitNoHooksPrefix(trusted);
 
-    // Compute workspace path using canonical method
     const deletedPath = this.getWorkspacePath(projectPath, workspaceName);
 
     try {
@@ -1561,7 +2225,6 @@ export class SSHRuntime extends RemoteRuntime {
       // Handle check results
       if (checkExitCode === 3) {
         // Directory doesn't exist - deletion is idempotent (success).
-        await this.deletePersistedWorkspaceBranchMapping(projectPath, workspaceName);
         return { success: true, deletedPath };
       }
 
@@ -1595,15 +2258,17 @@ export class SSHRuntime extends RemoteRuntime {
         };
       }
 
-      const branchToDelete =
-        (await this.getPersistedWorkspaceBranchName(projectPath, workspaceName)) ?? workspaceName;
+      const branchToDelete = await this.resolveCheckedOutBranch(deletedPath, abortSignal, 10);
 
       // Detect if workspace is a worktree (.git is a file) vs a legacy full clone (.git is a directory).
       const isWorktree = await this.isWorktreeWorkspace(deletedPath, abortSignal);
 
       if (isWorktree) {
-        // Worktree: use `git worktree remove` to clean up the base repo's worktree metadata.
-        const baseRepoPathArg = expandTildeForSSH(this.getBaseRepoPath(projectPath));
+        // Worktree: use `git worktree remove` against the actual common git dir for this
+        // workspace so upgraded legacy SSH worktrees keep their original base repo metadata.
+        const baseRepoPathArg = expandTildeForSSH(
+          await this.resolveWorktreeBaseRepoPath(projectPath, deletedPath, abortSignal)
+        );
         const removeCmd = force
           ? `${nhp}git -C ${baseRepoPathArg} worktree remove --force ${this.quoteForRemote(deletedPath)}`
           : `${nhp}git -C ${baseRepoPathArg} worktree remove ${this.quoteForRemote(deletedPath)}`;
@@ -1669,7 +2334,6 @@ export class SSHRuntime extends RemoteRuntime {
         }
       }
 
-      await this.deletePersistedWorkspaceBranchMapping(projectPath, workspaceName);
       return { success: true, deletedPath };
     } catch (error) {
       return { success: false, error: `Failed to delete directory: ${getErrorMessage(error)}` };
@@ -1679,9 +2343,11 @@ export class SSHRuntime extends RemoteRuntime {
   async forkWorkspace(params: WorkspaceForkParams): Promise<WorkspaceForkResult> {
     const { projectPath, sourceWorkspaceName, newWorkspaceName, initLogger, abortSignal } = params;
 
-    // Compute workspace paths using canonical method
     const sourceWorkspacePath = this.getWorkspacePath(projectPath, sourceWorkspaceName);
-    const newWorkspacePath = this.getWorkspacePath(projectPath, newWorkspaceName);
+    const newWorkspacePath = path.posix.join(
+      path.posix.dirname(sourceWorkspacePath),
+      newWorkspaceName
+    );
 
     // For SSH commands, tilde must be expanded using $HOME - plain quoting won't expand it.
     const sourceWorkspacePathArg = expandTildeForSSH(sourceWorkspacePath);

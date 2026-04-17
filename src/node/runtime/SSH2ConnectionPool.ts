@@ -15,6 +15,7 @@ import { Duplex } from "stream";
 import type { Client } from "ssh2";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
+import { sleepWithAbort } from "@/node/utils/abort";
 import { attachStreamErrorHandler } from "@/node/utils/streamErrors";
 import type { SSHConnectionConfig, ConnectionHealth } from "./sshConnectionPool";
 import { resolveSSHConfig, type ResolvedSSHConfig } from "./sshConfigParser";
@@ -82,32 +83,6 @@ interface SSH2ConnectionEntry {
 function withJitter(seconds: number): number {
   const jitterFactor = 0.8 + Math.random() * 0.4;
   return seconds * jitterFactor;
-}
-
-async function sleepWithAbort(ms: number, abortSignal?: AbortSignal): Promise<void> {
-  if (ms <= 0) return;
-  if (abortSignal?.aborted) {
-    throw new Error("Operation aborted");
-  }
-
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      cleanup();
-      resolve();
-    }, ms);
-
-    const onAbort = () => {
-      cleanup();
-      reject(new Error("Operation aborted"));
-    };
-
-    const cleanup = () => {
-      clearTimeout(timer);
-      abortSignal?.removeEventListener("abort", onAbort);
-    };
-
-    abortSignal?.addEventListener("abort", onAbort);
-  });
 }
 
 function getAgentConfig(): string | undefined {
@@ -223,6 +198,13 @@ function spawnProxyCommand(
   return { sock, process: proc };
 }
 
+/** Extract a message string from an error for `.includes()` matching.
+ *  Unlike getErrorMessage, this doesn't walk the cause chain and returns ""
+ *  for non-Error, non-string values — intentionally narrow for match guards. */
+function errorMessageText(error: unknown): string {
+  return error instanceof Error ? error.message : typeof error === "string" ? error : "";
+}
+
 /**
  * Detect if error is due to encrypted key without passphrase.
  * ssh2 throws parse errors like "Cannot parse privateKey: Encrypted private OpenSSH key detected,
@@ -233,7 +215,7 @@ function isEncryptedKeyError(error: unknown): boolean {
   if (!error) {
     return false;
   }
-  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  const message = errorMessageText(error);
   return (
     message.includes("Encrypted private key detected") ||
     message.includes("Encrypted private OpenSSH key detected") ||
@@ -260,7 +242,7 @@ function isAuthFailure(error: unknown): boolean {
     }
   }
 
-  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  const message = errorMessageText(error);
   return (
     message.includes("All configured authentication methods failed") ||
     message.includes("Authentication failed") ||

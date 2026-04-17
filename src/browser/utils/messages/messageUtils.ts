@@ -115,22 +115,41 @@ export function shouldShowInterruptedBarrier(
 
 /**
  * Returns whether ChatPane should bypass useDeferredValue and render the immediate
- * message list. We bypass deferral while assistant content is streaming OR while
- * any tool call is still executing (e.g. live bash output).
+ * message list. We bypass deferral while assistant content is streaming, while the
+ * init hook is still running, OR while any tool call is still executing (for example,
+ * live bash output).
  *
  * We also bypass when the deferred snapshot appears stale (it still has active
  * streaming/executing rows after the immediate snapshot is idle), or when both
  * snapshots have diverged in row identity/order. Showing stale deferred rows can
- * cause hidden-marker placement and tool-state flash at stream completion.
+ * cause hidden-marker placement, hide live init logs after a workspace switch, and
+ * flash tool state at stream completion.
  */
 export function shouldBypassDeferredMessages(
   messages: DisplayedMessage[],
-  deferredMessages: DisplayedMessage[]
+  deferredMessages: DisplayedMessage[],
+  options?: {
+    immediateWorkspaceId?: string;
+    deferredWorkspaceId?: string;
+  }
 ): boolean {
+  if (
+    options?.immediateWorkspaceId !== undefined &&
+    options?.deferredWorkspaceId !== undefined &&
+    options.immediateWorkspaceId !== options.deferredWorkspaceId
+  ) {
+    return true;
+  }
+
   const hasActiveRows = (rows: DisplayedMessage[]) =>
     rows.some(
       (m) =>
-        ("isStreaming" in m && m.isStreaming) || (m.type === "tool" && m.status === "executing")
+        ("isStreaming" in m && m.isStreaming) ||
+        (m.type === "tool" && m.status === "executing") ||
+        // Keep SSH/Coder init output on the immediate path when a user returns to a
+        // workspace mid-setup; otherwise the deferred snapshot can keep showing an
+        // older empty/stale init row because workspace-init uses a stable display ID.
+        (m.type === "workspace-init" && m.status === "running")
     );
 
   if (messages.length !== deferredMessages.length) {
@@ -265,18 +284,4 @@ export function computeBashOutputGroupInfos(
   }
 
   return groupInfos;
-}
-
-/**
- * Computes the bash_output group info for a message at a given index.
- */
-export function computeBashOutputGroupInfo(
-  messages: DisplayedMessage[],
-  index: number
-): BashOutputGroupInfo | undefined {
-  if (index < 0 || index >= messages.length) {
-    return undefined;
-  }
-
-  return computeBashOutputGroupInfos(messages)[index];
 }

@@ -1,6 +1,10 @@
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import { ModelDisplay } from "@/browser/features/Messages/ModelDisplay";
 import { EmojiIcon } from "@/browser/components/icons/EmojiIcon/EmojiIcon";
+import {
+  getWorkspaceStreamingStatusPhase,
+  useWorkspaceStreamingStatusPhase,
+} from "@/browser/hooks/useWorkspaceStreamingStatusPhase";
 import { CircleHelp, ExternalLinkIcon, Loader2 } from "lucide-react";
 import { memo } from "react";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
@@ -12,8 +16,21 @@ export const WorkspaceStatusIndicator = memo<{
    *  a prop so this component doesn't need to subscribe to the full WorkspaceContext. */
   isCreating?: boolean;
 }>(({ workspaceId, fallbackModel, isCreating }) => {
-  const { canInterrupt, isStarting, awaitingUserQuestion, currentModel, agentStatus } =
-    useWorkspaceSidebarState(workspaceId);
+  const {
+    canInterrupt,
+    isStarting,
+    awaitingUserQuestion,
+    currentModel,
+    pendingStreamModel,
+    agentStatus,
+  } = useWorkspaceSidebarState(workspaceId);
+
+  const phase = getWorkspaceStreamingStatusPhase({
+    canInterrupt,
+    isStarting,
+    isCreating,
+  });
+  const { displayPhase, shouldCollapsePhaseSlot } = useWorkspaceStreamingStatusPhase(phase);
 
   // Show prompt when ask_user_question is pending - make it prominent
   if (awaitingUserQuestion) {
@@ -27,7 +44,7 @@ export const WorkspaceStatusIndicator = memo<{
 
   // Todo-derived status can outlive the stream that produced it. Once the turn is idle,
   // keep refresh-style status icons static so unfinished work does not look actively running.
-  const agentStatusSpinOverride = canInterrupt || isStarting || isCreating ? undefined : false;
+  const agentStatusSpinOverride = displayPhase !== null ? undefined : false;
 
   if (agentStatus) {
     return (
@@ -67,34 +84,66 @@ export const WorkspaceStatusIndicator = memo<{
     );
   }
 
-  const phase: "starting" | "streaming" | null = canInterrupt
-    ? "streaming"
-    : isStarting || isCreating
-      ? "starting"
-      : null;
-
-  if (!phase) {
+  if (!displayPhase) {
     return null;
   }
 
-  const modelToShow = canInterrupt ? (currentModel ?? fallbackModel) : fallbackModel;
-  const suffix = phase === "starting" ? "- starting..." : "- streaming...";
+  const modelToShow =
+    displayPhase === "starting"
+      ? (pendingStreamModel ?? fallbackModel)
+      : (currentModel ?? pendingStreamModel ?? fallbackModel);
+  const suffix = displayPhase === "starting" ? "- starting..." : "- streaming...";
+
+  if (displayPhase === "streaming" && !shouldCollapsePhaseSlot) {
+    return (
+      <div className="text-muted flex min-w-0 items-center gap-1.5 text-xs">
+        {modelToShow ? (
+          <>
+            <span className="min-w-0 truncate">
+              <ModelDisplay modelString={modelToShow} showTooltip={false} />
+            </span>
+            <span className="shrink-0 opacity-70">{suffix}</span>
+          </>
+        ) : (
+          <span className="min-w-0 truncate">Assistant - streaming...</span>
+        )}
+      </div>
+    );
+  }
 
   return (
-    <div className="text-muted flex min-w-0 items-center gap-1.5 text-xs">
-      {phase === "starting" && (
-        <Loader2 aria-hidden="true" className="h-3 w-3 shrink-0 animate-spin opacity-70" />
+    <div className="text-muted flex min-w-0 items-center text-xs">
+      {/* Keep the old steady-state layout, but hold the spinner slot just long enough to
+          animate the start -> stream handoff instead of flashing the label left. */}
+      {(displayPhase === "starting" || shouldCollapsePhaseSlot) && (
+        <span
+          className={
+            displayPhase === "starting"
+              ? "mr-1.5 inline-flex w-3 shrink-0 overflow-hidden opacity-100"
+              : "mr-0 inline-flex w-0 shrink-0 overflow-hidden opacity-0 transition-[margin,width,opacity] duration-150 ease-out"
+          }
+          data-phase-slot
+        >
+          <Loader2
+            aria-hidden="true"
+            className={
+              displayPhase === "starting"
+                ? "h-3 w-3 shrink-0 animate-spin opacity-70"
+                : "h-3 w-3 shrink-0"
+            }
+          />
+        </span>
       )}
       {modelToShow ? (
-        <>
+        <div className="flex min-w-0 items-center gap-1.5">
           <span className="min-w-0 truncate">
             <ModelDisplay modelString={modelToShow} showTooltip={false} />
           </span>
           <span className="shrink-0 opacity-70">{suffix}</span>
-        </>
+        </div>
       ) : (
         <span className="min-w-0 truncate">
-          {phase === "starting" ? "Assistant - starting..." : "Assistant - streaming..."}
+          {displayPhase === "starting" ? "Assistant - starting..." : "Assistant - streaming..."}
         </span>
       )}
     </div>

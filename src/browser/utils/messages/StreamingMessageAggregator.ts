@@ -423,6 +423,17 @@ export class StreamingMessageAggregator {
     truncatedLines?: number; // Lines dropped from middle when output exceeded limit
   } | null = null;
 
+  // When reconnect replay re-emits init-start for the same running init, keep the existing row and
+  // treat replayed init-output as a continuation. Snapshot the already-visible prefix so replay can
+  // skip only those previously rendered lines without collapsing legitimate duplicates later on.
+  private replayInitVisiblePrefix: Array<{ line: string; isError: boolean }> | null = null;
+  private replayInitVisiblePrefixIndex = 0;
+
+  // Replay reconnects apply the same init events twice: once immediately before caught-up and
+  // once again from the buffered catch-up pass. Track replay event identity so the second pass can
+  // skip the exact same event object without collapsing legitimate duplicate log lines.
+  private appliedReplayInitEvents = new WeakSet<object>();
+
   // Throttle init-output cache invalidation to avoid re-render per line during fast streaming
   private initOutputThrottleTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly INIT_OUTPUT_THROTTLE_MS = 100;
@@ -453,6 +464,12 @@ export class StreamingMessageAggregator {
   // Model used for the pending send (set on user message) so the "starting" UI
   // reflects one-shot/compaction overrides instead of stale localStorage values.
   private pendingStreamModel: string | null = null;
+
+  // A brand-new workspace can auto-navigate before onChat replays the first user turn.
+  // Keep the startup barrier alive through that empty catch-up window until we see
+  // either the real user message or a terminal stream event.
+  private optimisticPendingStreamStart = false;
+  private optimisticPendingStreamStartIdleCaughtUpCount = 0;
 
   // Last completed stream timing stats (preserved after stream ends for display)
   // Unlike activeStreams, this persists until the next stream starts
@@ -1066,9 +1083,14 @@ export class StreamingMessageAggregator {
 
     if (!opts?.skipDerivedState && !hasActiveStream && this.pendingStreamStartTime !== null) {
       const latestMessage = this.getAllMessages().at(-1);
-      if (!latestMessage || latestMessage.role === "assistant") {
-        // Authoritative history now shows an idle/assistant-ended transcript, so any
-        // preserved "starting..." state came from a disconnected pre-stream turn.
+      const historySettledThePendingTurn =
+        latestMessage?.role === "assistant" ||
+        (latestMessage?.role === "user" && this.optimisticPendingStreamStart) ||
+        (latestMessage == null && !this.optimisticPendingStreamStart);
+      if (historySettledThePendingTurn) {
+        // User rationale: optimistic startup for a brand-new chat should survive an
+        // empty caught-up cycle, but once history shows the first turn (or an assistant
+        // response), the normal transcript can take over and the local barrier should end.
         this.clearPendingStreamLifecycleState();
       }
     }
@@ -1246,6 +1268,31 @@ export class StreamingMessageAggregator {
     return this.pendingStreamModel;
   }
 
+  markOptimisticPendingStreamStart(model: string | null): void {
+    this.optimisticPendingStreamStart = true;
+    this.optimisticPendingStreamStartIdleCaughtUpCount = 0;
+    this.pendingCompactionRequest = null;
+    this.pendingStreamModel = model;
+    this.setPendingStreamStartTime(Date.now());
+  }
+
+  clearPendingStreamStartIfNotOptimistic(): void {
+    if (!this.optimisticPendingStreamStart) {
+      this.clearPendingStreamStart();
+      return;
+    }
+
+    // Preserve exactly one authoritative idle caught-up cycle for a just-created workspace.
+    // If the server later still reports no active stream and no replayed turn has arrived,
+    // the optimistic startup barrier is stale and should clear so recovery UI can reappear.
+    if (this.optimisticPendingStreamStartIdleCaughtUpCount > 0) {
+      this.clearPendingStreamStart();
+      return;
+    }
+
+    this.optimisticPendingStreamStartIdleCaughtUpCount += 1;
+  }
+
   private getLatestHistoricalCompactionRequest(): PendingCompactionRequest | null {
     let sawCompletedCompaction = false;
     const messages = this.getAllMessages();
@@ -1302,6 +1349,8 @@ export class StreamingMessageAggregator {
     if (time === null) {
       this.pendingCompactionRequest = null;
       this.pendingStreamModel = null;
+      this.optimisticPendingStreamStart = false;
+      this.optimisticPendingStreamStartIdleCaughtUpCount = 0;
     }
   }
 
@@ -1595,8 +1644,49 @@ export class StreamingMessageAggregator {
     }
   }
 
+  /**
+   * Replay-visible init output needs a synchronous cache flush. WorkspaceStore can
+   * bump subscribers before the normal 100ms init-output throttle fires, and in
+   * reconnects that would otherwise leave the newest line hidden until caught-up.
+   */
+  flushPendingInitOutput(): void {
+    if (this.initOutputThrottleTimer) {
+      clearTimeout(this.initOutputThrottleTimer);
+      this.initOutputThrottleTimer = null;
+    }
+
+    this.invalidateCache();
+  }
+
   clearPendingStreamStart(): void {
     this.setPendingStreamStartTime(null);
+  }
+
+  resetForReplay(): void {
+    const pendingStreamSnapshot =
+      this.pendingStreamStartTime === null
+        ? null
+        : {
+            pendingStreamStartTime: this.pendingStreamStartTime,
+            pendingCompactionRequest: this.pendingCompactionRequest,
+            pendingStreamModel: this.pendingStreamModel,
+            optimisticPendingStreamStart: this.optimisticPendingStreamStart,
+            optimisticPendingStreamStartIdleCaughtUpCount:
+              this.optimisticPendingStreamStartIdleCaughtUpCount,
+          };
+
+    this.clear();
+
+    if (!pendingStreamSnapshot) {
+      return;
+    }
+
+    this.pendingStreamStartTime = pendingStreamSnapshot.pendingStreamStartTime;
+    this.pendingCompactionRequest = pendingStreamSnapshot.pendingCompactionRequest;
+    this.pendingStreamModel = pendingStreamSnapshot.pendingStreamModel;
+    this.optimisticPendingStreamStart = pendingStreamSnapshot.optimisticPendingStreamStart;
+    this.optimisticPendingStreamStartIdleCaughtUpCount =
+      pendingStreamSnapshot.optimisticPendingStreamStartIdleCaughtUpCount;
   }
 
   clear(): void {
@@ -2320,9 +2410,69 @@ export class StreamingMessageAggregator {
     this.invalidateCache();
   }
 
+  private clearReplayInitVisiblePrefix(): void {
+    this.replayInitVisiblePrefix = null;
+    this.replayInitVisiblePrefixIndex = 0;
+  }
+
+  private shouldSkipVisibleReplayInitOutput(line: string, isError: boolean): boolean {
+    const prefix = this.replayInitVisiblePrefix;
+    if (!prefix) {
+      return false;
+    }
+
+    const nextVisibleLine = prefix[this.replayInitVisiblePrefixIndex];
+    if (nextVisibleLine?.line !== line || nextVisibleLine?.isError !== isError) {
+      this.clearReplayInitVisiblePrefix();
+      return false;
+    }
+
+    this.replayInitVisiblePrefixIndex += 1;
+    if (this.replayInitVisiblePrefixIndex >= prefix.length) {
+      this.clearReplayInitVisiblePrefix();
+    }
+
+    return true;
+  }
+
+  private shouldSkipReplayInitEvent(data: WorkspaceChatMessage): boolean {
+    if (
+      (data as { replay?: boolean }).replay !== true ||
+      (!isInitStart(data) && !isInitOutput(data) && !isInitEnd(data))
+    ) {
+      return false;
+    }
+
+    if (this.appliedReplayInitEvents.has(data as object)) {
+      return true;
+    }
+
+    this.appliedReplayInitEvents.add(data as object);
+    return false;
+  }
+
   handleMessage(data: WorkspaceChatMessage): void {
     // Handle init hook events (ephemeral, not persisted to history)
+    if (this.shouldSkipReplayInitEvent(data)) {
+      return;
+    }
+
     if (isInitStart(data)) {
+      const isReplay = (data as { replay?: boolean }).replay === true;
+      if (
+        isReplay &&
+        this.initState?.status === "running" &&
+        this.initState.hookPath === data.hookPath &&
+        this.initState.startTime === data.timestamp
+      ) {
+        // Reconnect replay re-emits init-start before replayed lines. Treat the same running init
+        // as a no-op so switching back never clears the visible SSH/setup output mid-replay.
+        this.replayInitVisiblePrefix = [...this.initState.lines];
+        this.replayInitVisiblePrefixIndex = 0;
+        return;
+      }
+
+      this.clearReplayInitVisiblePrefix();
       this.initState = {
         status: "running",
         hookPath: data.hookPath,
@@ -2346,6 +2496,10 @@ export class StreamingMessageAggregator {
       }
       const line = data.line.trimEnd();
       const isError = data.isError === true;
+      const isReplay = (data as { replay?: boolean }).replay === true;
+      if (isReplay && this.shouldSkipVisibleReplayInitOutput(line, isError)) {
+        return;
+      }
 
       // Truncation: keep only the most recent MAX_LINES (matches backend)
       if (this.initState.lines.length >= INIT_HOOK_MAX_LINES) {
@@ -2363,6 +2517,7 @@ export class StreamingMessageAggregator {
     }
 
     if (isInitEnd(data)) {
+      this.clearReplayInitVisiblePrefix();
       if (!this.initState) {
         console.error("Received init-end without init-start", { data });
         return;
@@ -2456,6 +2611,8 @@ export class StreamingMessageAggregator {
               }
             : null;
 
+        this.optimisticPendingStreamStart = false;
+        this.optimisticPendingStreamStartIdleCaughtUpCount = 0;
         this.pendingStreamModel = muxMetadata?.requestedModel ?? null;
 
         if (muxMeta?.displayStatus) {

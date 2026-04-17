@@ -3,6 +3,7 @@ import { UIModeSchema } from "../../types/mode";
 import { z } from "zod";
 import { CODER_ARCHIVE_BEHAVIORS } from "@/common/config/coderArchiveBehavior";
 import { WORKTREE_ARCHIVE_BEHAVIORS } from "@/common/config/worktreeArchiveBehavior";
+import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { ChatStatsSchema, SessionUsageFileSchema } from "./chatStats";
 import {
@@ -1752,6 +1753,11 @@ const ResolvedTaskSettingsSchema = TaskSettingsSchema.required({
   maxTaskNestingDepth: true,
 });
 
+const AdvisorModelStringSchema = z.string().nullable();
+const AdvisorThinkingLevelSchema = ThinkingLevelSchema.nullable();
+const AdvisorMaxUsesPerTurnSchema = z.number().int().positive().nullable();
+const AdvisorMaxOutputTokensSchema = z.number().int().positive().nullable();
+
 export const config = {
   getConfig: {
     input: z.void(),
@@ -1762,6 +1768,10 @@ export const config = {
       routePriority: z.array(z.string()).optional(),
       routeOverrides: z.record(z.string(), z.string()).optional(),
       defaultModel: z.string().optional(),
+      advisorModelString: AdvisorModelStringSchema,
+      advisorThinkingLevel: AdvisorThinkingLevelSchema,
+      advisorMaxUsesPerTurn: AdvisorMaxUsesPerTurnSchema.optional(),
+      advisorMaxOutputTokens: AdvisorMaxOutputTokensSchema.optional(),
       hiddenModels: z.array(z.string()).optional(),
       coderWorkspaceArchiveBehavior: z.enum(CODER_ARCHIVE_BEHAVIORS),
       worktreeArchiveBehavior: z.enum(WORKTREE_ARCHIVE_BEHAVIORS),
@@ -1775,12 +1785,18 @@ export const config = {
       muxGovernorUrl: z.string().nullable(),
       muxGovernorEnrolled: z.boolean(),
       llmDebugLogs: z.boolean(),
+      heartbeatDefaultPrompt: z.string().optional(),
+      heartbeatDefaultIntervalMs: z.number().optional(),
       onePasswordAccountName: z.string().nullish(),
     }),
   },
   saveConfig: {
     input: z.object({
       taskSettings: ResolvedTaskSettingsSchema,
+      advisorModelString: AdvisorModelStringSchema.nullish(),
+      advisorThinkingLevel: AdvisorThinkingLevelSchema.nullish(),
+      advisorMaxUsesPerTurn: AdvisorMaxUsesPerTurnSchema.nullish(),
+      advisorMaxOutputTokens: AdvisorMaxOutputTokensSchema.nullish(),
       agentAiDefaults: AgentAiDefaultsSchema.optional(),
       // Legacy field (downgrade compatibility)
       subagentAiDefaults: SubagentAiDefaultsSchema.optional(),
@@ -1858,6 +1874,27 @@ export const config = {
     input: z
       .object({
         enabled: z.boolean(),
+      })
+      .strict(),
+    output: z.void(),
+  },
+  updateHeartbeatDefaultPrompt: {
+    input: z
+      .object({
+        defaultPrompt: z.string().nullish(),
+      })
+      .strict(),
+    output: z.void(),
+  },
+  updateHeartbeatDefaultIntervalMs: {
+    input: z
+      .object({
+        intervalMs: z
+          .number()
+          .int()
+          .min(HEARTBEAT_MIN_INTERVAL_MS)
+          .max(HEARTBEAT_MAX_INTERVAL_MS)
+          .nullish(),
       })
       .strict(),
     output: z.void(),

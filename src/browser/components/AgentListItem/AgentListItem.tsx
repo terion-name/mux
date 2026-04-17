@@ -1,20 +1,24 @@
 import { useTitleEdit } from "@/browser/contexts/WorkspaceTitleEditContext";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { useContextMenuPosition } from "@/browser/hooks/useContextMenuPosition";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import {
+  getWorkspaceStreamingStatusPhase,
+  useWorkspaceStreamingStatusPhase,
+} from "@/browser/hooks/useWorkspaceStreamingStatusPhase";
+import { useWorkspaceFallbackModel } from "@/browser/hooks/useWorkspaceFallbackModel";
+import { useWorkspaceUnread } from "@/browser/hooks/useWorkspaceUnread";
+import { useRuntimeStatus } from "@/browser/stores/RuntimeStatusStore";
+import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import type { AgentRowRenderMeta } from "@/browser/utils/ui/workspaceFiltering";
 import { cn } from "@/common/lib/utils";
-import { useRuntimeStatus } from "@/browser/stores/RuntimeStatusStore";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { useWorkspaceUnread } from "@/browser/hooks/useWorkspaceUnread";
-import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
-import { useWorkspaceFallbackModel } from "@/browser/hooks/useWorkspaceFallbackModel";
-import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import {
   TASK_GROUP_KIND,
   getTaskGroupKindFromMetadata,
   normalizeTaskGroupLabel,
 } from "@/common/utils/tools/taskGroups";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { MUX_HELP_CHAT_WORKSPACE_ID } from "@/common/constants/muxChat";
 import { isDevcontainerRuntime } from "@/common/types/runtime";
 import { getWorkspaceLastReadKey } from "@/common/constants/storage";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -25,8 +29,15 @@ import { SubAgentListItem } from "./SubAgentListItem";
 
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { Popover, PopoverContent, PopoverTrigger, PopoverAnchor } from "../Popover/Popover";
-import { useContextMenuPosition } from "@/browser/hooks/useContextMenuPosition";
 import { PositionedMenu, PositionedMenuItem } from "../PositionedMenu/PositionedMenu";
+import {
+  getAncestorRailX,
+  getSidebarItemPaddingLeft,
+  getSubAgentChildStatusCenterX,
+  getSubAgentParentRailX,
+  SIDEBAR_LEADING_SLOT_SIZE_PX,
+  type SubAgentConnectorLayout,
+} from "../sidebarItemLayout";
 import {
   Trash2,
   Trash,
@@ -86,7 +97,7 @@ export interface AgentListItemProps extends AgentListItemBaseProps {
   variant?: "workspace";
   metadata: FrontendWorkspaceMetadata;
   projectName: string;
-  subAgentConnectorLayout?: "default" | "task-group-member";
+  subAgentConnectorLayout?: SubAgentConnectorLayout;
   isArchiving?: boolean;
   /** True when deletion is in-flight (optimistic UI while backend removes). */
   isRemoving?: boolean;
@@ -118,30 +129,17 @@ export interface DraftAgentListItemProps extends AgentListItemBaseProps {
  * before react-dnd has locked into a drag session.
  */
 const LIST_ITEM_BASE_CLASSES =
-  "bg-surface-primary relative flex items-start gap-1.5 rounded-l-sm py-2 pr-2 select-none transition-all duration-150";
+  "bg-surface-primary relative flex items-start gap-1.5 rounded-l-sm py-2 pr-1.5 select-none transition-all duration-150";
 
 const HIDE_INLINE_ACTIONS_ON_MOBILE_TOUCH =
   "[@media(max-width:768px)_and_(hover:none)_and_(pointer:coarse)]:invisible [@media(max-width:768px)_and_(hover:none)_and_(pointer:coarse)]:pointer-events-none";
 const SHOW_INLINE_ACTIONS_ON_WIDE_TOUCH =
   "[@media(min-width:769px)_and_(hover:none)_and_(pointer:coarse)]:opacity-100";
 
-/** Calculate left padding based on nesting depth */
-function getItemPaddingLeft(depth?: number): number {
-  const safeDepth = typeof depth === "number" && Number.isFinite(depth) ? Math.max(0, depth) : 0;
-  return 8 + Math.min(32, safeDepth) * 12;
-}
-
-function getSubAgentConnectorLeft(
-  indentLeft: number,
-  layout: "default" | "task-group-member"
-): number {
-  return layout === "task-group-member" ? indentLeft - 2 : indentLeft + 9;
-}
-
-function getAncestorTrunkLeft(depth: number, layout: "default" | "task-group-member"): number {
-  const indentLeft = getItemPaddingLeft(depth);
-  return layout === "task-group-member" ? indentLeft + 6 : indentLeft + 8;
-}
+const LEADING_SLOT_CONTAINER_STYLE = {
+  width: SIDEBAR_LEADING_SLOT_SIZE_PX,
+  height: SIDEBAR_LEADING_SLOT_SIZE_PX,
+} as const;
 
 type VisualState = "active" | "idle" | "seen" | "hidden" | "error" | "question";
 
@@ -191,7 +189,9 @@ function isStatusDotVisible(state: VisualState, isDraft?: boolean, isSubAgent?: 
 }
 
 const LEADING_SLOT_CONTAINER_CLASSES =
-  "relative z-20 flex h-4 w-4 shrink-0 items-center justify-center self-center";
+  "relative z-1 flex shrink-0 items-center justify-center self-center";
+const STATUS_DOT_SLOT_CONTAINER_CLASSES =
+  "relative z-20 flex shrink-0 items-center justify-center self-center";
 
 function HeartbeatFallbackIcon() {
   return (
@@ -235,7 +235,8 @@ function StatusDot(props: {
     <div
       // Keep the status dot above sub-agent connector overlays so branch lines do
       // not draw across the dot when rows are nested.
-      className={LEADING_SLOT_CONTAINER_CLASSES}
+      className={STATUS_DOT_SLOT_CONTAINER_CLASSES}
+      style={LEADING_SLOT_CONTAINER_STYLE}
     >
       {dot}
       {props.overlay && (
@@ -252,7 +253,7 @@ function QuickArchiveButton(props: {
   onArchiveWorkspace: (button: HTMLElement) => void;
 }) {
   return (
-    <div className={LEADING_SLOT_CONTAINER_CLASSES}>
+    <div className={LEADING_SLOT_CONTAINER_CLASSES} style={LEADING_SLOT_CONTAINER_STYLE}>
       <Tooltip>
         <TooltipTrigger asChild>
           <button
@@ -295,7 +296,7 @@ function ActionButtonWrapper(props: { children: React.ReactNode; className?: str
 
 function DraftAgentListItemInner(props: DraftAgentListItemProps) {
   const { projectPath, isSelected, depth, sectionId, draft } = props;
-  const paddingLeft = getItemPaddingLeft(depth);
+  const paddingLeft = getSidebarItemPaddingLeft(depth);
   const hasPromptPreview = draft.promptPreview.length > 0;
   const draftBorderStyle: React.CSSProperties = {
     backgroundImage: [
@@ -314,7 +315,7 @@ function DraftAgentListItemInner(props: DraftAgentListItemProps) {
     <div
       className={cn(
         LIST_ITEM_BASE_CLASSES,
-        sectionId != null ? "ml-8" : "ml-6.5",
+        sectionId != null ? "ml-2" : "ml-0",
         "cursor-pointer pl-1 hover:bg-surface-secondary [&:hover_button]:opacity-100",
         isSelected && "bg-surface-secondary"
       )}
@@ -442,7 +443,6 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
 
   // Destructure metadata for convenience
   const { id: workspaceId, namedWorkspacePath } = metadata;
-  const isMuxHelpChat = workspaceId === MUX_HELP_CHAT_WORKSPACE_ID;
   const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
   const isInitializing = metadata.isInitializing === true;
   const isRemoving = isRemovingProp === true || metadata.isRemoving === true;
@@ -470,11 +470,15 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
 
   // Display title (fallback to name for legacy workspaces without title)
   const workspaceTitle = metadata.title ?? metadata.name;
-  const variantLabel =
-    getTaskGroupKindFromMetadata(metadata.bestOf) === TASK_GROUP_KIND.VARIANTS
-      ? normalizeTaskGroupLabel(metadata.bestOf?.label)
+  // Derive a short group label for grouped task children: explicit label for variants,
+  // alphabetical letter (A, B, C…) for best-of-n candidates.
+  const groupLabel =
+    metadata.bestOf != null
+      ? getTaskGroupKindFromMetadata(metadata.bestOf) === TASK_GROUP_KIND.VARIANTS
+        ? normalizeTaskGroupLabel(metadata.bestOf.label)
+        : String.fromCharCode(65 + (metadata.bestOf.index ?? 0))
       : undefined;
-  const displayTitle = variantLabel ? `${variantLabel} · ${workspaceTitle}` : workspaceTitle;
+  const displayTitle = groupLabel ? `${groupLabel} · ${workspaceTitle}` : workspaceTitle;
   const isEditing = editingWorkspaceId === workspaceId;
 
   const linkSharingEnabled = useLinkSharingEnabled();
@@ -590,7 +594,14 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
   } = useWorkspaceSidebarState(workspaceId);
 
   const fallbackModel = useWorkspaceFallbackModel(workspaceId);
-  const isWorking = (canInterrupt || isStarting) && !awaitingUserQuestion;
+  const streamingStatusPhase = getWorkspaceStreamingStatusPhase({
+    canInterrupt,
+    isStarting,
+    isCreating: isInitializing,
+  });
+  const { displayPhase: displayStreamingStatusPhase } =
+    useWorkspaceStreamingStatusPhase(streamingStatusPhase);
+  const isWorking = displayStreamingStatusPhase !== null && !awaitingUserQuestion;
   const hasError = lastAbortReason?.reason === "system";
   const visualState = getVisualState({
     awaitingUserQuestion,
@@ -598,7 +609,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     isRemoving,
     isArchiving: isArchiving === true,
     isWorking,
-    isStarting,
+    isStarting: displayStreamingStatusPhase === "starting",
     isUnread,
     isSelected,
     hasError,
@@ -606,7 +617,10 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
   const isSubAgentRow = rowRenderMeta?.rowKind === "subagent";
   const showsVisibleStatusDot = isStatusDotVisible(visualState, false, isSubAgentRow);
   const hasStatusText =
-    Boolean(agentStatus) || awaitingUserQuestion || isWorking || isInitializing || isRemoving;
+    Boolean(agentStatus) ||
+    awaitingUserQuestion ||
+    displayStreamingStatusPhase !== null ||
+    isRemoving;
   // Keep archiving feedback inline with the title so the row doesn't jump to a
   // two-line layout right before it disappears from the sidebar.
   const shouldShowInlineArchivingStatus = isArchiving === true && !isRemoving;
@@ -625,7 +639,6 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
   const shouldShowQuickArchiveButton =
     !isDisabled &&
     !isEditing &&
-    !isMuxHelpChat &&
     !isSubAgentRow &&
     !showCompletedChildrenIndicator &&
     !showsVisibleStatusDot;
@@ -652,7 +665,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
         ? "text-content-tertiary"
         : "text-content-primary";
 
-  const paddingLeft = getItemPaddingLeft(depth);
+  const paddingLeft = getSidebarItemPaddingLeft(depth);
 
   // Drag handle for moving workspace between sections
   const [{ isDragging }, drag, dragPreview] = useDrag(
@@ -687,7 +700,9 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
         className={cn(
           LIST_ITEM_BASE_CLASSES,
           "group/row",
-          sectionId != null ? "ml-7.5" : "ml-5",
+          // No left margin — status dot aligns with the project folder icon.
+          // Section members get a small indent for visual grouping.
+          sectionId != null ? "ml-2" : "ml-0",
           isDragging && "opacity-50",
           isRemoving && "opacity-70",
           // Keep hover styles enabled for initializing workspaces so the row feels interactive.
@@ -778,7 +793,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
         data-section-id={sectionId ?? ""}
       >
         {shouldShowHeartbeatFallback ? (
-          <div className={LEADING_SLOT_CONTAINER_CLASSES}>
+          <div className={STATUS_DOT_SLOT_CONTAINER_CLASSES} style={LEADING_SLOT_CONTAINER_STYLE}>
             <HeartbeatFallbackIcon />
           </div>
         ) : shouldShowQuickArchiveButton ? (
@@ -898,9 +913,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                   <WorkspaceActionsMenuContent
                     onEditTitle={startEditing}
                     onConfigureHeartbeat={
-                      workspaceHeartbeatsEnabled && !isMuxHelpChat
-                        ? () => setHeartbeatModalOpen(true)
-                        : null
+                      workspaceHeartbeatsEnabled ? () => setHeartbeatModalOpen(true) : null
                     }
                     onStopRuntime={
                       isRuntimeRunning && onStopRuntime
@@ -920,7 +933,6 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                     }}
                     onCloseMenu={() => ctxMenu.close()}
                     linkSharingEnabled={linkSharingEnabled === true}
-                    isMuxHelpChat={isMuxHelpChat}
                   />
                   {!isSelected && !isUnread && (
                     <PositionedMenuItem
@@ -968,7 +980,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                   />
                 </PopoverContent>
               </Popover>
-              {workspaceHeartbeatsEnabled && !isMuxHelpChat && (
+              {workspaceHeartbeatsEnabled && (
                 <WorkspaceHeartbeatModal
                   workspaceId={workspaceId}
                   open={heartbeatModalOpen}
@@ -1013,7 +1025,14 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                 data-workspace-id={workspaceId}
               />
             ) : (
-              <div className="flex min-w-0 items-center gap-1">
+              <div className="flex min-w-0 items-baseline gap-1">
+                {/* Group label (variant name or A/B/C letter) rendered as a non-shrinkable
+                    badge so it stays visible even when the sidebar is narrow.
+                    items-baseline keeps the 12px label on the same text baseline as the
+                    14px title so they look naturally aligned despite the size difference. */}
+                {groupLabel && (
+                  <span className="text-muted shrink-0 text-[12px] leading-6">{groupLabel}</span>
+                )}
                 <span
                   className={cn(
                     "min-w-0 flex-1 truncate text-left text-[14px] leading-6 transition-colors duration-200",
@@ -1022,7 +1041,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                     titleColorClass
                   )}
                 >
-                  {displayTitle}
+                  {workspaceTitle}
                 </span>
               </div>
             )}
@@ -1104,15 +1123,12 @@ function AgentListItemInner(props: UnifiedAgentListItemProps) {
     // Connector geometry is driven by render metadata so visible siblings keep
     // consistent single/middle/last shapes as parents expand/collapse children.
     const isElbowActive = props.metadata.taskStatus === "running";
-    // Task-group members use a slightly different left rail so their connector
-    // trunk aligns with the group's leading chevron column.
     const connectorLayout = props.subAgentConnectorLayout ?? "default";
-    const connectorLeft = getSubAgentConnectorLeft(
-      getItemPaddingLeft(props.depth),
-      connectorLayout
-    );
+    const connectorDepth = props.depth ?? rowMeta.depth;
+    const connectorRailX = getSubAgentParentRailX(connectorDepth, connectorLayout);
+    const childStatusCenterX = getSubAgentChildStatusCenterX(connectorDepth);
     const ancestorTrunks = rowMeta.ancestorTrunks.map((trunk) => ({
-      left: getAncestorTrunkLeft(trunk.depth, connectorLayout),
+      left: getAncestorRailX(trunk.depth, connectorLayout),
       active: trunk.active,
     }));
 
@@ -1123,7 +1139,8 @@ function AgentListItemInner(props: UnifiedAgentListItemProps) {
         sharedTrunkActiveThroughRow={rowMeta.sharedTrunkActiveThroughRow}
         sharedTrunkActiveBelowRow={rowMeta.sharedTrunkActiveBelowRow}
         ancestorTrunks={ancestorTrunks}
-        connectorLeft={connectorLeft}
+        connectorRailX={connectorRailX}
+        childStatusCenterX={childStatusCenterX}
         isSelected={props.isSelected}
         isElbowActive={isElbowActive}
       >

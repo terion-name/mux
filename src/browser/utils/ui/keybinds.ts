@@ -286,7 +286,9 @@ export const KEYBINDS = {
   TOGGLE_AGENT: { key: "A", ctrl: true, shift: true },
 
   /** Cycle to next manual agent without opening picker */
-  CYCLE_AGENT: { key: ".", ctrl: true },
+  // Use the physical Period key so Cmd+. keeps working on macOS and layouts
+  // where KeyboardEvent.key varies for this shortcut.
+  CYCLE_AGENT: { key: ".", code: "Period", ctrl: true, allowShift: true },
 
   /** Send message / Submit form */
   SEND_MESSAGE: { key: "Enter" },
@@ -380,10 +382,6 @@ export const KEYBINDS = {
   /** Open Command Palette directly in command mode (prefills ">") */
   // F4 avoids browser-level collisions with Ctrl/Cmd+Shift+P in Firefox.
   OPEN_COMMAND_PALETTE_ACTIONS: { key: "F4" },
-
-  /** Open Chat with Mux */
-  // User requested F1 for quick access to the built-in help chat.
-  OPEN_MUX_CHAT: { key: "F1" },
 
   /** Toggle thinking level between off and last-used value for current model */
   // Saves/restores thinking level per model (defaults to "medium" if not found)

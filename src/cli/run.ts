@@ -79,8 +79,10 @@ import { buildEphemeralRunConfig } from "./runTrust";
 import { resolveConfiguredProjectPathForTrust } from "../node/utils/projectTrust";
 import { buildExperimentsObject } from "./runOptions";
 
-// Display labels for CLI help (OFF, LOW, MED, HIGH, MAX)
-const THINKING_LABELS_LIST = Object.values(THINKING_DISPLAY_LABELS).join(", ");
+// Display labels for CLI help (OFF, LOW, MED, HIGH, MAX).
+// Deduplicate because xhigh and max both display as "MAX" for default/Anthropic
+// models; the distinction only matters at the provider boundary (OpenAI / Opus 4.7).
+const THINKING_LABELS_LIST = [...new Set(Object.values(THINKING_DISPLAY_LABELS))].join(", ");
 
 type CLIMode = "plan" | "exec";
 

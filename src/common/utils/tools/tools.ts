@@ -1,4 +1,5 @@
-import { type Tool } from "ai";
+import { type LanguageModel, type Tool } from "ai";
+import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { createFileReadTool } from "@/node/services/tools/file_read";
 import { createAttachFileTool } from "@/node/services/tools/attach_file";
@@ -10,6 +11,7 @@ import { createFileEditReplaceStringTool } from "@/node/services/tools/file_edit
 // DISABLED: import { createFileEditReplaceLinesTool } from "@/node/services/tools/file_edit_replace_lines";
 import { createFileEditInsertTool } from "@/node/services/tools/file_edit_insert";
 import { createAskUserQuestionTool } from "@/node/services/tools/ask_user_question";
+import { createAdvisorTool } from "@/node/services/tools/advisor";
 import { createProposePlanTool } from "@/node/services/tools/propose_plan";
 import { createTodoWriteTool, createTodoReadTool } from "@/node/services/tools/todo";
 import { createNotifyTool } from "@/node/services/tools/notify";
@@ -54,9 +56,34 @@ import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { FileState } from "@/node/services/agentSession";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { ModelMessage } from "@/common/types/message";
 import type { ProjectRef } from "@/common/types/workspace";
 import type { LspManager } from "@/node/services/lsp/lspManager";
 import type { LspPolicyContext } from "@/node/services/lsp/types";
+
+export interface ToolModelUsageEvent {
+  source: "tool";
+  toolName: string;
+  model: string;
+  usage: LanguageModelV2Usage;
+  providerMetadata?: Record<string, unknown>;
+  toolCallId?: string;
+  timestamp: number;
+}
+
+export interface AdvisorToolCallSnapshot {
+  toolCallId: string;
+  toolName: "advisor";
+  input: Record<string, unknown>;
+  stepText: string;
+  stepReasoning: string;
+}
+
+export interface AdvisorStepCaptureRef {
+  currentStepText: string;
+  currentStepReasoning: string;
+  frozenSnapshotsByToolCallId: Map<string, AdvisorToolCallSnapshot>;
+}
 
 /**
  * Configuration for tools that need runtime context
@@ -103,6 +130,8 @@ export interface ToolConfiguration {
   onFilesMutated?: (params: { filePaths: string[] }) => Promise<string | undefined>;
   /** Callback to notify that provider/config was written (triggers hot-reload). */
   onConfigChanged?: () => void;
+  /** Best-effort callback for recording tool-initiated model usage in session totals. */
+  reportModelUsage?: (event: ToolModelUsageEvent) => void;
   /** Task orchestration for sub-agent tasks */
   taskService?: TaskService;
   /** Enable agent_report tool (only valid for child task workspaces) */
@@ -122,6 +151,25 @@ export interface ToolConfiguration {
   /** Analytics service for raw SQL queries against DuckDB analytics data */
   analyticsService?: {
     executeRawQuery(sql: string): Promise<unknown>;
+  };
+  /** Runtime bundle for the advisor tool (present only when advisor is eligible for this stream). */
+  advisorRuntime?: {
+    /** The advisor model string (e.g. "anthropic:claude-sonnet-4-20250514") */
+    advisorModelString: string;
+    /** Optional reasoning/thinking level metadata for the advisor request. */
+    reasoningLevel?: string;
+    /** Normalized max uses per turn: null = unlimited, positive integer = exact cap */
+    maxUsesPerTurn: number | null;
+    /** Normalized max output tokens cap for advisor responses: undefined = unlimited, positive integer = explicit cap */
+    maxOutputTokens?: number;
+    /** Returns the live conversation transcript up to the current tool call */
+    getTranscriptSnapshot: () => ModelMessage[];
+    /** Returns the frozen same-step capture snapshot for a specific advisor tool call, if available. */
+    takeToolCallSnapshot: (toolCallId: string) => AdvisorToolCallSnapshot | undefined;
+    /** Creates a LanguageModel from a model string (delegates to providerModelFactory) */
+    createModel: (modelString: string) => Promise<LanguageModel>;
+    /** The abort signal from the parent stream */
+    abortSignal: AbortSignal;
   };
   /** Desktop session manager for desktop automation tools */
   desktopSessionManager?: DesktopSessionManager;
@@ -397,6 +445,7 @@ export async function getToolsForModel(
     mux_config_write: createMuxConfigWriteTool(config),
     skills_catalog_search: createSkillsCatalogSearchTool(config),
     skills_catalog_read: createSkillsCatalogReadTool(config),
+    ...(config.advisorRuntime ? { advisor: createAdvisorTool(config) } : {}),
     ask_user_question: createAskUserQuestionTool(config),
     propose_plan: createProposePlanTool(config),
     // propose_name is intentionally NOT registered here — it's only used by
@@ -512,6 +561,7 @@ export async function getToolsForModel(
         config.lspManager != null &&
         config.lspPolicyContext != null &&
         config.lspQueryEnabled === true,
+      enableAdvisor: Boolean(config.advisorRuntime),
       // Mux global tools are always created; tool policy (agent frontmatter)
       // controls which agents can actually use them.
       enableMuxGlobalAgentsTools: true,
@@ -546,5 +596,8 @@ export async function getToolsForModel(
   // Then apply model-only notifications (adds notifications to results)
   finalTools = wrapToolsWithModelOnlyNotifications(finalTools, config);
 
-  return finalTools;
+  // Sort tool names so provider prompt cache prefixes stay byte-identical
+  // across turns, even when tool composition sources are assembled in a
+  // different order.
+  return Object.fromEntries(Object.entries(finalTools).sort(([a], [b]) => a.localeCompare(b)));
 }

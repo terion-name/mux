@@ -366,6 +366,20 @@ export const BashOutputEventSchema = z.object({
 });
 
 /**
+ * UI-only advisor progress update for live phase display.
+ *
+ * This is intentionally NOT part of the tool result returned to the model.
+ * It is streamed over workspace.onChat so the UI can show honest advisor progress.
+ */
+export const AdvisorPhaseEventSchema = z.object({
+  type: z.literal("advisor-phase"),
+  workspaceId: z.string(),
+  toolCallId: z.string(),
+  phase: z.enum(["preparing_context", "waiting_for_response", "finalizing_result"]),
+  timestamp: z.number().meta({ description: "When the phase changed (Date.now())" }),
+});
+
+/**
  * UI-only notification that a task tool call has created a child workspace.
  *
  * This is intentionally NOT part of the tool result returned to the model.
@@ -468,6 +482,10 @@ export const InitStartEventSchema = z.object({
   type: z.literal("init-start"),
   hookPath: z.string(),
   timestamp: z.number(),
+  replay: z
+    .boolean()
+    .optional()
+    .meta({ description: "True when this event is emitted during init replay" }),
 });
 
 export const InitOutputEventSchema = z.object({
@@ -475,12 +493,26 @@ export const InitOutputEventSchema = z.object({
   line: z.string(),
   timestamp: z.number(),
   isError: z.boolean().optional(),
+  lineNumber: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .meta({ description: "Monotonic line index within the current init run" }),
+  replay: z
+    .boolean()
+    .optional()
+    .meta({ description: "True when this event is emitted during init replay" }),
 });
 
 export const InitEndEventSchema = z.object({
   type: z.literal("init-end"),
   exitCode: z.number(),
   timestamp: z.number(),
+  replay: z
+    .boolean()
+    .optional()
+    .meta({ description: "True when this event is emitted during init replay" }),
   /** Number of lines dropped from middle when output exceeded limit (omitted if 0) */
   truncatedLines: z.number().optional(),
 });
@@ -550,6 +582,7 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   ToolCallEndEventSchema,
   BashOutputEventSchema,
   TaskCreatedEventSchema,
+  AdvisorPhaseEventSchema,
   // Reasoning events
   ReasoningDeltaEventSchema,
   ReasoningEndEventSchema,
@@ -609,6 +642,7 @@ export const ToolPolicySchema = z.array(ToolPolicyFilterSchema).meta({
 export const ExperimentsSchema = z.object({
   programmaticToolCalling: z.boolean().optional(),
   programmaticToolCallingExclusive: z.boolean().optional(),
+  advisorTool: z.boolean().optional(),
   system1: z.boolean().optional(),
   lspQuery: z.boolean().optional(),
   execSubagentHardRestart: z.boolean().optional(),

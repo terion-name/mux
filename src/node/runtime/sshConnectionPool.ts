@@ -18,6 +18,7 @@ import * as crypto from "crypto";
 import * as path from "path";
 import * as os from "os";
 import { spawn } from "child_process";
+import { sleepWithAbort } from "@/node/utils/abort";
 import { HOST_KEY_APPROVAL_TIMEOUT_MS } from "@/common/constants/ssh";
 import { formatSshEndpoint } from "@/common/utils/ssh/formatSshEndpoint";
 import { log } from "@/node/services/log";
@@ -31,6 +32,10 @@ let hostKeyPolicyMode: OpenSSHHostKeyPolicyMode = "headless-fallback";
 
 export function setSshPromptService(svc: SshPromptService | undefined): void {
   sshPromptService = svc;
+}
+
+export function getSshPromptService(): SshPromptService | undefined {
+  return sshPromptService;
 }
 
 export function setOpenSSHHostKeyPolicyMode(mode: OpenSSHHostKeyPolicyMode): void {
@@ -135,6 +140,12 @@ export interface AcquireConnectionOptions {
   onWait?: (waitMs: number) => void;
 
   /**
+   * Optional explicit ControlPath to probe/bootstrap before returning. When omitted,
+   * the default host-scoped ControlPath is used.
+   */
+  controlPath?: string;
+
+  /**
    * Test seam.
    *
    * If provided, this is used for sleeping between wait cycles.
@@ -142,29 +153,50 @@ export interface AcquireConnectionOptions {
   sleep?: (ms: number, abortSignal?: AbortSignal) => Promise<void>;
 }
 
-async function sleepWithAbort(ms: number, abortSignal?: AbortSignal): Promise<void> {
-  if (ms <= 0) return;
+async function waitForPromiseWithTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  abortSignal?: AbortSignal,
+  timeoutError?: Error
+): Promise<T> {
   if (abortSignal?.aborted) {
     throw new Error("Operation aborted");
   }
 
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      cleanup();
-      resolve();
-    }, ms);
-
-    const onAbort = () => {
-      cleanup();
-      reject(new Error("Operation aborted"));
-    };
+  return await new Promise<T>((resolve, reject) => {
+    let settled = false;
 
     const cleanup = () => {
       clearTimeout(timer);
       abortSignal?.removeEventListener("abort", onAbort);
     };
 
+    const finish = (handler: () => void) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      handler();
+    };
+
+    const onAbort = () => {
+      finish(() => reject(new Error("Operation aborted")));
+    };
+
+    const timer = setTimeout(() => {
+      finish(() => reject(timeoutError ?? new Error("Operation timed out")));
+    }, timeoutMs);
+
     abortSignal?.addEventListener("abort", onAbort);
+    promise.then(
+      (value) => {
+        finish(() => resolve(value));
+      },
+      (error) => {
+        finish(() => reject(error instanceof Error ? error : new Error(String(error))));
+      }
+    );
   });
 }
 
@@ -179,6 +211,7 @@ async function sleepWithAbort(ms: number, abortSignal?: AbortSignal): Promise<vo
  */
 export class SSHConnectionPool {
   private health = new Map<string, ConnectionHealth>();
+  private readyControlPaths = new Map<string, Set<string>>();
   private inflight = new Map<string, Promise<void>>();
 
   /**
@@ -210,7 +243,15 @@ export class SSHConnectionPool {
     const shouldWait = maxWaitMs > 0;
 
     const key = makeConnectionKey(config);
+    const requestedControlPath = options.controlPath ?? getControlPath(config);
     const startTime = Date.now();
+    const getRemainingWaitBudgetMs = (): number =>
+      Math.max(0, maxWaitMs - (Date.now() - startTime));
+    const createWaitBudgetExceededError = (lastError?: string): Error =>
+      new Error(
+        `SSH connection to ${config.host} did not become healthy within ${maxWaitMs}ms. ` +
+          `Last error: ${lastError ?? "unknown"}`
+      );
 
     while (true) {
       if (options.abortSignal?.aborted) {
@@ -231,13 +272,9 @@ export class SSHConnectionPool {
           );
         }
 
-        const elapsedMs = Date.now() - startTime;
-        const budgetMs = Math.max(0, maxWaitMs - elapsedMs);
+        const budgetMs = getRemainingWaitBudgetMs();
         if (budgetMs <= 0) {
-          throw new Error(
-            `SSH connection to ${config.host} did not become healthy within ${maxWaitMs}ms. ` +
-              `Last error: ${health.lastError ?? "unknown"}`
-          );
+          throw createWaitBudgetExceededError(health.lastError);
         }
 
         const waitMs = Math.min(remainingMs, budgetMs);
@@ -249,13 +286,21 @@ export class SSHConnectionPool {
       // Return immediately if known healthy and not stale.
       if (health?.status === "healthy") {
         const age = Date.now() - (health.lastSuccess?.getTime() ?? 0);
-        if (age < HEALTHY_TTL_MS) {
+        const specificMasterReady =
+          options.controlPath == null ? true : this.isControlPathReady(key, requestedControlPath);
+        if (age < HEALTHY_TTL_MS && specificMasterReady) {
           log.debug(`SSH connection to ${config.host} is known healthy, skipping probe`);
           return;
         }
-        log.debug(
-          `SSH connection to ${config.host} health is stale (${Math.round(age / 1000)}s), re-probing`
-        );
+        if (!specificMasterReady) {
+          log.debug(
+            `SSH connection to ${config.host} is healthy, but ControlPath ${requestedControlPath} is not ready; bootstrapping it now`
+          );
+        } else {
+          log.debug(
+            `SSH connection to ${config.host} health is stale (${Math.round(age / 1000)}s), re-probing`
+          );
+        }
       }
 
       // Check for inflight probe - singleflighting.
@@ -263,11 +308,28 @@ export class SSHConnectionPool {
       if (existing) {
         log.debug(`SSH connection to ${config.host} has inflight probe, waiting...`);
         try {
-          await existing;
-          return;
+          if (shouldWait) {
+            const budgetMs = getRemainingWaitBudgetMs();
+            if (budgetMs <= 0) {
+              throw createWaitBudgetExceededError(health?.lastError);
+            }
+            await waitForPromiseWithTimeout(
+              existing,
+              budgetMs,
+              options.abortSignal,
+              createWaitBudgetExceededError(health?.lastError)
+            );
+          } else {
+            await existing;
+          }
+          continue;
         } catch (error) {
           // Probe failed; if we're in wait mode we'll loop and sleep through the backoff.
-          if (!shouldWait) {
+          if (
+            !shouldWait ||
+            (error instanceof Error &&
+              error.message.includes(`did not become healthy within ${maxWaitMs}ms`))
+          ) {
             throw error;
           }
           continue;
@@ -275,8 +337,14 @@ export class SSHConnectionPool {
       }
 
       // Start new probe.
+      const probeTimeoutMs = shouldWait
+        ? Math.min(timeoutMs, getRemainingWaitBudgetMs())
+        : timeoutMs;
+      if (probeTimeoutMs <= 0) {
+        throw createWaitBudgetExceededError(health?.lastError);
+      }
       log.debug(`SSH connection to ${config.host} needs probe, starting health check`);
-      const probe = this.probeConnection(config, timeoutMs, key);
+      const probe = this.probeConnection(config, probeTimeoutMs, key, requestedControlPath);
       this.inflight.set(key, probe);
 
       try {
@@ -298,6 +366,20 @@ export class SSHConnectionPool {
         this.inflight.delete(key);
       }
     }
+  }
+
+  private isControlPathReady(key: string, controlPath: string): boolean {
+    return this.readyControlPaths.get(key)?.has(controlPath) === true;
+  }
+
+  private markControlPathReady(key: string, controlPath: string): void {
+    const readyPaths = this.readyControlPaths.get(key) ?? new Set<string>();
+    readyPaths.add(controlPath);
+    this.readyControlPaths.set(key, readyPaths);
+  }
+
+  private clearReadyControlPaths(key: string): void {
+    this.readyControlPaths.delete(key);
   }
 
   /**
@@ -325,6 +407,7 @@ export class SSHConnectionPool {
       health.backoffUntil = undefined;
       health.consecutiveFailures = 0;
       health.status = "unknown";
+      this.clearReadyControlPaths(key);
       log.info(`Reset backoff for SSH connection to ${config.host}`);
     }
   }
@@ -368,6 +451,7 @@ export class SSHConnectionPool {
     const backoffIndex = Math.min(failures - 1, BACKOFF_SCHEDULE.length - 1);
     const backoffSecs = withJitter(BACKOFF_SCHEDULE[backoffIndex]);
 
+    this.clearReadyControlPaths(key);
     this.health.set(key, {
       status: "unhealthy",
       lastFailure: new Date(),
@@ -387,6 +471,7 @@ export class SSHConnectionPool {
    */
   clearAllHealth(): void {
     this.health.clear();
+    this.readyControlPaths.clear();
     this.inflight.clear();
   }
 
@@ -396,9 +481,9 @@ export class SSHConnectionPool {
   private async probeConnection(
     config: SSHConnectionConfig,
     timeoutMs: number,
-    key: string
+    key: string,
+    controlPath = getControlPath(config)
   ): Promise<void> {
-    const controlPath = getControlPath(config);
     const promptService = sshPromptService;
     const canPromptInteractively = isInteractiveHostKeyApprovalAvailable();
 
@@ -504,6 +589,7 @@ export class SSHConnectionPool {
 
         if (code === 0) {
           this.markHealthyByKey(key);
+          this.markControlPathReady(key, controlPath);
           log.debug(`SSH probe to ${config.host} succeeded`);
           resolve();
         } else {

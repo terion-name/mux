@@ -53,6 +53,7 @@ import {
   type WorktreeArchiveBehavior,
 } from "@/common/config/worktreeArchiveBehavior";
 import { PlatformPaths } from "@/common/utils/paths";
+import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
 import {
   isValidModelFormat,
   normalizeSelectedModel,
@@ -62,6 +63,7 @@ import { ensurePrivateDirSync } from "@/node/utils/fs";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { isProviderAutoRouteEligible } from "@/node/utils/providerRequirements";
 import { getContainerName as getDockerContainerName } from "@/node/runtime/DockerRuntime";
+import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
 
 // Re-export project/provider types from dedicated schema/types files (for preload usage)
 export type { Workspace, ProjectConfig, ProjectsConfig, ProviderConfig, CanonicalProvidersConfig };
@@ -317,6 +319,34 @@ function parseOptionalPort(value: unknown): number | undefined {
   }
 
   if (value < 0 || value > 65535) {
+    return undefined;
+  }
+
+  return value;
+}
+
+function parseOptionalPositiveInteger(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
+    return undefined;
+  }
+
+  if (value <= 0) {
+    return undefined;
+  }
+
+  return value;
+}
+
+function parseOptionalThinkingLevel(value: unknown): ThinkingLevel | undefined {
+  return coerceThinkingLevel(value);
+}
+
+function parseOptionalHeartbeatIntervalMs(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
+    return undefined;
+  }
+
+  if (value < HEARTBEAT_MIN_INTERVAL_MS || value > HEARTBEAT_MAX_INTERVAL_MS) {
     return undefined;
   }
 
@@ -685,6 +715,16 @@ export class Config {
         const routeOverrides = normalizeRouteOverridesRecord(parsed.routeOverrides);
 
         const defaultModel = normalizeOptionalModelString(parsed.defaultModel);
+        const advisorModelString = parseOptionalNonEmptyString(parsed.advisorModelString);
+        const advisorThinkingLevel = parseOptionalThinkingLevel(parsed.advisorThinkingLevel);
+        const advisorMaxUsesPerTurn =
+          parsed.advisorMaxUsesPerTurn === null
+            ? null
+            : parseOptionalPositiveInteger(parsed.advisorMaxUsesPerTurn);
+        const advisorMaxOutputTokens =
+          parsed.advisorMaxOutputTokens === null
+            ? null
+            : parseOptionalPositiveInteger(parsed.advisorMaxOutputTokens);
         const hiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);
         const legacySubagentAiDefaults = normalizeSubagentAiDefaults(parsed.subagentAiDefaults);
 
@@ -732,10 +772,18 @@ export class Config {
           taskSettings,
           muxGatewayEnabled,
           llmDebugLogs: parseOptionalBoolean(parsed.llmDebugLogs),
+          heartbeatDefaultPrompt: parseOptionalNonEmptyString(parsed.heartbeatDefaultPrompt),
+          heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs(
+            parsed.heartbeatDefaultIntervalMs
+          ),
           muxGatewayModels,
           routePriority,
           routeOverrides,
           defaultModel,
+          advisorModelString,
+          advisorThinkingLevel,
+          advisorMaxUsesPerTurn,
+          advisorMaxOutputTokens,
           hiddenModels,
           agentAiDefaults,
           // Legacy fields are still parsed and returned for downgrade compatibility.
@@ -803,6 +851,18 @@ export class Config {
         data.llmDebugLogs = llmDebugLogs;
       }
 
+      const heartbeatDefaultPrompt = parseOptionalNonEmptyString(config.heartbeatDefaultPrompt);
+      if (heartbeatDefaultPrompt) {
+        data.heartbeatDefaultPrompt = heartbeatDefaultPrompt;
+      }
+
+      const heartbeatDefaultIntervalMs = parseOptionalHeartbeatIntervalMs(
+        config.heartbeatDefaultIntervalMs
+      );
+      if (heartbeatDefaultIntervalMs !== undefined) {
+        data.heartbeatDefaultIntervalMs = heartbeatDefaultIntervalMs;
+      }
+
       const muxGatewayModels = parseOptionalStringArray(config.muxGatewayModels);
       if (muxGatewayModels !== undefined) {
         data.muxGatewayModels = muxGatewayModels;
@@ -811,6 +871,34 @@ export class Config {
       const defaultModel = normalizeOptionalModelString(config.defaultModel);
       if (defaultModel !== undefined) {
         data.defaultModel = defaultModel;
+      }
+
+      const advisorModelString = parseOptionalNonEmptyString(config.advisorModelString);
+      if (advisorModelString !== undefined) {
+        data.advisorModelString = advisorModelString;
+      }
+
+      const advisorThinkingLevel = parseOptionalThinkingLevel(config.advisorThinkingLevel);
+      if (advisorThinkingLevel !== undefined) {
+        data.advisorThinkingLevel = advisorThinkingLevel;
+      }
+
+      if (config.advisorMaxUsesPerTurn === null) {
+        data.advisorMaxUsesPerTurn = null;
+      } else {
+        const advisorMaxUsesPerTurn = parseOptionalPositiveInteger(config.advisorMaxUsesPerTurn);
+        if (advisorMaxUsesPerTurn !== undefined) {
+          data.advisorMaxUsesPerTurn = advisorMaxUsesPerTurn;
+        }
+      }
+
+      if (config.advisorMaxOutputTokens === null) {
+        data.advisorMaxOutputTokens = null;
+      } else {
+        const advisorMaxOutputTokens = parseOptionalPositiveInteger(config.advisorMaxOutputTokens);
+        if (advisorMaxOutputTokens !== undefined) {
+          data.advisorMaxOutputTokens = advisorMaxOutputTokens;
+        }
       }
 
       const hiddenModels = normalizeOptionalModelStringArray(config.hiddenModels);

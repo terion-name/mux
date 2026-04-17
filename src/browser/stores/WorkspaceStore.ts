@@ -29,18 +29,27 @@ import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { useCallback, useSyncExternalStore } from "react";
 import {
   isCaughtUpMessage,
+  isStreamAbort,
   isStreamError,
+  isStreamLifecycle,
   isDeleteMessage,
+  isInitEnd,
+  isInitOutput,
+  isInitStart,
+  isAdvisorPhaseEvent,
   isBashOutputEvent,
   isTaskCreatedEvent,
   isMuxMessage,
   isQueuedMessageChanged,
   isRestoreToInput,
+  isRuntimeStatus,
 } from "@/common/orpc/types";
 import {
+  type AdvisorPhaseEvent,
   type StreamAbortEvent,
   type StreamAbortReasonSnapshot,
   type StreamEndEvent,
+  type StreamStartEvent,
   type RuntimeStatusEvent,
 } from "@/common/types/stream";
 import { MapStore } from "./MapStore";
@@ -124,6 +133,9 @@ export interface WorkspaceSidebarState {
   awaitingUserQuestion: boolean;
   lastAbortReason: StreamAbortReasonSnapshot | null;
   currentModel: string | null;
+  // Requested model for the pending send so the sidebar keeps the same label while
+  // the turn transitions from pre-stream "starting" into the live stream.
+  pendingStreamModel: string | null;
   recencyTimestamp: number | null;
   loadedSkills: LoadedSkill[];
   skillLoadErrors: SkillLoadError[];
@@ -177,6 +189,11 @@ export interface WorkspaceConsumersState {
   topFilePaths?: Array<{ path: string; tokens: number }>; // Top 10 files aggregated across all file tools
 }
 
+export interface AdvisorLivePhaseState {
+  phase: AdvisorPhaseEvent["phase"];
+  timestamp: number;
+}
+
 interface WorkspaceChatTransientState {
   caughtUp: boolean;
   isHydratingTranscript: boolean;
@@ -185,6 +202,7 @@ interface WorkspaceChatTransientState {
   replayingHistory: boolean;
   queuedMessage: QueuedMessage | null;
   liveBashOutput: Map<string, LiveBashOutputInternal>;
+  liveAdvisorPhase: Map<string, AdvisorLivePhaseState>;
   liveTaskIds: Map<string, string[]>;
   autoRetryStatus: AutoRetryStatus | null;
 }
@@ -226,6 +244,42 @@ function createInitialHistoryPaginationState(): WorkspaceHistoryPaginationState 
   };
 }
 
+function getBufferedActiveStreamStart(
+  events: WorkspaceChatMessage[]
+): Pick<StreamStartEvent, "model" | "thinkingLevel"> | null {
+  let activeStreamStart: StreamStartEvent | null = null;
+
+  for (const event of events) {
+    if (!("type" in event)) {
+      continue;
+    }
+
+    if (event.type === "stream-start") {
+      activeStreamStart = event;
+      continue;
+    }
+
+    if (
+      activeStreamStart !== null &&
+      (event.type === "stream-end" ||
+        event.type === "stream-abort" ||
+        event.type === "stream-error") &&
+      event.messageId === activeStreamStart.messageId
+    ) {
+      activeStreamStart = null;
+    }
+  }
+
+  if (!activeStreamStart) {
+    return null;
+  }
+
+  return {
+    model: activeStreamStart.model,
+    thinkingLevel: activeStreamStart.thinkingLevel,
+  };
+}
+
 function createInitialChatTransientState(): WorkspaceChatTransientState {
   return {
     caughtUp: false,
@@ -235,6 +289,7 @@ function createInitialChatTransientState(): WorkspaceChatTransientState {
     replayingHistory: false,
     queuedMessage: null,
     liveBashOutput: new Map(),
+    liveAdvisorPhase: new Map(),
     liveTaskIds: new Map(),
     autoRetryStatus: null,
   };
@@ -702,35 +757,35 @@ export class WorkspaceStore {
     },
     "tool-call-end": (workspaceId, aggregator, data) => {
       const toolCallEnd = data as Extract<WorkspaceChatMessage, { type: "tool-call-end" }>;
+      const transient = this.chatTransientState.get(workspaceId);
 
       // Cleanup live bash output once the real tool result contains output.
       // If output is missing (e.g. tmpfile overflow), keep the tail buffer so the UI still shows something.
-      if (toolCallEnd.toolName === "bash") {
-        const transient = this.chatTransientState.get(workspaceId);
-        if (transient) {
-          const output = (toolCallEnd.result as { output?: unknown } | undefined)?.output;
-          if (typeof output === "string") {
-            transient.liveBashOutput.delete(toolCallEnd.toolCallId);
-          } else {
-            // If we keep the tail buffer, ensure we don't get stuck in "filtering" UI state.
-            const prev = transient.liveBashOutput.get(toolCallEnd.toolCallId);
-            if (prev?.phase === "filtering") {
-              const next = appendLiveBashOutputChunk(
-                prev,
-                { text: "", isError: false, phase: "output" },
-                BASH_TRUNCATE_MAX_TOTAL_BYTES
-              );
-              if (next !== prev) {
-                transient.liveBashOutput.set(toolCallEnd.toolCallId, next);
-              }
+      if (toolCallEnd.toolName === "bash" && transient) {
+        const output = (toolCallEnd.result as { output?: unknown } | undefined)?.output;
+        if (typeof output === "string") {
+          transient.liveBashOutput.delete(toolCallEnd.toolCallId);
+        } else {
+          // If we keep the tail buffer, ensure we don't get stuck in "filtering" UI state.
+          const prev = transient.liveBashOutput.get(toolCallEnd.toolCallId);
+          if (prev?.phase === "filtering") {
+            const next = appendLiveBashOutputChunk(
+              prev,
+              { text: "", isError: false, phase: "output" },
+              BASH_TRUNCATE_MAX_TOTAL_BYTES
+            );
+            if (next !== prev) {
+              transient.liveBashOutput.set(toolCallEnd.toolCallId, next);
             }
           }
         }
       }
 
-      // Cleanup ephemeral taskId storage once the actual tool result is available.
+      // Cleanup ephemeral advisor/task state once the actual tool result is available.
+      if (toolCallEnd.toolName === "advisor") {
+        transient?.liveAdvisorPhase.delete(toolCallEnd.toolCallId);
+      }
       if (toolCallEnd.toolName === "task") {
-        const transient = this.chatTransientState.get(workspaceId);
         transient?.liveTaskIds.delete(toolCallEnd.toolCallId);
       }
       applyWorkspaceChatEventToAggregator(aggregator, data);
@@ -1637,6 +1692,13 @@ export class WorkspaceStore {
     return state ?? null;
   }
 
+  getAdvisorToolLivePhase(
+    workspaceId: string,
+    toolCallId: string
+  ): AdvisorLivePhaseState | undefined {
+    return this.chatTransientState.get(workspaceId)?.liveAdvisorPhase.get(toolCallId);
+  }
+
   getTaskToolLiveTaskIds(workspaceId: string, toolCallId: string): string[] | null {
     const taskIds = this.chatTransientState.get(workspaceId)?.liveTaskIds.get(toolCallId);
     return taskIds ?? null;
@@ -1713,6 +1775,10 @@ export class WorkspaceStore {
       const aggregator = this.assertGet(workspaceId);
 
       const hasMessages = aggregator.hasMessages();
+      const displayedMessages = aggregator.getDisplayedMessages();
+      const hasRunningInitMessage = displayedMessages.some(
+        (message) => message.type === "workspace-init" && message.status === "running"
+      );
       const transient = this.assertChatTransientState(workspaceId);
       const historyPagination =
         this.historyPagination.get(workspaceId) ?? createInitialHistoryPaginationState();
@@ -1723,11 +1789,18 @@ export class WorkspaceStore {
       const metadata = this.workspaceMetadata.get(workspaceId);
       const pendingStreamStartTime = aggregator.getPendingStreamStartTime();
       const streamLifecycle = aggregator.getStreamLifecycle();
+      const bufferedActiveStreamStart =
+        isActiveWorkspace && !transient.caughtUp
+          ? getBufferedActiveStreamStart(transient.pendingStreamEvents)
+          : null;
       // Trust the live aggregator only when it is both active AND has finished
       // replaying historical events (caughtUp). During the replay window after a
       // workspace switch, the aggregator is cleared and re-hydrating; fall back to
-      // the activity snapshot so the UI continues to reflect the last known state
-      // (e.g., canInterrupt stays true for a workspace that is still streaming).
+      // the activity snapshot so the UI continues to reflect the last known state.
+      //
+      // Replayed stream-start events arrive on onChat before the authoritative caught-up marker.
+      // Surface that buffered active-stream context immediately so the transcript tail can show the
+      // live streaming barrier during hydration instead of inserting it a moment later.
       //
       // For non-active workspaces, the aggregator's activeStreams may be stale since
       // they don't receive stream-end events when unsubscribed from onChat. Prefer the
@@ -1736,31 +1809,46 @@ export class WorkspaceStore {
       const useAggregatorState = isActiveWorkspace && transient.caughtUp;
       const canInterrupt = useAggregatorState
         ? activeStreams.length > 0
-        : (activity?.streaming ?? activeStreams.length > 0);
+        : bufferedActiveStreamStart !== null
+          ? true
+          : (activity?.streaming ?? activeStreams.length > 0);
       const currentModel = useAggregatorState
         ? (aggregator.getCurrentModel() ?? null)
-        : (activity?.lastModel ?? aggregator.getCurrentModel() ?? null);
+        : (bufferedActiveStreamStart?.model ??
+          activity?.lastModel ??
+          aggregator.getCurrentModel() ??
+          null);
       const currentThinkingLevel = useAggregatorState
         ? (aggregator.getCurrentThinkingLevel() ?? null)
-        : (activity?.lastThinkingLevel ?? aggregator.getCurrentThinkingLevel() ?? null);
+        : (bufferedActiveStreamStart?.thinkingLevel ??
+          activity?.lastThinkingLevel ??
+          aggregator.getCurrentThinkingLevel() ??
+          null);
       const hasAuthoritativeStreamLifecycle =
         streamLifecycle !== null && streamLifecycle.phase !== "idle";
+      const activePendingStreamStartTime = isActiveWorkspace ? pendingStreamStartTime : null;
       const aggregatorRecency = aggregator.getRecencyTimestamp();
       const recencyTimestamp =
         aggregatorRecency === null
           ? (activity?.recency ?? null)
           : Math.max(aggregatorRecency, activity?.recency ?? aggregatorRecency);
-      // Treat the backend lifecycle as authoritative, but keep any optimistic
-      // pre-stream "starting" state scoped to the active, caught-up workspace.
-      // Inactive or replaying workspaces should derive status from authoritative
-      // activity instead of a sticky local pending-start timestamp.
+      // User rationale: a brand-new chat should show its startup barrier immediately instead of
+      // flashing "Catching up"/"No Messages Yet" while the very first send is still in flight.
+      // The aggregator owns both normal user-message startup and the optimistic new-chat handoff,
+      // so the workspace only needs to ask whether the active transcript still has a pending start.
       const isStreamStarting =
-        useAggregatorState &&
+        isActiveWorkspace &&
+        !canInterrupt &&
         (streamLifecycle?.phase === "preparing" ||
-          (!hasAuthoritativeStreamLifecycle && pendingStreamStartTime !== null)) &&
-        !canInterrupt;
+          (!hasAuthoritativeStreamLifecycle && activePendingStreamStartTime !== null));
+      // Only actively running init output should bypass transcript hydration. Completed init
+      // rows are still replayed, but they should not suppress the normal catch-up placeholder
+      // for stale cached transcript content on reconnect.
       const isHydratingTranscript =
-        isActiveWorkspace && transient.isHydratingTranscript && !transient.caughtUp;
+        isActiveWorkspace &&
+        transient.isHydratingTranscript &&
+        !transient.caughtUp &&
+        !hasRunningInitMessage;
       const aggregatorTodos = aggregator.getCurrentTodos();
       const displayStatus = useAggregatorState ? undefined : (activity?.displayStatus ?? undefined);
       const todoStatus = useAggregatorState
@@ -1781,13 +1869,13 @@ export class WorkspaceStore {
 
       return {
         name: metadata?.name ?? workspaceId, // Fall back to ID if metadata missing
-        messages: aggregator.getDisplayedMessages(),
+        messages: displayedMessages,
         queuedMessage: transient.queuedMessage,
         canInterrupt,
         isCompacting: aggregator.isCompacting(),
         isStreamStarting,
         awaitingUserQuestion: aggregator.hasAwaitingUserQuestion(),
-        loading: !hasMessages && !transient.caughtUp,
+        loading: !hasMessages && !hasRunningInitMessage && !transient.caughtUp,
         isHydratingTranscript,
         hasOlderHistory: historyPagination.hasOlder,
         loadingOlderHistory: historyPagination.loading,
@@ -1845,6 +1933,7 @@ export class WorkspaceStore {
       cached.awaitingUserQuestion === fullState.awaitingUserQuestion &&
       cached.lastAbortReason === fullState.lastAbortReason &&
       cached.currentModel === fullState.currentModel &&
+      cached.pendingStreamModel === fullState.pendingStreamModel &&
       cached.recencyTimestamp === fullState.recencyTimestamp &&
       cached.loadedSkills === fullState.loadedSkills &&
       cached.skillLoadErrors === fullState.skillLoadErrors &&
@@ -1865,6 +1954,7 @@ export class WorkspaceStore {
       awaitingUserQuestion: fullState.awaitingUserQuestion,
       lastAbortReason: fullState.lastAbortReason,
       currentModel: fullState.currentModel,
+      pendingStreamModel: fullState.pendingStreamModel,
       recencyTimestamp: fullState.recencyTimestamp,
       loadedSkills: fullState.loadedSkills,
       skillLoadErrors: fullState.skillLoadErrors,
@@ -3047,7 +3137,7 @@ export class WorkspaceStore {
       this.preReplayUsageSnapshot.delete(workspaceId);
     }
 
-    aggregator.clear();
+    aggregator.resetForReplay();
 
     // Reset per-workspace transient state so the next replay rebuilds from the backend source of truth.
     const previousTransient = this.chatTransientState.get(workspaceId);
@@ -3423,6 +3513,26 @@ export class WorkspaceStore {
     }
   }
 
+  markPendingInitialSend(workspaceId: string, pendingStreamModel: string | null): void {
+    const aggregator = this.aggregators.get(workspaceId);
+    if (!aggregator) {
+      return;
+    }
+
+    aggregator.markOptimisticPendingStreamStart(pendingStreamModel);
+    this.states.bump(workspaceId);
+  }
+
+  clearPendingInitialSendState(workspaceId: string): void {
+    const aggregator = this.aggregators.get(workspaceId);
+    if (aggregator?.getPendingStreamStartTime() == null) {
+      return;
+    }
+
+    aggregator.clearPendingStreamStart();
+    this.states.bump(workspaceId);
+  }
+
   /**
    * Remove a workspace and clean up subscriptions.
    */
@@ -3663,6 +3773,19 @@ export class WorkspaceStore {
     return this.aggregators.get(workspaceId)!;
   }
 
+  private shouldBumpStateForBufferedStreamFallback(data: WorkspaceChatMessage): boolean {
+    if (!("type" in data)) {
+      return false;
+    }
+
+    return (
+      data.type === "stream-start" ||
+      data.type === "stream-end" ||
+      data.type === "stream-abort" ||
+      data.type === "stream-error"
+    );
+  }
+
   /**
    * Check if data is a buffered event type by checking the handler map.
    * This ensures isStreamEvent() and processStreamEvent() can never fall out of sync.
@@ -3672,11 +3795,12 @@ export class WorkspaceStore {
       return false;
     }
 
-    // Buffer high-frequency stream events (including bash/task live updates) until
+    // Buffer high-frequency stream events (including bash/task/advisor live updates) until
     // caught-up so full-replay reconnects can deterministically rebuild transient state.
     return (
       data.type in this.bufferedEventHandlers ||
       data.type === "bash-output" ||
+      data.type === "advisor-phase" ||
       data.type === "task-created"
     );
   }
@@ -3722,10 +3846,12 @@ export class WorkspaceStore {
       ) {
         aggregator.clearActiveStreams();
       }
-      // When server confirms no active stream, clear optimistic pending-start state
-      // so the UI doesn't remain stuck in "starting..." after reconnect.
+      // When server confirms no active stream, a normal pending-start is stale and should end.
+      // Preserve exactly one optimistic new-chat catch-up cycle: the first authoritative idle
+      // caught-up can arrive before the delayed first send is replayed, but if a later catch-up
+      // still reports no active stream then the optimistic barrier was stale and must clear.
       if (serverActiveStreamMessageId === undefined) {
-        aggregator.clearPendingStreamStart();
+        aggregator.clearPendingStreamStartIfNotOptimistic();
       }
 
       if (replay === "full") {
@@ -3749,6 +3875,7 @@ export class WorkspaceStore {
         // Live tool-call UI is tied to the active stream context; clear it when replay
         // replaces history, reports no active stream, or reports a different stream ID.
         transient.liveBashOutput.clear();
+        transient.liveAdvisorPhase.clear();
         transient.liveTaskIds.clear();
       }
 
@@ -3831,18 +3958,42 @@ export class WorkspaceStore {
       // failure classification/copy as the live session, then replay them again after
       // history loads so full-replay replacement does not wipe the error back out.
       applyWorkspaceChatEventToAggregator(aggregator, data, { allowSideEffects: false });
-      this.states.bump(workspaceId);
       transient.pendingStreamEvents.push(data);
+      // WorkspaceState may now clear its buffered active-stream fallback based on the appended
+      // terminal error, so invalidate after the pending-events snapshot is up to date.
+      this.states.bump(workspaceId);
       return;
     }
 
     if (!transient.caughtUp && this.isBufferedEvent(data)) {
-      if ("type" in data && (data.type === "stream-lifecycle" || data.type === "stream-abort")) {
+      const shouldApplyImmediately =
+        isStreamLifecycle(data) ||
+        isStreamAbort(data) ||
+        isRuntimeStatus(data) ||
+        isInitStart(data) ||
+        isInitOutput(data) ||
+        isInitEnd(data);
+
+      if (shouldApplyImmediately) {
+        // SSH/Coder init replay can be the only transcript content for a new workspace.
+        // Apply it immediately so reconnects show the latest init snapshot before caught-up;
+        // the aggregator treats replayed init-start/output as idempotent, so the buffered
+        // catch-up pass can reuse the same events without blanking or duplicating the row.
         applyWorkspaceChatEventToAggregator(aggregator, data, { allowSideEffects: false });
-        this.states.bump(workspaceId);
+        if (isInitOutput(data)) {
+          aggregator.flushPendingInitOutput();
+          this.scheduleIdleStateBump(workspaceId);
+        } else {
+          this.states.bump(workspaceId);
+        }
       }
 
       transient.pendingStreamEvents.push(data);
+      if (this.shouldBumpStateForBufferedStreamFallback(data)) {
+        // WorkspaceState now derives the streaming barrier fallback from pending stream events,
+        // so buffered start/terminal transitions must invalidate the memoized hydration snapshot.
+        this.states.bump(workspaceId);
+      }
       return;
     }
 
@@ -3902,6 +4053,23 @@ export class WorkspaceStore {
 
       // High-frequency: throttle UI updates like other delta-style events.
       this.scheduleIdleStateBump(workspaceId);
+      return;
+    }
+
+    if (isAdvisorPhaseEvent(data)) {
+      const transient = this.assertChatTransientState(workspaceId);
+      const prev = transient.liveAdvisorPhase.get(data.toolCallId);
+
+      // Avoid unnecessary re-renders if the phase is unchanged.
+      if (prev?.phase === data.phase) return;
+
+      transient.liveAdvisorPhase.set(data.toolCallId, {
+        phase: data.phase,
+        timestamp: data.timestamp,
+      });
+
+      // Low-frequency: bump immediately so advisor progress updates feel responsive.
+      this.states.bump(workspaceId);
       return;
     }
 
@@ -4013,6 +4181,14 @@ export const workspaceStore = {
    */
   addWorkspace: (metadata: FrontendWorkspaceMetadata) => getStoreInstance().addWorkspace(metadata),
   /**
+   * Mark a newly-created workspace as having its first send in flight.
+   * Used by creation mode so the transcript can show the starting barrier immediately.
+   */
+  markPendingInitialSend: (workspaceId: string, pendingStreamModel: string | null) =>
+    getStoreInstance().markPendingInitialSend(workspaceId, pendingStreamModel),
+  clearPendingInitialSendState: (workspaceId: string) =>
+    getStoreInstance().clearPendingInitialSendState(workspaceId),
+  /**
    * Set the active workspace for onChat subscription management.
    * Exposed for test helpers that bypass React routing effects.
    */
@@ -4086,6 +4262,27 @@ export function useBashToolLiveOutput(
     () => {
       if (!workspaceId || !toolCallId) return null;
       return store.getBashToolLiveOutput(workspaceId, toolCallId);
+    }
+  );
+}
+
+/**
+ * Hook to get UI-only live advisor phase for a running advisor tool call.
+ */
+export function useAdvisorToolLivePhase(
+  workspaceId: string | undefined,
+  toolCallId: string | undefined
+): AdvisorLivePhaseState | undefined {
+  const store = getStoreInstance();
+
+  return useSyncExternalStore(
+    (listener) => {
+      if (!workspaceId) return () => undefined;
+      return store.subscribeKey(workspaceId, listener);
+    },
+    () => {
+      if (!workspaceId || !toolCallId) return undefined;
+      return store.getAdvisorToolLivePhase(workspaceId, toolCallId);
     }
   );
 }

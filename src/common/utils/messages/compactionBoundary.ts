@@ -1,15 +1,12 @@
 import assert from "@/common/utils/assert";
+import { isPositiveInteger } from "@/common/utils/numbers";
 
 import type { MuxMessage } from "@/common/types/message";
 
-function isPositiveInteger(value: unknown): value is number {
-  return (
-    typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value > 0
-  );
-}
-
-function hasDurableCompactedMarker(value: unknown): value is true | "user" | "idle" {
-  return value === true || value === "user" || value === "idle";
+export function isDurableCompactedMarker(
+  value: unknown
+): value is true | "user" | "idle" | "heartbeat" {
+  return value === true || value === "user" || value === "idle" || value === "heartbeat";
 }
 
 export function isDurableCompactionBoundaryMarker(message: MuxMessage | undefined): boolean {
@@ -23,7 +20,7 @@ export function isDurableCompactionBoundaryMarker(message: MuxMessage | undefine
 
   // Self-healing read path: malformed persisted boundary metadata should be ignored,
   // not crash request assembly.
-  if (!hasDurableCompactedMarker(message.metadata.compacted)) {
+  if (!isDurableCompactedMarker(message.metadata.compacted)) {
     return false;
   }
 

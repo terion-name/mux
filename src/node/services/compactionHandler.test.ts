@@ -7,6 +7,7 @@ import * as os from "os";
 import * as path from "path";
 
 import type { EventEmitter } from "events";
+import { MAX_EDITED_FILES } from "@/common/constants/attachments";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { StreamEndEvent } from "@/common/types/stream";
 import type { TelemetryService } from "./telemetryService";
@@ -295,6 +296,253 @@ describe("CompactionHandler", () => {
         exists = false;
       }
       expect(exists).toBe(false);
+    });
+
+    it("appends a heartbeat reset boundary that preserves pending post-boundary state", async () => {
+      const fileEditMessage = createSuccessfulFileEditMessage(
+        "assistant-edit-reset",
+        "/tmp/reset.ts",
+        "@@ -1 +1 @@\n-before\n+after\n"
+      );
+      const skillReadMessage = createSuccessfulAgentSkillReadMessage(
+        "assistant-skill-reset",
+        "react-effects",
+        "Keep follow-up work grounded after the reset."
+      );
+
+      await seedHistory(fileEditMessage, skillReadMessage);
+
+      const result = await handler.appendHeartbeatContextResetBoundary({
+        boundaryText: "Heartbeat context reset boundary",
+        pendingFollowUp: {
+          text: "heartbeat follow-up",
+          model: "openai:gpt-4o",
+          agentId: "exec",
+          dispatchOptions: { requireIdle: true },
+        },
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        throw new Error(`Expected append to succeed: ${result.error}`);
+      }
+      expect(result.data.summaryMessageId).toBeDefined();
+
+      const latestHistory = await historyService.getLastMessages(workspaceId, 10);
+      expect(latestHistory.success).toBe(true);
+      if (!latestHistory.success) {
+        throw new Error(`Expected history read to succeed: ${latestHistory.error}`);
+      }
+      const historyIds = latestHistory.data.map((message) => message.id);
+      expect(historyIds).toHaveLength(3);
+      expect(historyIds[0]).toBe("assistant-edit-reset");
+      expect(historyIds[1]).toBe("assistant-skill-reset");
+      expect(typeof historyIds[2]).toBe("string");
+      const boundaryMessage = latestHistory.data.at(-1);
+      expect(boundaryMessage).toBeDefined();
+      if (!boundaryMessage) {
+        throw new Error("Expected a heartbeat reset boundary message to be appended");
+      }
+      expect(boundaryMessage.metadata).toMatchObject({
+        synthetic: true,
+        uiVisible: true,
+        compacted: "heartbeat",
+        compactionBoundary: true,
+        compactionEpoch: 1,
+      });
+      expect(boundaryMessage?.metadata?.muxMetadata).toEqual({
+        type: "compaction-summary",
+        pendingFollowUp: {
+          text: "heartbeat follow-up",
+          model: "openai:gpt-4o",
+          agentId: "exec",
+          dispatchOptions: { requireIdle: true },
+        },
+      });
+
+      const activeEpoch = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(activeEpoch.success).toBe(true);
+      if (!activeEpoch.success) {
+        throw new Error(`Expected boundary history read to succeed: ${activeEpoch.error}`);
+      }
+      expect(activeEpoch.data).toHaveLength(1);
+      expect(activeEpoch.data[0]?.id).toBe(boundaryMessage.id);
+
+      const pendingState = await handler.peekPendingState();
+      expect(pendingState?.diffs[0]?.path).toBe("/tmp/reset.ts");
+      expect(pendingState?.loadedSkills[0]?.name).toBe("react-effects");
+    });
+
+    it("preserves pre-existing pending diffs when a heartbeat reset boundary is appended", async () => {
+      const existingBoundary = createMuxMessage(
+        "summary-existing",
+        "assistant",
+        "Existing summary",
+        {
+          compacted: "user",
+          compactionBoundary: true,
+          compactionEpoch: 1,
+        }
+      );
+      await seedHistory(existingBoundary);
+
+      const persistedPath = path.join(sessionDir, "post-compaction.json");
+      await fsPromises.writeFile(
+        persistedPath,
+        JSON.stringify({
+          version: 1,
+          createdAt: Date.now(),
+          diffs: [
+            {
+              path: "/tmp/preexisting.ts",
+              diff: "@@ -1 +1 @@\n-old\n+pending\n",
+              truncated: false,
+            },
+          ],
+          loadedSkills: [],
+        })
+      );
+
+      const result = await handler.appendHeartbeatContextResetBoundary({
+        boundaryText: "Heartbeat context reset boundary",
+        pendingFollowUp: {
+          text: "heartbeat follow-up",
+          model: "openai:gpt-4o",
+          agentId: "exec",
+          dispatchOptions: { requireIdle: true },
+        },
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        throw new Error(`Expected append to succeed: ${result.error}`);
+      }
+      expect(result.data.summaryMessageId).toBeDefined();
+      const pendingState = await handler.peekPendingState();
+      expect(pendingState?.diffs.map((diff) => diff.path)).toContain("/tmp/preexisting.ts");
+    });
+
+    it("rolls back heartbeat reset boundaries and restores pending state", async () => {
+      const existingBoundary = createMuxMessage(
+        "summary-existing",
+        "assistant",
+        "Existing summary",
+        {
+          compacted: "user",
+          compactionBoundary: true,
+          compactionEpoch: 1,
+        }
+      );
+      await seedHistory(existingBoundary);
+
+      const persistedPath = path.join(sessionDir, "post-compaction.json");
+      await fsPromises.writeFile(
+        persistedPath,
+        JSON.stringify({
+          version: 1,
+          createdAt: Date.now(),
+          diffs: [
+            {
+              path: "/tmp/preexisting.ts",
+              diff: "@@ -1 +1 @@\n-old\n+pending\n",
+              truncated: false,
+            },
+          ],
+          loadedSkills: [],
+        })
+      );
+
+      const appendResult = await handler.appendHeartbeatContextResetBoundary({
+        boundaryText: "Heartbeat context reset boundary",
+        pendingFollowUp: {
+          text: "heartbeat follow-up",
+          model: "openai:gpt-4o",
+          agentId: "exec",
+          dispatchOptions: { requireIdle: true },
+        },
+      });
+      expect(appendResult.success).toBe(true);
+      if (!appendResult.success) {
+        throw new Error(`Expected append to succeed: ${appendResult.error}`);
+      }
+
+      const boundaryHistory = await historyService.getLastMessages(workspaceId, 1);
+      expect(boundaryHistory.success).toBe(true);
+      if (!boundaryHistory.success) {
+        throw new Error(`Expected history read to succeed: ${boundaryHistory.error}`);
+      }
+      const boundaryMessage = boundaryHistory.data[0];
+      expect(boundaryMessage?.metadata?.compacted).toBe("heartbeat");
+
+      if (!boundaryMessage) {
+        throw new Error("Expected heartbeat reset boundary to exist before rollback");
+      }
+      const rollbackResult = await handler.rollbackHeartbeatContextResetBoundary(boundaryMessage);
+      expect(rollbackResult.success).toBe(true);
+
+      const latestHistory = await historyService.getLastMessages(workspaceId, 10);
+      expect(latestHistory.success).toBe(true);
+      if (!latestHistory.success) {
+        throw new Error(`Expected history read to succeed: ${latestHistory.error}`);
+      }
+      expect(latestHistory.data.map((message) => message.id)).toEqual(["summary-existing"]);
+
+      const pendingState = await handler.peekPendingState();
+      expect(pendingState?.diffs.map((diff) => diff.path)).toEqual(["/tmp/preexisting.ts"]);
+    });
+
+    it("prioritizes newly extracted diffs over stale pending diffs when the cap is reached", async () => {
+      const existingBoundary = createMuxMessage(
+        "summary-existing",
+        "assistant",
+        "Existing summary",
+        {
+          compacted: "user",
+          compactionBoundary: true,
+          compactionEpoch: 1,
+        }
+      );
+      const freshEdit = createSuccessfulFileEditMessage(
+        "assistant-edit-fresh",
+        "/tmp/fresh.ts",
+        "@@ -1 +1 @@\n-old\n+fresh\n"
+      );
+      await seedHistory(existingBoundary, freshEdit);
+
+      const persistedPath = path.join(sessionDir, "post-compaction.json");
+      const staleDiffs = Array.from({ length: MAX_EDITED_FILES }, (_value, index) => ({
+        path: `/tmp/stale-${index}.ts`,
+        diff: `@@ -1 +1 @@\n-old\n+stale-${index}\n`,
+        truncated: false,
+      }));
+      await fsPromises.writeFile(
+        persistedPath,
+        JSON.stringify({
+          version: 1,
+          createdAt: Date.now(),
+          diffs: staleDiffs,
+          loadedSkills: [],
+        })
+      );
+
+      const result = await handler.appendHeartbeatContextResetBoundary({
+        boundaryText: "Heartbeat context reset boundary",
+        pendingFollowUp: {
+          text: "heartbeat follow-up",
+          model: "openai:gpt-4o",
+          agentId: "exec",
+          dispatchOptions: { requireIdle: true },
+        },
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        throw new Error(`Expected append to succeed: ${result.error}`);
+      }
+
+      const pendingState = await handler.peekPendingState();
+      expect(pendingState?.diffs.map((diff) => diff.path)).toContain("/tmp/fresh.ts");
+      expect(pendingState?.diffs).toHaveLength(MAX_EDITED_FILES);
     });
 
     it("loads legacy persisted state files that omit loadedSkills", async () => {

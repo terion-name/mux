@@ -8,8 +8,9 @@ import {
   type ReactNode,
 } from "react";
 import { MemoryRouter, useLocation, useNavigate, useSearchParams } from "react-router-dom";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
+  LAST_VISITED_ROUTE_KEY,
   LAUNCH_BEHAVIOR_KEY,
   SELECTED_WORKSPACE_KEY,
   type LaunchBehavior,
@@ -19,7 +20,12 @@ import { getProjectRouteId } from "@/common/utils/projectRouteId";
 
 export interface RouterContext {
   navigateToWorkspace: (workspaceId: string) => void;
-  navigateToProject: (projectPath: string, sectionId?: string, draftId?: string) => void;
+  navigateToProject: (
+    projectPath: string,
+    sectionId?: string,
+    draftId?: string,
+    options?: { replace?: boolean }
+  ) => void;
   navigateToHome: () => void;
   navigateToSettings: (section?: string) => void;
   navigateFromSettings: () => void;
@@ -56,7 +62,7 @@ export function useRouter(): RouterContext {
   return ctx;
 }
 
-const STANDALONE_PWA_SESSION_KEY = "muxStandaloneSessionInitialized";
+type StartupNavigationType = "navigate" | "reload" | "back_forward" | "prerender" | null;
 
 function isStandalonePwa(): boolean {
   return (
@@ -65,37 +71,130 @@ function isStandalonePwa(): boolean {
   );
 }
 
-function hasStandalonePwaSessionInitialized(): boolean {
+function getStartupNavigationType(): StartupNavigationType {
+  const entries = window.performance?.getEntriesByType?.("navigation");
+  const firstEntry = entries?.[0];
+  const entryType =
+    firstEntry && typeof firstEntry === "object" && "type" in firstEntry ? firstEntry.type : null;
+
+  if (
+    entryType === "navigate" ||
+    entryType === "reload" ||
+    entryType === "back_forward" ||
+    entryType === "prerender"
+  ) {
+    return entryType;
+  }
+
+  const legacyType = window.performance?.navigation?.type;
+  if (legacyType === 1) {
+    return "reload";
+  }
+  if (legacyType === 2) {
+    return "back_forward";
+  }
+  if (legacyType === 0) {
+    return "navigate";
+  }
+
+  return null;
+}
+
+function isRouteRestoringNavigationType(type: StartupNavigationType): boolean {
+  return type === "reload" || type === "back_forward";
+}
+
+function shouldRestoreWorkspaceUrlOnStartup(options: {
+  isStandalone: boolean;
+  launchBehavior: LaunchBehavior | null;
+  navigationType: StartupNavigationType;
+}): boolean {
+  if (options.isStandalone) {
+    return isRouteRestoringNavigationType(options.navigationType);
+  }
+
+  return (
+    options.launchBehavior === "last-workspace" ||
+    isRouteRestoringNavigationType(options.navigationType)
+  );
+}
+
+function hasValidEncodedPathSegment(encodedValue: string): boolean {
+  if (encodedValue.length === 0) {
+    return false;
+  }
+
   try {
-    return window.sessionStorage.getItem(STANDALONE_PWA_SESSION_KEY) === "1";
+    decodeURIComponent(encodedValue);
+    return true;
   } catch {
     return false;
   }
 }
 
-function markStandalonePwaSessionInitialized(): void {
+function hasValidRestorableWorkspaceRoute(route: string): boolean {
+  if (!route.startsWith("/workspace/")) {
+    return false;
+  }
+
+  const workspaceId = route.slice("/workspace/".length).split(/[?#]/, 1)[0] ?? "";
+  return hasValidEncodedPathSegment(workspaceId);
+}
+
+function hasValidRestorableSettingsRoute(route: string): boolean {
+  if (!route.startsWith("/settings/")) {
+    return false;
+  }
+
+  const sectionId = route.slice("/settings/".length).split(/[?#]/, 1)[0] ?? "";
+  return hasValidEncodedPathSegment(sectionId);
+}
+
+function matchesRouteBoundary(route: string, basePath: string): boolean {
+  return route === basePath || route.startsWith(`${basePath}?`) || route.startsWith(`${basePath}#`);
+}
+
+function decodePathSegment(segment: string): string | null {
   try {
-    window.sessionStorage.setItem(STANDALONE_PWA_SESSION_KEY, "1");
+    return decodeURIComponent(segment);
   } catch {
-    // If sessionStorage is unavailable, fall back to treating each load as a fresh launch.
+    return null;
   }
 }
 
-/** Get initial route from browser URL or default to home. */
+function isRestorableRoute(route: unknown): route is string {
+  if (typeof route !== "string" || route.length === 0) {
+    return false;
+  }
+
+  return (
+    hasValidRestorableWorkspaceRoute(route) ||
+    matchesRouteBoundary(route, "/project") ||
+    hasValidRestorableSettingsRoute(route) ||
+    matchesRouteBoundary(route, "/analytics")
+  );
+}
+
+/** Get the initial route, falling back to the compatibility root entrypoint when needed. */
 function getInitialRoute(): string {
   const isStorybook = window.location.pathname.endsWith("iframe.html");
   const isStandalone = isStandalonePwa();
-  const hasStandaloneSession = hasStandalonePwaSessionInitialized();
+  const navigationType = getStartupNavigationType();
   const launchBehavior = !isStandalone
     ? readPersistedState<LaunchBehavior>(LAUNCH_BEHAVIOR_KEY, "dashboard")
     : null;
-  const shouldIgnoreStandaloneWorkspaceUrl =
-    isStandalone && !hasStandaloneSession && window.location.pathname.startsWith("/workspace/");
 
-  // In browser mode (not Storybook), read route directly from URL (enables refresh restoration).
-  // Standalone PWAs intentionally ignore stale workspace URLs on cold launch so opening the app
-  // lands on the dashboard, while preserving explicit deep links like /settings or /project.
-  if (window.location.protocol !== "file:" && !isStorybook && !shouldIgnoreStandaloneWorkspaceUrl) {
+  if (window.location.protocol === "file:") {
+    const persistedRoute = readPersistedState<string | null>(LAST_VISITED_ROUTE_KEY, null);
+    if (isRestorableRoute(persistedRoute)) {
+      return persistedRoute;
+    }
+  }
+
+  // In browser mode (not Storybook), read route directly from the current URL. Workspace
+  // routes are special: fresh launches may ignore them, but explicit restore-style navigations
+  // such as hard reload/back-forward should reopen the same chat.
+  if (window.location.protocol !== "file:" && !isStorybook) {
     const url = window.location.pathname + window.location.search;
     // Only use URL if it's a valid route (starts with /, not just "/" or empty)
     if (url.startsWith("/") && url !== "/") {
@@ -103,9 +202,13 @@ function getInitialRoute(): string {
         return url;
       }
 
-      // Respect dashboard/new-chat launch preferences in browser mode so stale workspace URLs
-      // do not silently override the user's chosen startup destination on a fresh launch.
-      if (isStandalone || launchBehavior === "last-workspace") {
+      if (
+        shouldRestoreWorkspaceUrlOnStartup({
+          isStandalone,
+          launchBehavior,
+          navigationType,
+        })
+      ) {
         return url;
       }
     }
@@ -133,24 +236,33 @@ function getInitialRoute(): string {
     }
   }
 
-  // "dashboard" and "new-chat" both start at /
+  // "dashboard" (legacy storage value) and "new-chat" both enter through "/".
+  // WorkspaceContext immediately resolves that compatibility root route to a real page.
   return "/";
 }
 
-/** Sync router state to browser URL (dev server only, not Electron/Storybook). */
+/** Sync router state to browser URL (dev server) and persist the desktop route. */
 function useUrlSync(): void {
   const location = useLocation();
   useEffect(() => {
+    const url = location.pathname + location.search + location.hash;
+
+    // The dedicated Mux home page is gone. Keep "/" as a transient compatibility
+    // entrypoint, but only persist real restorable routes so desktop relaunches reopen
+    // the last meaningful page instead of getting stuck on root.
+    if (isRestorableRoute(url)) {
+      updatePersistedState(LAST_VISITED_ROUTE_KEY, url);
+    }
+
     // Skip in Storybook (conflicts with story navigation)
     if (window.location.pathname.endsWith("iframe.html")) return;
-    // Skip in Electron (file:// breaks on reload)
+    // Skip in Electron (file:// reloads always boot through index.html; we restore via localStorage above)
     if (window.location.protocol === "file:") return;
 
-    const url = location.pathname + location.search;
-    if (url !== window.location.pathname + window.location.search) {
+    if (url !== window.location.pathname + window.location.search + window.location.hash) {
       window.history.replaceState(null, "", url);
     }
-  }, [location.pathname, location.search]);
+  }, [location.pathname, location.search, location.hash]);
 }
 
 function RouterContextInner(props: { children: ReactNode }) {
@@ -172,7 +284,7 @@ function RouterContextInner(props: { children: ReactNode }) {
   useUrlSync();
 
   const workspaceMatch = /^\/workspace\/(.+)$/.exec(location.pathname);
-  const currentWorkspaceId = workspaceMatch ? decodeURIComponent(workspaceMatch[1]) : null;
+  const currentWorkspaceId = workspaceMatch ? decodePathSegment(workspaceMatch[1]) : null;
   const currentProjectId =
     location.pathname === "/project"
       ? (searchParams.get("project") ?? searchParams.get("path"))
@@ -180,7 +292,7 @@ function RouterContextInner(props: { children: ReactNode }) {
   const currentProjectPathFromState =
     location.pathname === "/project" ? getProjectPathFromLocationState(location.state) : null;
   const settingsMatch = /^\/settings\/([^/]+)$/.exec(location.pathname);
-  const currentSettingsSection = settingsMatch ? decodeURIComponent(settingsMatch[1]) : null;
+  const currentSettingsSection = settingsMatch ? decodePathSegment(settingsMatch[1]) : null;
   const isAnalyticsOpen = location.pathname === "/analytics";
 
   interface NonSettingsLocationSnapshot {
@@ -242,25 +354,32 @@ function RouterContextInner(props: { children: ReactNode }) {
   const pendingSectionId = location.pathname === "/project" ? searchParams.get("section") : null;
   const pendingDraftId = location.pathname === "/project" ? searchParams.get("draft") : null;
 
-  // Navigation functions use push (not replace) to build history for back/forward navigation.
-  // See App.tsx handleMouseNavigation and KEYBINDS.NAVIGATE_BACK/FORWARD.
+  // Navigation defaults to push so back/forward keeps working as expected.
+  // Callers can opt into replace for compatibility-root redirects that should not
+  // add a disposable "/" history entry.
   const navigateToWorkspace = useCallback((id: string) => {
     void navigateRef.current(`/workspace/${encodeURIComponent(id)}`);
   }, []);
 
-  const navigateToProject = useCallback((path: string, sectionId?: string, draftId?: string) => {
-    const projectId = getProjectRouteId(path);
-    const params = new URLSearchParams();
-    params.set("project", projectId);
-    if (sectionId) {
-      params.set("section", sectionId);
-    }
-    if (draftId) {
-      params.set("draft", draftId);
-    }
-    const url = `/project?${params.toString()}`;
-    void navigateRef.current(url, { state: { projectPath: path } });
-  }, []);
+  const navigateToProject = useCallback(
+    (path: string, sectionId?: string, draftId?: string, options?: { replace?: boolean }) => {
+      const projectId = getProjectRouteId(path);
+      const params = new URLSearchParams();
+      params.set("project", projectId);
+      if (sectionId) {
+        params.set("section", sectionId);
+      }
+      if (draftId) {
+        params.set("draft", draftId);
+      }
+      const url = `/project?${params.toString()}`;
+      void navigateRef.current(url, {
+        replace: options?.replace === true,
+        state: { projectPath: path },
+      });
+    },
+    []
+  );
 
   const navigateToHome = useCallback(() => {
     void navigateRef.current("/");
@@ -341,13 +460,6 @@ function RouterContextInner(props: { children: ReactNode }) {
 // causing a flash of stale UI between normal-priority updates (e.g.
 // setIsSending(false)) and the deferred route change.
 export function RouterProvider(props: { children: ReactNode }) {
-  useEffect(() => {
-    if (!isStandalonePwa()) return;
-    // Mark the standalone session after commit so StrictMode's throwaway renders cannot
-    // flip a cold launch into the reload path before the first real paint.
-    markStandalonePwaSessionInitialized();
-  }, []);
-
   return (
     <MemoryRouter initialEntries={[getInitialRoute()]} unstable_useTransitions={false}>
       <RouterContextInner>{props.children}</RouterContextInner>

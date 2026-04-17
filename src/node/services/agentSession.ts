@@ -63,8 +63,10 @@ import {
   type ReviewNoteDataForDisplay,
   type StartupRetrySendOptions,
 } from "@/common/types/message";
-import { createRuntime } from "@/node/runtime/runtimeFactory";
-import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
+import {
+  createRuntimeContextForWorkspace,
+  createRuntimeForWorkspace,
+} from "@/node/runtime/runtimeHelpers";
 import { hasNonEmptyPlanFile } from "@/node/utils/runtime/helpers";
 import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentTools";
 import {
@@ -76,6 +78,7 @@ import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/r
 import { MessageQueue } from "./messageQueue";
 import {
   copyStreamLifecycleSnapshot,
+  type RuntimeStatusEvent,
   type StreamAbortReason,
   type StreamEndEvent,
   type StreamLifecycleSnapshot,
@@ -398,6 +401,16 @@ export class AgentSession {
    */
   private terminalStreamError: StreamErrorMessage | null = null;
 
+  /**
+   * Latest pre-stream runtime-status breadcrumb for the in-flight PREPARING turn.
+   *
+   * This used to live only in the renderer, which meant switching away from and back to an
+   * SSH/Coder workspace could drop the startup detail text until a brand-new event arrived.
+   * Keeping the latest breadcrumb in the session lets replay restore the same status UI that
+   * live subscribers saw.
+   */
+  private preparingRuntimeStatus: RuntimeStatusEvent | null = null;
+
   /** Last lifecycle snapshot emitted to live subscribers (used for change detection only). */
   private lastEmittedStreamLifecycle: StreamLifecycleSnapshot | null = null;
 
@@ -609,19 +622,38 @@ export class AgentSession {
     return this.terminalStreamLifecycle ?? { phase: "idle", hadAnyOutput: false };
   }
 
+  private hasSameStreamLifecycle(
+    left: StreamLifecycleSnapshot | null,
+    right: StreamLifecycleSnapshot
+  ): boolean {
+    return (
+      left !== null &&
+      left.phase === right.phase &&
+      left.hadAnyOutput === right.hadAnyOutput &&
+      (left.abortReason ?? null) === (right.abortReason ?? null)
+    );
+  }
+
+  private hasSameRuntimeStatus(
+    left: RuntimeStatusEvent | null,
+    right: RuntimeStatusEvent
+  ): boolean {
+    return (
+      left !== null &&
+      left.phase === right.phase &&
+      left.runtimeType === right.runtimeType &&
+      (left.source ?? null) === (right.source ?? null) &&
+      (left.detail ?? null) === (right.detail ?? null)
+    );
+  }
+
   private emitStreamLifecycleIfChanged(): void {
     if (this.disposed) {
       return;
     }
 
     const snapshot = this.getCurrentStreamLifecycleSnapshot();
-    const lastSnapshot = this.lastEmittedStreamLifecycle;
-    if (
-      lastSnapshot &&
-      lastSnapshot.phase === snapshot.phase &&
-      lastSnapshot.hadAnyOutput === snapshot.hadAnyOutput &&
-      (lastSnapshot.abortReason ?? null) === (snapshot.abortReason ?? null)
-    ) {
+    if (this.hasSameStreamLifecycle(this.lastEmittedStreamLifecycle, snapshot)) {
       return;
     }
 
@@ -651,6 +683,19 @@ export class AgentSession {
       hadAnyOutput: options?.hadAnyOutput ?? this.activeStreamHadAnyDelta,
       abortReason: options?.abortReason,
     });
+  }
+
+  private updatePreparingRuntimeStatus(status: RuntimeStatusEvent): void {
+    if (status.phase === "ready" || status.phase === "error") {
+      this.clearPreparingRuntimeStatus();
+      return;
+    }
+
+    this.preparingRuntimeStatus = status;
+  }
+
+  private clearPreparingRuntimeStatus(): void {
+    this.preparingRuntimeStatus = null;
   }
 
   private emitRetryEvent(event: RetryStatusEvent): void {
@@ -1550,6 +1595,7 @@ export class AgentSession {
 
     let replayedTerminalStreamError = false;
     let replayedStreamLifecycle: StreamLifecycleSnapshot | null = null;
+    let replayedRuntimeStatus: RuntimeStatusEvent | null = null;
     const emitReplayStatusMessage = (message: WorkspaceChatMessage): void => {
       listener({ workspaceId: this.workspaceId, message });
     };
@@ -1563,21 +1609,20 @@ export class AgentSession {
       }
 
       const lifecycle = this.getCurrentStreamLifecycleSnapshot();
-      if (
-        replayedStreamLifecycle &&
-        replayedStreamLifecycle.phase === lifecycle.phase &&
-        replayedStreamLifecycle.hadAnyOutput === lifecycle.hadAnyOutput &&
-        (replayedStreamLifecycle.abortReason ?? null) === (lifecycle.abortReason ?? null)
-      ) {
-        return;
+      if (!this.hasSameStreamLifecycle(replayedStreamLifecycle, lifecycle)) {
+        replayedStreamLifecycle = copyStreamLifecycleSnapshot(lifecycle);
+        emitReplayStatusMessage({
+          type: "stream-lifecycle",
+          workspaceId: this.workspaceId,
+          ...lifecycle,
+        });
       }
 
-      replayedStreamLifecycle = copyStreamLifecycleSnapshot(lifecycle);
-      emitReplayStatusMessage({
-        type: "stream-lifecycle",
-        workspaceId: this.workspaceId,
-        ...lifecycle,
-      });
+      const runtimeStatus = this.preparingRuntimeStatus;
+      if (runtimeStatus && !this.hasSameRuntimeStatus(replayedRuntimeStatus, runtimeStatus)) {
+        replayedRuntimeStatus = { ...runtimeStatus };
+        emitReplayStatusMessage(runtimeStatus);
+      }
     };
 
     let emittedReplayStreamEvents = false;
@@ -1909,20 +1954,12 @@ export class AgentSession {
     const existing = await this.aiService.getWorkspaceMetadata(this.workspaceId);
 
     if (existing.success) {
-      // Metadata already exists, verify workspace path matches
-      const metadata = existing.data;
-      // For in-place workspaces (projectPath === name), use path directly
-      // Otherwise reconstruct using runtime's worktree pattern
-      const isInPlace = metadata.projectPath === metadata.name;
-      const expectedPath = isInPlace
-        ? metadata.projectPath
-        : (() => {
-            const runtime = createRuntime(metadata.runtimeConfig, {
-              projectPath: metadata.projectPath,
-              workspaceName: metadata.name,
-            });
-            return runtime.getWorkspacePath(metadata.projectPath, metadata.name);
-          })();
+      // Metadata already exists; use the persisted config entry as the source of truth instead of
+      // reconstructing a canonical path, because upgraded SSH workspaces may still live under a
+      // legacy remote layout until an operation explicitly seeds that layout back into the runtime.
+      const workspace = this.config.findWorkspace(this.workspaceId);
+      assert(workspace, `Workspace ${this.workspaceId} is missing its persisted config entry`);
+      const expectedPath = path.resolve(workspace.workspacePath);
       assert(
         expectedPath === normalizedWorkspacePath,
         `Existing metadata workspace path mismatch for ${this.workspaceId}: expected ${expectedPath}, got ${normalizedWorkspacePath}`
@@ -3484,14 +3521,7 @@ export class AgentSession {
     let chain: Awaited<ReturnType<typeof resolveAgentInheritanceChain>> | undefined;
     for (const agentMetadata of metadataCandidates) {
       try {
-        const runtime = createRuntimeForWorkspace(agentMetadata);
-
-        // In-place workspaces (CLI/benchmarks) have projectPath === name.
-        // Use path directly instead of reconstructing via getWorkspacePath.
-        const isInPlace = agentMetadata.projectPath === agentMetadata.name;
-        const workspacePath = isInPlace
-          ? agentMetadata.projectPath
-          : runtime.getWorkspacePath(agentMetadata.projectPath, agentMetadata.name);
+        const { runtime, workspacePath } = createRuntimeContextForWorkspace(agentMetadata);
 
         const agentDiscoveryPath =
           context.options?.disableWorkspaceAgents === true
@@ -3818,6 +3848,12 @@ export class AgentSession {
     forward("task-created", (payload) => {
       this.emitChatEvent(payload);
     });
+    forward("advisor-phase", (payload) => {
+      this.emitChatEvent(payload);
+    });
+    forward("session-usage-delta", (payload) => {
+      this.emitChatEvent(payload);
+    });
     forward("tool-call-delta", (payload) => {
       this.markActiveStreamHadAnyOutput();
       this.emitChatEvent(payload);
@@ -3902,6 +3938,7 @@ export class AgentSession {
 
         const preStreamAbortReason = "abortReason" in payload ? payload.abortReason : undefined;
         if (this.turnPhase === TurnPhase.PREPARING) {
+          this.clearPreparingRuntimeStatus();
           this.setTerminalStreamLifecycle("interrupted", {
             abortReason: preStreamAbortReason,
             hadAnyOutput: false,
@@ -3946,7 +3983,12 @@ export class AgentSession {
       this.emitChatEvent(payload);
       this.setTurnPhase(TurnPhase.IDLE);
     });
-    forward("runtime-status", (payload) => this.emitChatEvent(payload));
+    forward("runtime-status", (payload) => {
+      if (payload.type === "runtime-status") {
+        this.updatePreparingRuntimeStatus(payload);
+      }
+      this.emitChatEvent(payload);
+    });
 
     forward("stream-end", async (payload) => {
       if (payload.type !== "stream-end") {
@@ -3985,7 +4027,7 @@ export class AgentSession {
           if (this.ackPendingPostCompactionStateOnStreamEnd) {
             this.ackPendingPostCompactionStateOnStreamEnd = false;
             try {
-              await this.compactionHandler.ackPendingDiffsConsumed();
+              await this.compactionHandler.ackPendingStateConsumed();
             } catch (error) {
               log.warn("Failed to ack pending post-compaction state", {
                 workspaceId: this.workspaceId,
@@ -4151,6 +4193,7 @@ export class AgentSession {
 
   private setTurnPhase(next: TurnPhase): void {
     this.turnPhase = next;
+    this.clearPreparingRuntimeStatus();
 
     if (next !== TurnPhase.IDLE) {
       this.terminalStreamLifecycle = null;
@@ -4406,14 +4449,7 @@ export class AgentSession {
     }
 
     const metadata = metadataResult.data;
-    const runtime = createRuntimeForWorkspace(metadata);
-
-    // In-place workspaces (CLI/benchmarks) have projectPath === name.
-    // Use the path directly instead of reconstructing via getWorkspacePath.
-    const isInPlace = metadata.projectPath === metadata.name;
-    const workspacePath = isInPlace
-      ? metadata.projectPath
-      : runtime.getWorkspacePath(metadata.projectPath, metadata.name);
+    const { runtime, workspacePath } = createRuntimeContextForWorkspace(metadata);
 
     // When disableWorkspaceAgents is active, use project path for discovery
     // (only built-in/global agents). Mirrors resolveAgentForStream behavior.
@@ -4724,27 +4760,44 @@ export class AgentSession {
    * for crash safety. The user message persisted by sendMessage() serves as
    * proof of dispatch (no history rewrite needed).
    */
-  private async dispatchPendingFollowUp(): Promise<boolean> {
+  private async dispatchPendingFollowUp(summaryMessageId?: string): Promise<boolean> {
     if (this.disposed) {
       return false;
     }
 
-    // Read the last message from history — only need 1 message, avoid full-file read.
-    // Startup recovery must retry on transient read failures, so bubble errors.
-    const historyResult = await this.historyService.getLastMessages(this.workspaceId, 1);
-    if (!historyResult.success) {
-      const historyError =
-        typeof historyResult.error === "string"
-          ? historyResult.error
-          : getErrorMessage(historyResult.error);
-      throw new Error(`Failed to read history for startup follow-up recovery: ${historyError}`);
+    let summaryMessage: MuxMessage | undefined;
+    if (summaryMessageId) {
+      const historyResult = await this.historyService.getHistoryFromLatestBoundary(
+        this.workspaceId
+      );
+      if (!historyResult.success) {
+        throw new Error(
+          `Failed to read history for targeted follow-up recovery: ${historyResult.error}`
+        );
+      }
+      summaryMessage = historyResult.data.find((message) => message.id === summaryMessageId);
+      if (!summaryMessage) {
+        return false;
+      }
+    } else {
+      // Read the last message from history — only need 1 message, avoid full-file read.
+      // Startup recovery must retry on transient read failures, so bubble errors.
+      const historyResult = await this.historyService.getLastMessages(this.workspaceId, 1);
+      if (!historyResult.success) {
+        const historyError =
+          typeof historyResult.error === "string"
+            ? historyResult.error
+            : getErrorMessage(historyResult.error);
+        throw new Error(`Failed to read history for startup follow-up recovery: ${historyError}`);
+      }
+
+      if (historyResult.data.length === 0) {
+        return false;
+      }
+      summaryMessage = historyResult.data[0];
     }
 
-    if (historyResult.data.length === 0) {
-      return false;
-    }
-
-    const lastMessage = historyResult.data[0];
+    const lastMessage = summaryMessage;
     const muxMeta = lastMessage.metadata?.muxMetadata;
 
     // Check if it's a compaction summary with a pending follow-up
@@ -4758,6 +4811,35 @@ export class AgentSession {
       mode?: "exec" | "plan";
       imageParts?: FilePart[];
     };
+
+    const hasQueuedMessages = this.hasQueuedMessages();
+    const hasActiveNonCompletingTurn = this.isBusy() && this.turnPhase !== TurnPhase.COMPLETING;
+    if (
+      followUp.dispatchOptions?.requireIdle === true &&
+      (hasQueuedMessages || hasActiveNonCompletingTurn)
+    ) {
+      log.info("Skipping pending follow-up because the workspace is no longer idle", {
+        workspaceId: this.workspaceId,
+        summaryMessageId: lastMessage.id,
+        hasQueuedMessages,
+        turnPhase: this.turnPhase,
+      });
+      if (
+        lastMessage.metadata?.compacted === "heartbeat" &&
+        hasQueuedMessages &&
+        !hasActiveNonCompletingTurn
+      ) {
+        const rollbackResult =
+          await this.compactionHandler.rollbackHeartbeatContextResetBoundary(lastMessage);
+        if (!rollbackResult.success) {
+          throw new Error(`Failed to rollback heartbeat reset boundary: ${rollbackResult.error}`);
+        }
+        this.onPostCompactionStateChange?.();
+      } else {
+        await this.clearPendingFollowUpFromSummary(lastMessage);
+      }
+      return false;
+    }
 
     // Derive agentId: new field has it directly, legacy may use `mode` field.
     // Legacy `mode` was "exec" | "plan" and maps directly to agentId.
@@ -4777,6 +4859,7 @@ export class AgentSession {
       hasReviews: Boolean(followUp.reviews?.length),
       model: effectiveModel,
       agentId: effectiveAgentId,
+      requireIdle: followUp.dispatchOptions?.requireIdle === true,
     });
 
     // Process the follow-up content (handles reviews -> text formatting + metadata)
@@ -4789,16 +4872,20 @@ export class AgentSession {
       followUp.muxMetadata
     );
 
-    // Build options for the follow-up message.
-    // Spread the followUp to include preserved send options (thinkingLevel, providerOptions, etc.)
-    // that were captured from the original user message in prepareCompactionMessage().
+    // Build options for the follow-up message from the preserved send settings captured
+    // when the compaction handoff was staged. Avoid forwarding internal-only recovery flags.
     const options: SendMessageOptions & {
       fileParts?: FilePart[];
       muxMetadata?: MuxMessageMetadata;
     } = {
-      ...followUp,
       model: effectiveModel,
       agentId: effectiveAgentId,
+      thinkingLevel: followUp.thinkingLevel,
+      additionalSystemInstructions: followUp.additionalSystemInstructions,
+      providerOptions: followUp.providerOptions,
+      experiments: followUp.experiments,
+      disableWorkspaceAgents: followUp.disableWorkspaceAgents,
+      skipAiSettingsPersistence: followUp.skipAiSettingsPersistence,
     };
 
     if (effectiveFileParts && effectiveFileParts.length > 0) {
@@ -4826,6 +4913,35 @@ export class AgentSession {
     }
 
     return true;
+  }
+
+  private async clearPendingFollowUpFromSummary(summaryMessage: MuxMessage): Promise<void> {
+    assert(
+      summaryMessage.role === "assistant",
+      "clearPendingFollowUpFromSummary requires an assistant summary message"
+    );
+
+    const muxMeta = summaryMessage.metadata?.muxMetadata;
+    assert(
+      isCompactionSummaryMetadata(muxMeta),
+      "clearPendingFollowUpFromSummary requires compaction-summary metadata"
+    );
+
+    if (!muxMeta.pendingFollowUp) {
+      return;
+    }
+
+    const { pendingFollowUp: _pendingFollowUp, ...muxMetadataWithoutFollowUp } = muxMeta;
+    const updateResult = await this.historyService.updateHistory(this.workspaceId, {
+      ...summaryMessage,
+      metadata: {
+        ...(summaryMessage.metadata ?? {}),
+        muxMetadata: muxMetadataWithoutFollowUp,
+      },
+    });
+    if (!updateResult.success) {
+      throw new Error(`Failed to clear skipped pending follow-up: ${updateResult.error}`);
+    }
   }
 
   /**
@@ -4995,8 +5111,7 @@ export class AgentSession {
     }
 
     const metadata = metadataResult.data;
-    const runtime = createRuntimeForWorkspace(metadata);
-    const workspacePath = runtime.getWorkspacePath(metadata.projectPath, metadata.name);
+    const { runtime, workspacePath } = createRuntimeContextForWorkspace(metadata);
 
     const materialized = await materializeFileAtMentions(messageText, {
       runtime,
@@ -5059,17 +5174,7 @@ export class AgentSession {
     }
 
     const metadata = metadataResult.data;
-    const runtime = createRuntime(metadata.runtimeConfig, {
-      projectPath: metadata.projectPath,
-      workspaceName: metadata.name,
-    });
-
-    // In-place workspaces (CLI/benchmarks) have projectPath === name.
-    // Use the path directly instead of reconstructing via getWorkspacePath.
-    const isInPlace = metadata.projectPath === metadata.name;
-    const workspacePath = isInPlace
-      ? metadata.projectPath
-      : runtime.getWorkspacePath(metadata.projectPath, metadata.name);
+    const { runtime, workspacePath } = createRuntimeContextForWorkspace(metadata);
 
     // When workspace agents are disabled, resolve skills from the project path instead of
     // the worktree so skill invocation uses the same precedence/discovery root as the UI.
@@ -5188,6 +5293,34 @@ export class AgentSession {
   /** Delegate to FileChangeTracker for external file change detection. */
   async getChangedFileAttachments(): Promise<EditedFileAttachment[]> {
     return this.fileChangeTracker.getChangedAttachments();
+  }
+
+  async appendHeartbeatContextResetBoundary(params: {
+    boundaryText: string;
+    pendingFollowUp: CompactionFollowUpRequest;
+  }): Promise<Result<{ summaryMessageId: string }, string>> {
+    this.assertNotDisposed("appendHeartbeatContextResetBoundary");
+
+    if (this.isBusy()) {
+      return Err("Cannot reset heartbeat context while a turn is active.");
+    }
+    if (this.hasQueuedMessages()) {
+      return Err("Cannot reset heartbeat context while queued user input is pending.");
+    }
+
+    const result = await this.compactionHandler.appendHeartbeatContextResetBoundary({
+      boundaryText: params.boundaryText,
+      pendingFollowUp: params.pendingFollowUp,
+    });
+    if (result.success) {
+      this.onPostCompactionStateChange?.();
+    }
+    return result;
+  }
+
+  async dispatchPendingCompactionFollowUpIfNeeded(summaryMessageId?: string): Promise<boolean> {
+    this.assertNotDisposed("dispatchPendingCompactionFollowUpIfNeeded");
+    return this.dispatchPendingFollowUp(summaryMessageId);
   }
 
   /**

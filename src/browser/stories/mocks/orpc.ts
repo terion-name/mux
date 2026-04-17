@@ -35,14 +35,6 @@ import type { MCPHttpServerInfo, MCPServerInfo } from "@/common/types/mcp";
 import type { MCPOAuthAuthStatus } from "@/common/types/mcpOauth";
 import type { ChatStats } from "@/common/types/chatStats";
 import {
-  MUX_HELP_CHAT_AGENT_ID,
-  MUX_HELP_CHAT_WORKSPACE_ID,
-  MUX_HELP_CHAT_WORKSPACE_NAME,
-  MUX_HELP_CHAT_WORKSPACE_TITLE,
-} from "@/common/constants/muxChat";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getWorkspaceLastReadKey } from "@/common/constants/storage";
-import {
   normalizeRuntimeEnablement,
   RUNTIME_ENABLEMENT_IDS,
   type RuntimeEnablementId,
@@ -144,6 +136,10 @@ export interface MockORPCClientOptions {
   onePasswordAccountName?: string | null;
   /** Initial LSP provisioning mode for config.getConfig */
   lspProvisioningMode?: LspProvisioningMode;
+  /** Initial global heartbeat default prompt for config.getConfig */
+  heartbeatDefaultPrompt?: string;
+  /** Initial global heartbeat default interval for config.getConfig */
+  heartbeatDefaultIntervalMs?: number;
   /** Initial route priority for config.getConfig */
   routePriority?: string[];
   /** Initial per-model route overrides for config.getConfig */
@@ -326,7 +322,7 @@ type MockMcpTestResult = { success: true; tools: string[] } | { success: false; 
 export function createMockORPCClient(options: MockORPCClientOptions = {}): APIClient {
   const {
     projects: providedProjects = new Map<string, ProjectConfig>(),
-    workspaces: inputWorkspaces = [],
+    workspaces = [],
     projectGitStatusesByWorkspace = new Map<string, ApiProjectGitStatusResult[]>(),
     workspaceActivitySnapshots = {},
     onChat,
@@ -361,6 +357,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     defaultRuntime: initialDefaultRuntime,
     lspProvisioningMode: initialLspProvisioningMode,
     onePasswordAccountName: initialOnePasswordAccountName = null,
+    heartbeatDefaultPrompt: initialHeartbeatDefaultPrompt,
+    heartbeatDefaultIntervalMs: initialHeartbeatDefaultIntervalMs,
     routePriority: initialRoutePriority = ["direct"],
     routeOverrides: initialRouteOverrides = {},
     agentDefinitions: initialAgentDefinitions,
@@ -390,41 +388,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     runtimeStatuses = new Map<string, "running" | "stopped" | "unknown" | "unsupported">(),
   } = options;
 
-  // App now boots into the built-in mux-chat workspace by default.
-  // Ensure Storybook mocks always include it so stories don't render "Workspace not found".
-  const muxChatProjectPath = "/Users/dev/.mux/system/chat-with-mux";
-  const muxChatWorkspace: FrontendWorkspaceMetadata = {
-    id: MUX_HELP_CHAT_WORKSPACE_ID,
-    name: MUX_HELP_CHAT_WORKSPACE_NAME,
-    title: MUX_HELP_CHAT_WORKSPACE_TITLE,
-    projectName: "Mux",
-    projectPath: muxChatProjectPath,
-    namedWorkspacePath: muxChatProjectPath,
-    runtimeConfig: { type: "local" },
-    agentId: MUX_HELP_CHAT_AGENT_ID,
-  };
-
-  const workspaces = inputWorkspaces.some((w) => w.id === MUX_HELP_CHAT_WORKSPACE_ID)
-    ? inputWorkspaces
-    : [muxChatWorkspace, ...inputWorkspaces];
-
-  // Keep Storybook aligned with app behavior: the built-in Mux chat workspace belongs to a
-  // system project so user-facing project lists can hide it while still rendering sidebar affordances.
   const projects = new Map(providedProjects);
-  const muxChatProject = projects.get(muxChatProjectPath);
-  if (muxChatProject) {
-    projects.set(muxChatProjectPath, { ...muxChatProject, projectKind: "system" });
-  } else {
-    projects.set(muxChatProjectPath, { workspaces: [], projectKind: "system" });
-  }
-
-  // Keep Storybook's built-in mux-help workspace behavior deterministic:
-  // if stories haven't seeded a read baseline, treat it as "known but never read"
-  // rather than "unknown workspace" so the unread badge can render when recency exists.
-  const muxHelpLastReadKey = getWorkspaceLastReadKey(MUX_HELP_CHAT_WORKSPACE_ID);
-  if (readPersistedState<number | null>(muxHelpLastReadKey, null) === null) {
-    updatePersistedState(muxHelpLastReadKey, 0);
-  }
   const workspaceMap = new Map(workspaces.map((w) => [w.id, w]));
 
   // Terminal sessions are used by RightSidebar and TerminalView.
@@ -518,15 +482,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         subagentRunnable: true,
         base: "exec",
       },
-      {
-        id: "mux",
-        scope: "built-in",
-        name: "Chat With Mux",
-        description: "Configure global Mux settings",
-        uiSelectable: false,
-        uiRoutable: false,
-        subagentRunnable: false,
-      },
     ] satisfies AgentDefinitionDescriptor[]);
 
   let taskSettings = normalizeTaskSettings(initialTaskSettings ?? DEFAULT_TASK_SETTINGS);
@@ -552,6 +507,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   let lspProvisioningMode: LspProvisioningMode =
     initialLspProvisioningMode ?? DEFAULT_LSP_PROVISIONING_MODE;
   let onePasswordAccountName: string | null = initialOnePasswordAccountName;
+  let heartbeatDefaultPrompt = initialHeartbeatDefaultPrompt;
+  let heartbeatDefaultIntervalMs = initialHeartbeatDefaultIntervalMs;
   let routePriority = [...initialRoutePriority];
   let routeOverrides = { ...initialRouteOverrides };
   const configChangeSubscribers = new Set<(value: void) => void>();
@@ -743,6 +700,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           subagentAiDefaults,
           muxGovernorUrl,
           onePasswordAccountName,
+          heartbeatDefaultPrompt,
+          heartbeatDefaultIntervalMs,
           muxGovernorEnrolled,
           llmDebugLogs: false,
         }),
@@ -825,6 +784,18 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       updateOnePasswordAccountName: (input: { onePasswordAccountName?: string | null }) => {
         onePasswordAccountName = input.onePasswordAccountName ?? null;
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateHeartbeatDefaultPrompt: (input: { defaultPrompt?: string | null }) => {
+        heartbeatDefaultPrompt = input.defaultPrompt?.trim()
+          ? input.defaultPrompt.trim()
+          : undefined;
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateHeartbeatDefaultIntervalMs: (input: { intervalMs?: number | null }) => {
+        heartbeatDefaultIntervalMs = input.intervalMs ?? undefined;
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },

@@ -124,6 +124,7 @@
     --color-surface-destructive: hsla(0, 75%, 15%, 1);
     --color-surface-invert-secondary: hsla(240, 5%, 65%, 1);
     --color-surface-tertiary: hsla(240, 4%, 16%, 1);
+    --color-surface-quaternary: hsla(240, 5%, 26%, 1);
     --color-content-success: hsla(142, 76%, 36%, 1);
     --color-surface-green: hsla(145, 80%, 10%, 1);
     --color-border-pending: hsla(188, 75%, 80%, 1);
@@ -231,11 +232,6 @@
     --color-input-text: hsl(0 0% 80%);
     --color-input-border: hsl(207 51% 59%);
     --color-input-border-focus: hsl(193 91% 64%);
-
-    /* Scrollbar */
-    --color-scrollbar-track: hsl(0 0% 18%);
-    --color-scrollbar-thumb: hsl(0 0% 32%);
-    --color-scrollbar-thumb-hover: hsl(0 0% 42%);
 
     /* Additional Semantic Colors */
     --color-muted: hsl(0 0% 53%); /* #888 - muted text */
@@ -427,6 +423,7 @@
   --color-surface-destructive: hsla(0, 93%, 94%, 1);
   --color-surface-invert-secondary: hsla(240, 5%, 26%, 1);
   --color-surface-tertiary: hsla(240, 6%, 90%, 1);
+  --color-surface-quaternary: hsla(240, 5%, 84%, 1);
   --color-content-success: hsla(142, 72%, 29%, 1);
   --color-surface-green: hsla(141, 79%, 85%, 1);
   --color-border-pending: hsla(194, 49%, 45%, 1);
@@ -512,10 +509,6 @@
   --color-input-text: hsl(210 18% 16%);
   --color-input-border: hsl(207 75% 52%);
   --color-input-border-focus: hsl(193 85% 56%);
-
-  --color-scrollbar-track: hsl(210 38% 95%);
-  --color-scrollbar-thumb: hsl(210 18% 78%);
-  --color-scrollbar-thumb-hover: hsl(210 18% 70%);
 
   --color-muted: hsl(210 14% 52%);
   --color-muted-light: hsl(210 20% 60%);
@@ -687,6 +680,7 @@
   --color-surface-destructive: color-mix(in srgb, var(--color-danger) 12%, var(--color-background) 88%);
   --color-surface-invert-secondary: #403e3c;
   --color-surface-tertiary: #f2f0e5;
+  --color-surface-quaternary: #dad8ce;
   --color-content-success: #66800b;
   --color-surface-green: color-mix(in srgb, var(--color-success) 20%, var(--color-background) 80%);
   --color-border-pending: #24837b;
@@ -760,10 +754,6 @@
   --color-input-text: #100f0f;
   --color-input-border: #205ea6;
   --color-input-border-focus: color-mix(in srgb, var(--color-input-border), white 30%);
-
-  --color-scrollbar-track: #f2f0e5;
-  --color-scrollbar-thumb: #dad8ce;
-  --color-scrollbar-thumb-hover: #cecdc3;
 
   --color-muted: #6f6e69;
   --color-muted-light: #6f6e69;
@@ -919,6 +909,7 @@
   --color-surface-destructive: color-mix(in srgb, var(--color-danger) 16%, var(--color-background) 84%);
   --color-surface-invert-secondary: #b7b5ac;
   --color-surface-tertiary: #282726;
+  --color-surface-quaternary: #343331;
   --color-content-success: #879a39;
   --color-surface-green: color-mix(in srgb, var(--color-success) 18%, var(--color-background) 82%);
   --color-border-pending: #3aa99f;
@@ -992,10 +983,6 @@
   --color-input-text: #cecdc3;
   --color-input-border: #4385be;
   --color-input-border-focus: color-mix(in srgb, var(--color-input-border), white 22%);
-
-  --color-scrollbar-track: #1c1b1a;
-  --color-scrollbar-thumb: #343331;
-  --color-scrollbar-thumb-hover: #403e3c;
 
   --color-muted: #878580;
   --color-muted-light: #cecdc3;
@@ -1106,37 +1093,19 @@ body {
   font-size: 14px;
 }
 
-/* Custom scrollbar styles */
-::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
-
-::-webkit-scrollbar-track {
-  background: var(--color-scrollbar-track);
+/* Global scrollbar styles */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-surface-quaternary) transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--color-scrollbar-thumb);
-  border-radius: 4px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-  background: var(--color-scrollbar-thumb-hover);
-}
-
-/* Firefox scrollbar */
-* {
-  scrollbar-width: thin;
-  scrollbar-color: var(--color-scrollbar-thumb) var(--color-scrollbar-track);
+  background: var(--color-surface-quaternary);
 }
 
 /*
  * Override for Tailwind's scrollbar-none utility.
- * The global ::-webkit-scrollbar rules above opt Chromium/Electron into
- * WebKit custom scrollbar rendering, which ignores the standard
- * scrollbar-width: none that scrollbar-none generates. This explicit
- * pseudo-element override restores the hidden behavior.
+ * Keep this as a defensive Chromium/Electron fallback for full hiding.
  */
 .scrollbar-none::-webkit-scrollbar {
   display: none;
@@ -2207,6 +2176,16 @@ input[type="checkbox"] {
   }
 }
 
+/* Radix ScrollArea wraps viewport children in a `display: table; min-width: 100%`
+   div that lets content expand beyond the viewport width (table auto-layout sizes
+   to max-content). This pushes right-aligned elements (action buttons, badges) past
+   the overflow-hidden clip boundary. Force block layout so children respect the
+   viewport width constraint and flex rows truncate properly. */
+[data-radix-scroll-area-viewport] > div {
+  display: block !important;
+  min-width: 0 !important;
+}
+
 .subagent-connector-active {
   /* Remove solid background; dashes rendered by ::before pseudo-element */
   background: none !important;
@@ -2323,11 +2302,3 @@ input[type="checkbox"] {
 .titlebar-safe-right-gutter-3 { --titlebar-safe-right-gutter: 0.75rem; } /* px-3 */
 .titlebar-safe-right-gutter-2 { --titlebar-safe-right-gutter: 0.5rem; }  /* px-2 */
 
-
-
-/* Titlebar inset for WorkspaceMenuBar when left sidebar is collapsed.
- * The sidebar collapse state is synced to a data attribute on :root by App.tsx.
- * This centralizes the concern - WorkspaceMenuBar doesn't need props or JS logic. */
-:root[data-left-sidebar-collapsed="true"] [data-testid="workspace-menu-bar"] {
-  padding-left: 60px;
-}

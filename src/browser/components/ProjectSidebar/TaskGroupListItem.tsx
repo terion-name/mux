@@ -1,5 +1,6 @@
 import { ChevronRight, Layers3 } from "lucide-react";
 
+import { getSidebarItemPaddingLeft } from "@/browser/components/sidebarItemLayout";
 import { cn } from "@/common/lib/utils";
 import {
   formatTaskGroupHeader,
@@ -24,12 +25,8 @@ interface TaskGroupListItemProps {
   onToggle: () => void;
 }
 
-function getItemPaddingLeft(depth: number): number {
-  return 12 + Math.min(32, Math.max(0, depth)) * 12;
-}
-
 export function TaskGroupListItem(props: TaskGroupListItemProps) {
-  const paddingLeft = getItemPaddingLeft(props.depth);
+  const paddingLeft = getSidebarItemPaddingLeft(props.depth);
   const statusParts: string[] = [];
   if (props.runningCount > 0) {
     statusParts.push(`${props.runningCount} running`);
@@ -56,7 +53,7 @@ export function TaskGroupListItem(props: TaskGroupListItemProps) {
       data-testid={`task-group-${props.groupId}`}
       className={cn(
         "bg-surface-primary relative flex items-start gap-1.5 rounded-l-sm py-2 pr-2 pl-1 select-none transition-all duration-150 hover:bg-surface-secondary",
-        props.sectionId != null ? "ml-7.5" : "ml-5",
+        props.sectionId != null ? "ml-2" : "ml-0",
         props.isSelected && "bg-surface-secondary"
       )}
       style={{ paddingLeft }}
@@ -72,7 +69,7 @@ export function TaskGroupListItem(props: TaskGroupListItemProps) {
     >
       <span
         aria-hidden="true"
-        className="text-muted mt-0.5 -ml-4 inline-flex h-4 w-4 shrink-0 items-center justify-center"
+        className="text-muted mt-0.5 -ml-2.5 inline-flex h-4 w-4 shrink-0 items-center justify-center"
       >
         <ChevronRight
           className="h-3 w-3 transition-transform duration-150"

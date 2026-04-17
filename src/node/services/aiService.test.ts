@@ -19,6 +19,7 @@ import { InitStateManager } from "./initStateManager";
 import { ProviderService } from "./providerService";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { Config } from "@/node/config";
+import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 
@@ -28,13 +29,13 @@ import { MUX_APP_ATTRIBUTION_TITLE, MUX_APP_ATTRIBUTION_URL } from "@/constants/
 import type { ProviderName } from "@/common/constants/providers";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
+import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
-
-import { MUX_HELP_CHAT_AGENT_ID } from "@/common/constants/muxChat";
 
 import type { LanguageModel, Tool } from "ai";
 import { createMuxMessage } from "@/common/types/message";
-import type { MuxMessage } from "@/common/types/message";
+import type { ModelMessage, MuxMessage } from "@/common/types/message";
+import type { MuxToolScope } from "@/common/types/toolScope";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { uniqueSuffix } from "@/common/utils/hasher";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
@@ -44,15 +45,19 @@ import type {
   StreamAbortEvent,
   StreamEndEvent,
 } from "@/common/types/stream";
+import { log } from "./log";
+import type { SessionUsageService } from "./sessionUsageService";
 import type { StreamManager } from "./streamManager";
 import { ExperimentsService } from "./experimentsService";
 import type { DevToolsService } from "./devToolsService";
-import type { MCPServerManager } from "./mcpServerManager";
 import { TelemetryService } from "@/node/services/telemetryService";
 import * as agentResolution from "./agentResolution";
 import * as streamContextBuilder from "./streamContextBuilder";
 import * as messagePipeline from "./messagePipeline";
 import * as toolAssembly from "./toolAssembly";
+import type { ToolModelUsageEvent } from "@/common/utils/tools/tools";
+import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import { normalizeToCanonical } from "@/common/utils/ai/models";
 import * as toolsModule from "@/common/utils/tools/tools";
 import * as providerOptionsModule from "@/common/utils/ai/providerOptions";
 import * as system1ToolWrapperModule from "./system1ToolWrapper";
@@ -1158,11 +1163,14 @@ describe("AIService.createModel (Codex OAuth routing)", () => {
 
 describe("AIService.streamMessage compaction boundary slicing", () => {
   interface StreamMessageHarness {
+    config: Config;
     service: AIService;
     planPayloadMessageIds: string[][];
     preparedPayloadMessageIds: string[][];
     preparedToolNamesForSentinel: string[][];
+    streamSystemContextMuxScopes: MuxToolScope[];
     startStreamCalls: unknown[][];
+    getToolsForModelSpy: ReturnType<typeof spyOn<typeof toolsModule, "getToolsForModel">>;
   }
 
   function createWorkspaceMetadata(workspaceId: string, projectPath: string): WorkspaceMetadata {
@@ -1224,17 +1232,26 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       routeProvider?: ProviderName;
       allTools?: Record<string, Tool>;
       postPolicyTools?: Record<string, Tool>;
+      sessionUsageService?: SessionUsageService;
     }
   ): StreamMessageHarness {
     const config = new Config(muxHomePath);
     const historyService = new HistoryService(config);
     const initStateManager = new InitStateManager(config);
     const providerService = new ProviderService(config);
-    const service = new AIService(config, historyService, initStateManager, providerService);
+    const service = new AIService(
+      config,
+      historyService,
+      initStateManager,
+      providerService,
+      undefined,
+      options?.sessionUsageService
+    );
 
     const planPayloadMessageIds: string[][] = [];
     const preparedPayloadMessageIds: string[][] = [];
     const preparedToolNamesForSentinel: string[][] = [];
+    const streamSystemContextMuxScopes: MuxToolScope[] = [];
     const startStreamCalls: unknown[][] = [];
 
     const resolvedAgentResult: Awaited<ReturnType<typeof agentResolution.resolveAgentForStream>> = {
@@ -1275,13 +1292,19 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       return Promise.resolve(planInstructionsResult);
     });
 
-    spyOn(streamContextBuilder, "buildStreamSystemContext").mockResolvedValue({
-      agentSystemPrompt: "test-agent-prompt",
-      systemMessage: "test-system-message",
-      systemMessageTokens: 1,
-      agentDefinitions: undefined,
-      availableSkills: undefined,
-      ancestorPlanFilePaths: [],
+    spyOn(streamContextBuilder, "buildStreamSystemContext").mockImplementation((args) => {
+      if (!args.muxScope) {
+        throw new Error("Expected muxScope in stream system context build args");
+      }
+      streamSystemContextMuxScopes.push(args.muxScope);
+      return Promise.resolve({
+        agentSystemPrompt: "test-agent-prompt",
+        systemMessage: "test-system-message",
+        systemMessageTokens: 1,
+        agentDefinitions: undefined,
+        availableSkills: undefined,
+        ancestorPlanFilePaths: [],
+      });
     });
 
     spyOn(messagePipeline, "prepareMessagesForProvider").mockImplementation((args) => {
@@ -1294,7 +1317,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
 
     const allTools = options?.allTools ?? {};
-    spyOn(toolsModule, "getToolsForModel").mockResolvedValue(allTools);
+    const getToolsForModelSpy = spyOn(toolsModule, "getToolsForModel").mockResolvedValue(allTools);
     if (options?.postPolicyTools) {
       spyOn(toolAssembly, "applyToolPolicyAndExperiments").mockResolvedValue(
         options.postPolicyTools
@@ -1374,11 +1397,116 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
 
     return {
+      config,
       service,
       planPayloadMessageIds,
       preparedPayloadMessageIds,
       preparedToolNamesForSentinel,
+      streamSystemContextMuxScopes,
       startStreamCalls,
+      getToolsForModelSpy,
+    };
+  }
+
+  const START_STREAM_ON_CHUNK_INDEX = 22;
+  const START_STREAM_ON_STEP_MESSAGES_INDEX = 23;
+
+  interface AdvisorRuntimeForTests {
+    createModel: (modelString: string) => Promise<LanguageModel>;
+    takeToolCallSnapshot: (toolCallId: string) =>
+      | {
+          toolCallId: string;
+          toolName: "advisor";
+          input: Record<string, unknown>;
+          stepText: string;
+          stepReasoning: string;
+        }
+      | undefined;
+  }
+
+  type AdvisorOnChunk = (event: {
+    chunk: {
+      type: string;
+      delta?: string;
+      toolCallId?: string;
+      toolName?: string;
+      input?: unknown;
+    };
+  }) => PromiseLike<void> | void;
+
+  async function enableAdvisorForHarness(
+    harness: StreamMessageHarness,
+    advisorModelString = KNOWN_MODELS.SONNET.id
+  ): Promise<void> {
+    const baseConfig = harness.config.loadConfigOrDefault();
+    await harness.config.saveConfig({
+      ...baseConfig,
+      advisorModelString,
+      agentAiDefaults: {
+        ...baseConfig.agentAiDefaults,
+        exec: {
+          ...baseConfig.agentAiDefaults?.exec,
+          advisorEnabled: true,
+        },
+      },
+    });
+  }
+
+  async function startAdvisorStream(
+    harness: StreamMessageHarness,
+    workspaceId: string
+  ): Promise<Awaited<ReturnType<AIService["streamMessage"]>>> {
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "continue")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+      experiments: { advisorTool: true },
+    });
+    expect(result.success).toBe(true);
+    return result;
+  }
+
+  function getToolConfigFromHarness(harness: StreamMessageHarness): Record<string, unknown> {
+    const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
+    if (!toolConfig || typeof toolConfig !== "object") {
+      throw new Error("Expected getToolsForModel to receive a tool configuration object");
+    }
+    return toolConfig as unknown as Record<string, unknown>;
+  }
+
+  function getAdvisorRuntimeFromHarness(harness: StreamMessageHarness): AdvisorRuntimeForTests {
+    const toolConfig = getToolConfigFromHarness(harness);
+    const advisorRuntime = (toolConfig as { advisorRuntime?: AdvisorRuntimeForTests })
+      .advisorRuntime;
+    expect(advisorRuntime).toBeDefined();
+    if (!advisorRuntime) {
+      throw new Error("Expected advisorRuntime in tool configuration");
+    }
+    return advisorRuntime;
+  }
+
+  function getAdvisorCallbacksFromHarness(harness: StreamMessageHarness): {
+    onChunk: AdvisorOnChunk;
+    onStepMessages: (messages: ModelMessage[]) => void;
+  } {
+    expect(harness.startStreamCalls).toHaveLength(1);
+    const startStreamCall = harness.startStreamCalls[0];
+    if (!startStreamCall) {
+      throw new Error("Expected streamManager.startStream call arguments");
+    }
+
+    const onChunk = startStreamCall[START_STREAM_ON_CHUNK_INDEX];
+    const onStepMessages = startStreamCall[START_STREAM_ON_STEP_MESSAGES_INDEX];
+    expect(typeof onChunk).toBe("function");
+    expect(typeof onStepMessages).toBe("function");
+    if (typeof onChunk !== "function" || typeof onStepMessages !== "function") {
+      throw new Error("Expected advisor startStream callbacks");
+    }
+
+    return {
+      onChunk: onChunk as AdvisorOnChunk,
+      onStepMessages: onStepMessages as (messages: ModelMessage[]) => void,
     };
   }
 
@@ -1456,6 +1584,59 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         runtimeType: "local",
       },
     ]);
+  });
+
+  it("keeps legacy system workspaces on the global mux tool scope", async () => {
+    using muxHome = new DisposableTempDir("ai-service-system-tool-scope");
+    const projectPath = path.join(muxHome.path, "legacy-system-project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-system-tool-scope";
+    const metadata = createWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(muxHome.path, metadata);
+    await harness.config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, { workspaces: [], projectKind: "system" });
+      return cfg;
+    });
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "hello")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+    });
+
+    expect(result.success).toBe(true);
+    expect(harness.streamSystemContextMuxScopes.at(-1)).toEqual({
+      type: "global",
+      muxHome: muxHome.path,
+    });
+  });
+
+  it("keeps _multi workspaces on the project mux tool scope", async () => {
+    using muxHome = new DisposableTempDir("ai-service-multi-project-tool-scope");
+    const workspaceId = "workspace-multi-project-tool-scope";
+    const metadata = createWorkspaceMetadata(workspaceId, MULTI_PROJECT_CONFIG_KEY);
+    const harness = createHarness(muxHome.path, metadata);
+    await harness.config.editConfig((cfg) => {
+      cfg.projects.set(MULTI_PROJECT_CONFIG_KEY, { workspaces: [], projectKind: "system" });
+      return cfg;
+    });
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "hello")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+    });
+
+    expect(result.success).toBe(true);
+    expect(harness.streamSystemContextMuxScopes.at(-1)).toEqual({
+      type: "project",
+      muxHome: muxHome.path,
+      projectRoot: MULTI_PROJECT_CONFIG_KEY,
+      projectStorageAuthority: "host-local",
+    });
   });
 
   it("uses the latest durable boundary slice for provider payload and OpenAI derivations", async () => {
@@ -1743,294 +1924,474 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       `mux-v1-project-under-test-${uniqueSuffix([projectPath])}`
     );
   });
-});
 
-describe("AIService.streamMessage mux help agent suppression", () => {
-  function createWorkspaceMetadata(workspaceId: string, projectPath: string): WorkspaceMetadata {
-    return {
-      id: workspaceId,
-      name: "workspace-under-test",
-      projectName: "project-under-test",
-      projectPath,
-      runtimeConfig: { type: "local" },
-    };
-  }
+  it("freezes advisor tool-call snapshots at the tool-call boundary", async () => {
+    using muxHome = new DisposableTempDir("ai-service-advisor-step-snapshot-boundary");
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
 
-  function createHarness(
-    muxHomePath: string,
-    metadata: WorkspaceMetadata,
-    agentScope: "built-in" | "project"
-  ) {
-    const config = new Config(muxHomePath);
-    const historyService = new HistoryService(config);
-    const initStateManager = new InitStateManager(config);
-    const providerService = new ProviderService(config);
-    const service = new AIService(config, historyService, initStateManager, providerService);
+    const workspaceId = "workspace-advisor-step-snapshot-boundary";
+    const metadata = createWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(muxHome.path, metadata);
+    await enableAdvisorForHarness(harness);
 
-    const buildStreamSystemContextArgs: Array<
-      Parameters<typeof streamContextBuilder.buildStreamSystemContext>[0]
-    > = [];
-    const toolConfigCalls: Array<Parameters<typeof toolsModule.getToolsForModel>[1]> = [];
-    const mcpToolCalls: Array<Parameters<typeof toolsModule.getToolsForModel>[5]> = [];
-    const listServersCalls: Array<{ projectPath: string; overrides: unknown }> = [];
-    const getToolsForWorkspaceCalls: Array<{
-      workspaceId: string;
-      projectPath: string;
-      workspacePath: string;
-      projectSecrets?: Record<string, string>;
-    }> = [];
+    await startAdvisorStream(harness, workspaceId);
 
-    const projectSecrets: ReturnType<Config["getEffectiveSecrets"]> = [
-      { key: "PROJECT_TOKEN", value: "secret-value" },
-    ];
-    const getEffectiveSecretsSpy = spyOn(config, "getEffectiveSecrets").mockReturnValue(
-      projectSecrets
-    );
+    const advisorRuntime = getAdvisorRuntimeFromHarness(harness);
+    const { onChunk, onStepMessages } = getAdvisorCallbacksFromHarness(harness);
+    onStepMessages([{ role: "user", content: "continue" }]);
 
-    const resolvedAgentResult: Awaited<ReturnType<typeof agentResolution.resolveAgentForStream>> = {
-      success: true,
-      data: {
-        effectiveAgentId: MUX_HELP_CHAT_AGENT_ID,
-        agentDefinition: {
-          id: MUX_HELP_CHAT_AGENT_ID,
-          scope: agentScope,
-          frontmatter: { name: "Mux" },
-          body: "Mux agent body",
-        },
-        agentDiscoveryPath: metadata.projectPath,
-        isSubagentWorkspace: false,
-        agentIsPlanLike: false,
-        effectiveMode: "exec",
-        taskSettings: DEFAULT_TASK_SETTINGS,
-        taskDepth: 0,
-        shouldDisableTaskToolsForDepth: false,
-        effectiveToolPolicy: undefined,
+    const input = { focus: "shared context" };
+    await onChunk({ chunk: { type: "text-delta", delta: "draft answer" } });
+    await onChunk({ chunk: { type: "reasoning-delta", delta: "risk analysis" } });
+    await onChunk({
+      chunk: {
+        type: "tool-call",
+        toolCallId: "advisor-call-1",
+        toolName: "advisor",
+        input,
       },
-    };
-    spyOn(agentResolution, "resolveAgentForStream").mockResolvedValue(resolvedAgentResult);
-
-    spyOn(streamContextBuilder, "buildPlanInstructions").mockResolvedValue({
-      effectiveAdditionalInstructions: undefined,
-      planFilePath: path.join(metadata.projectPath, "plan.md"),
-      planContentForTransition: undefined,
     });
+    input.focus = "mutated after freeze";
 
-    spyOn(streamContextBuilder, "buildStreamSystemContext").mockImplementation((args) => {
-      buildStreamSystemContextArgs.push(args);
-      return Promise.resolve({
-        agentSystemPrompt: "test-agent-prompt",
-        systemMessage: "test-system-message",
-        systemMessageTokens: 1,
-        agentDefinitions: undefined,
-        availableSkills: undefined,
-        ancestorPlanFilePaths: [],
-      });
+    expect(advisorRuntime.takeToolCallSnapshot("advisor-call-1")).toEqual({
+      toolCallId: "advisor-call-1",
+      toolName: "advisor",
+      input: { focus: "shared context" },
+      stepText: "draft answer",
+      stepReasoning: "risk analysis",
     });
+  });
 
-    spyOn(messagePipeline, "prepareMessagesForProvider").mockImplementation((args) => {
-      const preparedMessages = args.messagesWithSentinel as unknown as Awaited<
-        ReturnType<typeof messagePipeline.prepareMessagesForProvider>
-      >;
-      return Promise.resolve(preparedMessages);
-    });
+  it("keeps multiple advisor tool-call snapshots isolated within the same step", async () => {
+    using muxHome = new DisposableTempDir("ai-service-advisor-step-snapshot-isolated");
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
 
-    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- stub MCP tool for streamMessage regression coverage
-    const stubMcpTool: Tool = {} as never;
-    const loadedMcpTools: Record<string, Tool> = { mcp_test_tool: stubMcpTool };
-    const listedServers = {};
-    const mcpServerManager = {
-      listServers: mock((projectPath: string, overrides: unknown) => {
-        listServersCalls.push({ projectPath, overrides });
-        return Promise.resolve(listedServers);
-      }),
-      getToolsForWorkspace: mock(
-        (options: {
-          workspaceId: string;
-          projectPath: string;
-          workspacePath: string;
-          projectSecrets?: Record<string, string>;
-        }) => {
-          getToolsForWorkspaceCalls.push({
-            workspaceId: options.workspaceId,
-            projectPath: options.projectPath,
-            workspacePath: options.workspacePath,
-            projectSecrets: options.projectSecrets,
-          });
-          return {
-            tools: loadedMcpTools,
-            stats: {
-              configuredServerCount: 1,
-              activeServerCount: 1,
-              failedServerCount: 0,
-              autoFallbackCount: 0,
-              hasStdio: true,
-              hasHttp: false,
-              hasSse: false,
-              transportMode: "stdio-only",
-            },
-          };
-        }
-      ),
-    } as unknown as MCPServerManager;
-    service.setMCPServerManager(mcpServerManager);
+    const workspaceId = "workspace-advisor-step-snapshot-isolated";
+    const metadata = createWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(muxHome.path, metadata);
+    await enableAdvisorForHarness(harness);
 
-    spyOn(toolsModule, "getToolsForModel").mockImplementation(
-      (_modelString, toolConfig, _workspaceId, _initStateManager, _toolInstructions, mcpTools) => {
-        toolConfigCalls.push(toolConfig);
-        mcpToolCalls.push(mcpTools);
-        return Promise.resolve({});
-      }
-    );
-    spyOn(toolAssembly, "applyToolPolicyAndExperiments").mockImplementation((args) =>
-      Promise.resolve(args.allTools)
-    );
-    spyOn(systemMessageModule, "readToolInstructions").mockResolvedValue({});
+    await startAdvisorStream(harness, workspaceId);
 
-    const fakeModel = Object.create(null) as LanguageModel;
-    const providerModelFactory = Reflect.get(service, "providerModelFactory") as
-      | ProviderModelFactory
-      | undefined;
-    if (!providerModelFactory) {
-      throw new Error("Expected AIService.providerModelFactory in mux help agent test harness");
-    }
+    const advisorRuntime = getAdvisorRuntimeFromHarness(harness);
+    const { onChunk, onStepMessages } = getAdvisorCallbacksFromHarness(harness);
+    onStepMessages([{ role: "user", content: "continue" }]);
 
-    const resolveAndCreateModelResult: Awaited<
-      ReturnType<ProviderModelFactory["resolveAndCreateModel"]>
-    > = {
-      success: true,
-      data: {
-        model: fakeModel,
-        effectiveModelString: "openai:gpt-5.2",
-        canonicalModelString: "openai:gpt-5.2",
-        canonicalProviderName: "openai",
-        canonicalModelId: "gpt-5.2",
-        routedThroughGateway: false,
+    await onChunk({ chunk: { type: "text-delta", delta: "alpha" } });
+    await onChunk({ chunk: { type: "reasoning-delta", delta: "first" } });
+    await onChunk({
+      chunk: {
+        type: "tool-call",
+        toolCallId: "advisor-call-1",
+        toolName: "advisor",
+        input: {},
       },
-    };
-    spyOn(providerModelFactory, "resolveAndCreateModel").mockResolvedValue(
-      resolveAndCreateModelResult
-    );
-
-    spyOn(service, "getWorkspaceMetadata").mockResolvedValue({
-      success: true,
-      data: metadata,
+    });
+    await onChunk({ chunk: { type: "text-delta", delta: " beta" } });
+    await onChunk({ chunk: { type: "reasoning-delta", delta: " second" } });
+    await onChunk({
+      chunk: {
+        type: "tool-call",
+        toolCallId: "advisor-call-2",
+        toolName: "advisor",
+        input: {},
+      },
     });
 
-    spyOn(initStateManager, "waitForInit").mockResolvedValue(undefined);
+    expect(advisorRuntime.takeToolCallSnapshot("advisor-call-1")).toMatchObject({
+      stepText: "alpha",
+      stepReasoning: "first",
+    });
+    expect(advisorRuntime.takeToolCallSnapshot("advisor-call-2")).toMatchObject({
+      stepText: "alpha beta",
+      stepReasoning: "first second",
+    });
+  });
 
-    spyOn(config, "findWorkspace").mockReturnValue({
-      workspacePath: metadata.projectPath,
-      projectPath: metadata.projectPath,
+  it("resets advisor step capture buffers and frozen snapshots between steps", async () => {
+    using muxHome = new DisposableTempDir("ai-service-advisor-step-snapshot-reset");
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-advisor-step-snapshot-reset";
+    const metadata = createWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(muxHome.path, metadata);
+    await enableAdvisorForHarness(harness);
+
+    await startAdvisorStream(harness, workspaceId);
+
+    const advisorRuntime = getAdvisorRuntimeFromHarness(harness);
+    const { onChunk, onStepMessages } = getAdvisorCallbacksFromHarness(harness);
+    onStepMessages([{ role: "user", content: "step 1" }]);
+
+    await onChunk({ chunk: { type: "text-delta", delta: "old text" } });
+    await onChunk({ chunk: { type: "reasoning-delta", delta: "old reasoning" } });
+    await onChunk({
+      chunk: {
+        type: "tool-call",
+        toolCallId: "advisor-call-1",
+        toolName: "advisor",
+        input: {},
+      },
     });
 
-    spyOn(historyService, "commitPartial").mockResolvedValue({
-      success: true,
-      data: undefined,
+    onStepMessages([{ role: "user", content: "step 2" }]);
+    expect(advisorRuntime.takeToolCallSnapshot("advisor-call-1")).toBeUndefined();
+
+    await onChunk({ chunk: { type: "text-delta", delta: "new text" } });
+    await onChunk({ chunk: { type: "reasoning-delta", delta: "new reasoning" } });
+    await onChunk({
+      chunk: {
+        type: "tool-call",
+        toolCallId: "advisor-call-2",
+        toolName: "advisor",
+        input: {},
+      },
     });
 
-    spyOn(historyService, "appendToHistory").mockImplementation((_workspaceId, message) => {
-      message.metadata = {
-        ...(message.metadata ?? {}),
-        historySequence: 11,
-      };
+    expect(advisorRuntime.takeToolCallSnapshot("advisor-call-2")).toEqual({
+      toolCallId: "advisor-call-2",
+      toolName: "advisor",
+      input: {},
+      stepText: "new text",
+      stepReasoning: "new reasoning",
+    });
+  });
 
-      return Promise.resolve({ success: true, data: undefined });
+  it("consumes advisor tool-call snapshots on first read", async () => {
+    using muxHome = new DisposableTempDir("ai-service-advisor-step-snapshot-consume");
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-advisor-step-snapshot-consume";
+    const metadata = createWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(muxHome.path, metadata);
+    await enableAdvisorForHarness(harness);
+
+    await startAdvisorStream(harness, workspaceId);
+
+    const advisorRuntime = getAdvisorRuntimeFromHarness(harness);
+    const { onChunk, onStepMessages } = getAdvisorCallbacksFromHarness(harness);
+    onStepMessages([{ role: "user", content: "continue" }]);
+
+    await onChunk({ chunk: { type: "text-delta", delta: "visible text" } });
+    await onChunk({
+      chunk: {
+        type: "tool-call",
+        toolCallId: "advisor-call-1",
+        toolName: "advisor",
+        input: {},
+      },
     });
 
-    const streamManager = (service as unknown as { streamManager: StreamManager }).streamManager;
-    const streamToken = "stream-token" as ReturnType<StreamManager["generateStreamToken"]>;
+    expect(advisorRuntime.takeToolCallSnapshot("advisor-call-1")).toMatchObject({
+      toolCallId: "advisor-call-1",
+      stepText: "visible text",
+    });
+    expect(advisorRuntime.takeToolCallSnapshot("advisor-call-1")).toBeUndefined();
+  });
 
-    spyOn(streamManager, "generateStreamToken").mockReturnValue(streamToken);
-    spyOn(streamManager, "createTempDirForStream").mockResolvedValue(
-      path.join(metadata.projectPath, ".tmp-stream")
-    );
-    spyOn(streamManager, "isResponseIdLost").mockReturnValue(false);
-    spyOn(streamManager, "startStream").mockResolvedValue({
-      success: true,
-      data: streamToken,
+  it("resolves advisor tool metadata pricing without changing the stored model bucket", async () => {
+    using muxHome = new DisposableTempDir("ai-service-tool-model-usage");
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-tool-model-usage";
+    const metadata = createWorkspaceMetadata(workspaceId, projectPath);
+    const recordUsage = mock(() => Promise.resolve(undefined));
+    const getSessionUsage = mock(() => Promise.resolve(undefined));
+    const sessionUsageService = {
+      recordUsage,
+      getSessionUsage,
+    } as unknown as SessionUsageService;
+    const harness = createHarness(muxHome.path, metadata, { sessionUsageService });
+    const metadataModel = KNOWN_MODELS.SONNET.id;
+    harness.config.saveProvidersConfig({
+      anthropic: {
+        models: [{ id: "custom-sonnet", mappedToModel: metadataModel }],
+      },
     });
 
-    return {
-      service,
-      projectSecrets,
-      listedServers,
-      loadedMcpTools,
-      buildStreamSystemContextArgs,
-      toolConfigCalls,
-      mcpToolCalls,
-      listServersCalls,
-      getToolsForWorkspaceCalls,
-      getEffectiveSecretsSpy,
-    };
-  }
-
-  async function streamAndAssertSuccess(
-    harness: ReturnType<typeof createHarness>,
-    workspaceId: string
-  ): Promise<void> {
     const result = await harness.service.streamMessage({
-      messages: [createMuxMessage("user-message", "user", "hello")],
+      messages: [createMuxMessage("latest-user", "user", "continue")],
       workspaceId,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
     });
 
     expect(result.success).toBe(true);
-  }
+    const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
+    if (!toolConfig || typeof toolConfig !== "object") {
+      throw new Error("Expected getToolsForModel to receive a tool configuration object");
+    }
 
-  afterEach(() => {
-    mock.restore();
-  });
+    const reportModelUsage = (
+      toolConfig as {
+        reportModelUsage?: (event: ToolModelUsageEvent) => void;
+      }
+    ).reportModelUsage;
+    expect(typeof reportModelUsage).toBe("function");
+    if (!reportModelUsage) {
+      throw new Error("Expected reportModelUsage callback on tool configuration");
+    }
 
-  it("suppresses secrets and MCP only for the built-in mux help agent", async () => {
-    using muxHome = new DisposableTempDir("ai-service-built-in-mux-help-agent");
-    const projectPath = path.join(muxHome.path, "project");
-    await fs.mkdir(projectPath, { recursive: true });
-
-    const workspaceId = "workspace-built-in-mux-help";
-    const metadata = createWorkspaceMetadata(workspaceId, projectPath);
-    const harness = createHarness(muxHome.path, metadata, "built-in");
-
-    await streamAndAssertSuccess(harness, workspaceId);
-
-    expect(harness.getEffectiveSecretsSpy).not.toHaveBeenCalled();
-    expect(harness.listServersCalls).toHaveLength(0);
-    expect(harness.getToolsForWorkspaceCalls).toHaveLength(0);
-    expect(harness.buildStreamSystemContextArgs).toHaveLength(1);
-    expect(harness.buildStreamSystemContextArgs[0]?.mcpServers).toBeUndefined();
-    expect(harness.toolConfigCalls).toHaveLength(1);
-    expect(harness.toolConfigCalls[0]?.secrets).toEqual({});
-    expect(harness.mcpToolCalls).toEqual([undefined]);
-  });
-
-  it("keeps secrets and MCP enabled for project-scoped agents that reuse the mux id", async () => {
-    using muxHome = new DisposableTempDir("ai-service-project-mux-help-agent");
-    const projectPath = path.join(muxHome.path, "project");
-    await fs.mkdir(projectPath, { recursive: true });
-
-    const workspaceId = "workspace-project-mux-help";
-    const metadata = createWorkspaceMetadata(workspaceId, projectPath);
-    const harness = createHarness(muxHome.path, metadata, "project");
-
-    await streamAndAssertSuccess(harness, workspaceId);
-
-    expect(harness.getEffectiveSecretsSpy).toHaveBeenCalledTimes(1);
-    expect(harness.getEffectiveSecretsSpy).toHaveBeenCalledWith(projectPath);
-    expect(harness.listServersCalls).toEqual([{ projectPath, overrides: undefined }]);
-    expect(harness.buildStreamSystemContextArgs).toHaveLength(1);
-    expect(harness.buildStreamSystemContextArgs[0]?.mcpServers).toEqual(harness.listedServers);
-    expect(harness.getToolsForWorkspaceCalls).toEqual([
-      {
-        workspaceId,
-        projectPath,
-        workspacePath: projectPath,
-        projectSecrets: { PROJECT_TOKEN: "secret-value" },
+    const event: ToolModelUsageEvent = {
+      source: "tool",
+      toolName: "advisor",
+      model: "anthropic:custom-sonnet",
+      usage: {
+        inputTokens: 120,
+        cachedInputTokens: 10,
+        outputTokens: 45,
+        reasoningTokens: 5,
+        totalTokens: 165,
       },
-    ]);
-    expect(harness.toolConfigCalls).toHaveLength(1);
-    expect(harness.toolConfigCalls[0]?.secrets).toEqual({ PROJECT_TOKEN: "secret-value" });
-    expect(harness.mcpToolCalls).toEqual([harness.loadedMcpTools]);
-    expect(harness.projectSecrets).toEqual([{ key: "PROJECT_TOKEN", value: "secret-value" }]);
+      providerMetadata: {
+        anthropic: { cacheCreationInputTokens: 6 },
+      },
+      toolCallId: "call-1",
+      timestamp: Date.now(),
+    };
+    const unresolvedDisplayUsage = createDisplayUsage(
+      event.usage,
+      event.model,
+      event.providerMetadata
+    );
+    expect(unresolvedDisplayUsage).toBeDefined();
+    if (!unresolvedDisplayUsage) {
+      throw new Error("Expected unresolved tool usage event to produce display usage");
+    }
+    expect(unresolvedDisplayUsage.input.cost_usd).toBeUndefined();
+
+    const expectedDisplayUsage = createDisplayUsage(
+      event.usage,
+      event.model,
+      event.providerMetadata,
+      metadataModel
+    );
+    expect(expectedDisplayUsage).toBeDefined();
+    if (!expectedDisplayUsage) {
+      throw new Error("Expected tool usage event to produce display usage");
+    }
+    expect(expectedDisplayUsage.model).toBe(event.model);
+    expect(expectedDisplayUsage.input.cost_usd).toBeDefined();
+
+    const canonicalModel = normalizeToCanonical(event.model);
+    const callSequence: string[] = [];
+    let sessionUsageDeltaEvent: unknown;
+    harness.service.once("session-usage-delta", (payload) => {
+      callSequence.push("emit");
+      sessionUsageDeltaEvent = payload;
+    });
+
+    recordUsage.mockImplementationOnce(() => {
+      callSequence.push("recordUsage");
+      return Promise.resolve(undefined);
+    });
+
+    reportModelUsage(event);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(recordUsage).toHaveBeenCalledWith(workspaceId, canonicalModel, expectedDisplayUsage);
+    expect(callSequence).toEqual(["recordUsage", "emit"]);
+    expect(sessionUsageDeltaEvent).toBeDefined();
+    if (typeof sessionUsageDeltaEvent !== "object" || sessionUsageDeltaEvent === null) {
+      throw new Error("Expected session-usage-delta event payload");
+    }
+    const sessionUsageDeltaRecord = sessionUsageDeltaEvent as Record<string, unknown>;
+    expect(sessionUsageDeltaRecord.type).toBe("session-usage-delta");
+    expect(sessionUsageDeltaRecord.workspaceId).toBe(workspaceId);
+    expect(sessionUsageDeltaRecord.sourceWorkspaceId).toBe(workspaceId);
+    expect(sessionUsageDeltaRecord.byModelDelta).toEqual({
+      [canonicalModel]: expectedDisplayUsage,
+    });
+    expect(typeof sessionUsageDeltaRecord.timestamp).toBe("number");
+  });
+
+  it("zeros advisor tool usage costs for costs-included models before persisting", async () => {
+    using muxHome = new DisposableTempDir("ai-service-tool-model-usage-costs-included");
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-tool-model-usage-costs-included";
+    const metadata = createWorkspaceMetadata(workspaceId, projectPath);
+    const recordUsage = mock(() => Promise.resolve(undefined));
+    const getSessionUsage = mock(() => Promise.resolve(undefined));
+    const sessionUsageService = {
+      recordUsage,
+      getSessionUsage,
+    } as unknown as SessionUsageService;
+    const harness = createHarness(muxHome.path, metadata, { sessionUsageService });
+
+    harness.config.saveProvidersConfig({
+      openai: {
+        codexOauth: {
+          type: "oauth",
+          access: "test-access-token",
+          refresh: "test-refresh-token",
+          expires: Date.now() + 60_000,
+          accountId: "test-account-id",
+        },
+      },
+    });
+    const baseConfig = harness.config.loadConfigOrDefault();
+    await harness.config.saveConfig({
+      ...baseConfig,
+      advisorModelString: KNOWN_MODELS.GPT_53_CODEX.id,
+      agentAiDefaults: {
+        ...baseConfig.agentAiDefaults,
+        exec: {
+          ...baseConfig.agentAiDefaults?.exec,
+          advisorEnabled: true,
+        },
+      },
+    });
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "continue")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+      experiments: { advisorTool: true },
+    });
+
+    expect(result.success).toBe(true);
+    const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
+    if (!toolConfig || typeof toolConfig !== "object") {
+      throw new Error("Expected getToolsForModel to receive a tool configuration object");
+    }
+
+    const advisorRuntime = (
+      toolConfig as {
+        advisorRuntime?: {
+          createModel: (modelString: string) => Promise<LanguageModel>;
+        };
+      }
+    ).advisorRuntime;
+    expect(advisorRuntime).toBeDefined();
+    if (!advisorRuntime) {
+      throw new Error("Expected advisorRuntime in tool configuration");
+    }
+    await advisorRuntime.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+
+    const reportModelUsage = (
+      toolConfig as {
+        reportModelUsage?: (event: ToolModelUsageEvent) => void;
+      }
+    ).reportModelUsage;
+    if (!reportModelUsage) {
+      throw new Error("Expected reportModelUsage callback on tool configuration");
+    }
+
+    const event: ToolModelUsageEvent = {
+      source: "tool",
+      toolName: "advisor",
+      model: KNOWN_MODELS.GPT_53_CODEX.id,
+      usage: {
+        inputTokens: 120,
+        outputTokens: 45,
+        totalTokens: 165,
+      },
+      providerMetadata: {
+        openai: { reasoningTokens: 5 },
+      },
+      timestamp: Date.now(),
+    };
+    const expectedDisplayUsage = createDisplayUsage(event.usage, event.model, {
+      ...(event.providerMetadata ?? {}),
+      mux: { costsIncluded: true },
+    });
+    expect(expectedDisplayUsage).toBeDefined();
+    if (!expectedDisplayUsage) {
+      throw new Error("Expected tool usage event to produce display usage");
+    }
+    expect(expectedDisplayUsage.costsIncluded).toBe(true);
+    expect(expectedDisplayUsage.input.cost_usd).toBe(0);
+    expect(expectedDisplayUsage.output.cost_usd).toBe(0);
+    expect(expectedDisplayUsage.reasoning.cost_usd).toBe(0);
+
+    reportModelUsage(event);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(recordUsage).toHaveBeenCalledWith(
+      workspaceId,
+      normalizeToCanonical(event.model),
+      expectedDisplayUsage
+    );
+  });
+
+  it("logs and swallows tool model usage persistence failures", async () => {
+    using muxHome = new DisposableTempDir("ai-service-tool-model-usage-failure");
+    const projectPath = path.join(muxHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-tool-model-usage-failure";
+    const metadata = createWorkspaceMetadata(workspaceId, projectPath);
+    const recordUsageError = new Error("write failed");
+    const recordUsage = mock(() => Promise.reject(recordUsageError));
+    const getSessionUsage = mock(() => Promise.resolve(undefined));
+    const sessionUsageService = {
+      recordUsage,
+      getSessionUsage,
+    } as unknown as SessionUsageService;
+    const warnSpy = spyOn(log, "warn").mockImplementation(() => undefined);
+    const harness = createHarness(muxHome.path, metadata, { sessionUsageService });
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "continue")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+    });
+
+    expect(result.success).toBe(true);
+    const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
+    if (!toolConfig || typeof toolConfig !== "object") {
+      throw new Error("Expected getToolsForModel to receive a tool configuration object");
+    }
+
+    const reportModelUsage = (
+      toolConfig as {
+        reportModelUsage?: (event: ToolModelUsageEvent) => void;
+      }
+    ).reportModelUsage;
+    if (!reportModelUsage) {
+      throw new Error("Expected reportModelUsage callback on tool configuration");
+    }
+
+    const event: ToolModelUsageEvent = {
+      source: "tool",
+      toolName: "advisor",
+      model: "anthropic:claude-sonnet-4-20250514",
+      usage: {
+        inputTokens: 50,
+        outputTokens: 20,
+        totalTokens: 70,
+      },
+      providerMetadata: {
+        anthropic: { cacheCreationInputTokens: 2 },
+      },
+      toolCallId: "call-2",
+      timestamp: Date.now(),
+    };
+
+    reportModelUsage(event);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      "Failed to record tool model usage",
+      expect.objectContaining({
+        error: recordUsageError,
+        workspaceId,
+        toolName: "advisor",
+        model: event.model,
+      })
+    );
   });
 });
 
@@ -2041,7 +2402,11 @@ describe("AIService.streamMessage multi-project trust gating", () => {
     getToolsForModelSpy: ReturnType<typeof spyOn<typeof toolsModule, "getToolsForModel">>;
   }
 
-  function createTrustMetadata(workspaceId: string, projectPaths: string[]): WorkspaceMetadata {
+  function createTrustMetadata(
+    workspaceId: string,
+    projectPaths: string[],
+    runtimeConfig: WorkspaceMetadata["runtimeConfig"] = { type: "local" }
+  ): WorkspaceMetadata {
     const [primaryProjectPath, secondaryProjectPath] = projectPaths;
     if (!primaryProjectPath) {
       throw new Error("Expected at least one project path");
@@ -2058,14 +2423,15 @@ describe("AIService.streamMessage multi-project trust gating", () => {
             { projectPath: secondaryProjectPath, projectName: "project-b" },
           ]
         : undefined,
-      runtimeConfig: { type: "local" },
+      runtimeConfig,
     };
   }
 
   function createHarness(
     muxHomePath: string,
     metadata: WorkspaceMetadata,
-    multiProjectExperimentEnabled = true
+    multiProjectExperimentEnabled = true,
+    workspacePathOverride?: string
   ): TrustGatingHarness {
     const config = new Config(muxHomePath);
     const historyService = new HistoryService(config);
@@ -2175,7 +2541,7 @@ describe("AIService.streamMessage multi-project trust gating", () => {
     spyOn(initStateManager, "waitForInit").mockResolvedValue(undefined);
 
     spyOn(config, "findWorkspace").mockReturnValue({
-      workspacePath: metadata.projectPath,
+      workspacePath: workspacePathOverride ?? metadata.projectPath,
       projectPath: metadata.projectPath,
     });
 
@@ -2281,6 +2647,42 @@ describe("AIService.streamMessage multi-project trust gating", () => {
     expect(trustedFromFirstGetToolsCall(harness.getToolsForModelSpy)).toBe(false);
   });
 
+  it("uses the persisted workspace root as cwd for multi-project ssh startup", async () => {
+    using muxHome = new DisposableTempDir("ai-service-multi-project-persisted-cwd");
+    const projectAPath = path.join(muxHome.path, "project-a");
+    const projectBPath = path.join(muxHome.path, "project-b");
+    await fs.mkdir(projectAPath, { recursive: true });
+    await fs.mkdir(projectBPath, { recursive: true });
+
+    const workspaceId = "workspace-multi-project-persisted-cwd";
+    const persistedWorkspacePath = path.join(muxHome.path, "persisted-legacy-workspace-root");
+    const metadata = createTrustMetadata(workspaceId, [projectAPath, projectBPath], {
+      type: "ssh",
+      host: "example.com",
+      srcBaseDir: "/remote/src",
+    });
+    const harness = createHarness(muxHome.path, metadata, true, persistedWorkspacePath);
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockImplementation(
+      (_runtimeConfig, options) => new LocalRuntime(options?.projectPath ?? projectAPath)
+    );
+
+    try {
+      await harness.config.editConfig((cfg) => {
+        cfg.projects.set(projectAPath, { workspaces: [], trusted: true });
+        cfg.projects.set(projectBPath, { workspaces: [], trusted: true });
+        return cfg;
+      });
+
+      await streamOnce(harness, workspaceId);
+
+      const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1] as
+        | { cwd?: unknown }
+        | undefined;
+      expect(toolConfig?.cwd).toBe(persistedWorkspacePath);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
   it("fails closed before tool setup when the multi-project experiment is disabled", async () => {
     using muxHome = new DisposableTempDir("ai-service-multi-project-experiment-disabled");
     const projectAPath = path.join(muxHome.path, "project-a");

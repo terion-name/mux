@@ -1,4 +1,4 @@
-import type { UIMessage } from "ai";
+import type { ModelMessage, UIMessage } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { StreamErrorType } from "./errors";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
@@ -9,6 +9,8 @@ import type { AgentMode } from "./mode";
 import type { AgentSkillScope } from "./agentSkill";
 import type { ThinkingLevel } from "./thinking";
 import { type ReviewNoteData, formatReviewForModel } from "./review";
+
+export type { ModelMessage };
 
 /**
  * Review data stored in message metadata for display.
@@ -49,6 +51,7 @@ type PreservedSendOptions = Pick<
   | "providerOptions"
   | "experiments"
   | "disableWorkspaceAgents"
+  | "skipAiSettingsPersistence"
 >;
 
 /**
@@ -62,6 +65,7 @@ export function pickPreservedSendOptions(options: SendMessageOptions): Preserved
     providerOptions: options.providerOptions,
     experiments: options.experiments,
     disableWorkspaceAgents: options.disableWorkspaceAgents,
+    skipAiSettingsPersistence: options.skipAiSettingsPersistence,
   };
 }
 
@@ -107,6 +111,11 @@ export function pickStartupRetrySendOptions(
   };
 }
 
+export interface CompactionFollowUpDispatchOptions {
+  /** Skip the queued follow-up instead of replaying it later if the workspace stopped being idle. */
+  requireIdle?: boolean;
+}
+
 /**
  * Content to send after compaction completes.
  * Extends CompactionFollowUpInput with model/agentId for the follow-up message,
@@ -125,6 +134,8 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
   model: string;
   /** Agent ID for the follow-up message (user's original agentId, not "compact") */
   agentId: string;
+  /** Internal dispatch guardrails for crash-safe follow-up recovery. */
+  dispatchOptions?: CompactionFollowUpDispatchOptions;
 }
 
 /**
@@ -361,6 +372,9 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
     | {
         type: "heartbeat-request";
         /** Synthetic heartbeat follow-ups use an explicit marker so future backend dispatch stays inspectable. */
+        source?: "heartbeat";
+        /** Transient status to display while the heartbeat is running. */
+        displayStatus?: DisplayStatus;
       }
     | {
         type: "normal"; // Regular messages
@@ -436,9 +450,10 @@ export interface MuxMetadata {
   uiVisible?: boolean;
   error?: string; // Error message if stream failed
   errorType?: StreamErrorType; // Error type/category if stream failed
-  // Compaction source: "user" (manual /compact), "idle" (auto-triggered), or legacy boolean `true`
+  // Compaction source: "user" (manual /compact), "idle" (auto-triggered summary),
+  // "heartbeat" (synthetic heartbeat reset boundary), or legacy boolean `true`.
   // Readers should use helper: isCompacted = compacted !== undefined && compacted !== false
-  compacted?: "user" | "idle" | boolean;
+  compacted?: "user" | "idle" | "heartbeat" | boolean;
   /**
    * Monotonic compaction epoch identifier.
    *

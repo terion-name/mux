@@ -4,7 +4,11 @@ import { GlobalWindow } from "happy-dom";
 import { StrictMode } from "react";
 import { useLocation } from "react-router-dom";
 import type { WorkspaceSelection } from "@/browser/components/AgentListItem/AgentListItem";
-import { LAUNCH_BEHAVIOR_KEY, SELECTED_WORKSPACE_KEY } from "@/common/constants/storage";
+import {
+  LAST_VISITED_ROUTE_KEY,
+  LAUNCH_BEHAVIOR_KEY,
+  SELECTED_WORKSPACE_KEY,
+} from "@/common/constants/storage";
 import { RouterProvider, useRouter, type RouterContext } from "./RouterContext";
 
 function createMatchMedia(isStandalone = false): typeof window.matchMedia {
@@ -21,7 +25,12 @@ function createMatchMedia(isStandalone = false): typeof window.matchMedia {
     }) satisfies MediaQueryList) as typeof window.matchMedia;
 }
 
-function installWindow(url: string, options?: { isStandalone?: boolean }) {
+type NavigationType = "navigate" | "reload" | "back_forward" | "prerender";
+
+function installWindow(
+  url: string,
+  options?: { isStandalone?: boolean; navigationType?: NavigationType }
+) {
   // Happy DOM can default to an opaque origin ("null") which breaks URL-based
   // logic in RouterContext. Give it a stable origin.
   const happyWindow = new GlobalWindow({ url });
@@ -30,6 +39,15 @@ function installWindow(url: string, options?: { isStandalone?: boolean }) {
   globalThis.window.matchMedia = createMatchMedia(options?.isStandalone);
   globalThis.window.localStorage.clear();
   globalThis.window.sessionStorage.clear();
+
+  const navigationEntries = [
+    { type: options?.navigationType ?? "navigate" } as unknown as PerformanceNavigationTiming,
+  ];
+  Object.defineProperty(globalThis.window.performance, "getEntriesByType", {
+    configurable: true,
+    value: (entryType: string) =>
+      entryType === "navigation" ? (navigationEntries as unknown as PerformanceEntryList) : [],
+  });
 }
 
 function PathnameObserver() {
@@ -134,6 +152,21 @@ describe("browser startup launch behavior", () => {
     });
   });
 
+  test("same-tab browser reload preserves a /workspace/:id URL in dashboard mode", async () => {
+    installWindow("https://mux.example.com/workspace/reload-me", { navigationType: "reload" });
+    window.localStorage.setItem(LAUNCH_BEHAVIOR_KEY, JSON.stringify("dashboard"));
+
+    const view = render(
+      <RouterProvider>
+        <PathnameObserver />
+      </RouterProvider>
+    );
+
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/workspace/reload-me");
+    });
+  });
+
   test("last-workspace mode preserves a /workspace/:id URL", async () => {
     installWindow("https://mux.example.com/workspace/stale-123");
     window.localStorage.setItem(LAUNCH_BEHAVIOR_KEY, JSON.stringify("last-workspace"));
@@ -179,6 +212,187 @@ describe("browser startup launch behavior", () => {
   });
 });
 
+describe("desktop startup route restoration", () => {
+  afterEach(() => {
+    cleanup();
+    globalThis.window = undefined as unknown as Window & typeof globalThis;
+    globalThis.document = undefined as unknown as Document;
+  });
+
+  test("restores the last visited route when Electron boots from file:///index.html", async () => {
+    installWindow("file:///index.html");
+    window.localStorage.setItem(LAST_VISITED_ROUTE_KEY, JSON.stringify("/workspace/reload-me"));
+
+    const view = render(
+      <RouterProvider>
+        <PathnameObserver />
+      </RouterProvider>
+    );
+
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/workspace/reload-me");
+    });
+  });
+
+  test("ignores persisted desktop root routes so last-workspace fallback can win", async () => {
+    installWindow("file:///index.html");
+
+    const savedWorkspace: WorkspaceSelection = {
+      workspaceId: "workspace-123",
+      projectPath: "/tmp/project",
+      projectName: "Test Project",
+      namedWorkspacePath: "/tmp/project/workspace-123",
+    };
+
+    window.localStorage.setItem(LAST_VISITED_ROUTE_KEY, JSON.stringify("/"));
+    window.localStorage.setItem(LAUNCH_BEHAVIOR_KEY, JSON.stringify("last-workspace"));
+    window.localStorage.setItem(SELECTED_WORKSPACE_KEY, JSON.stringify(savedWorkspace));
+
+    const view = render(
+      <RouterProvider>
+        <PathnameObserver />
+      </RouterProvider>
+    );
+
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/workspace/workspace-123");
+    });
+  });
+
+  test("ignores malformed persisted desktop routes instead of crashing startup", async () => {
+    installWindow("file:///index.html");
+    window.localStorage.setItem(LAST_VISITED_ROUTE_KEY, JSON.stringify({ bad: true }));
+
+    const view = render(
+      <RouterProvider>
+        <PathnameObserver />
+      </RouterProvider>
+    );
+
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/");
+    });
+  });
+
+  test("ignores invalid percent-encoded workspace routes instead of restoring a crash loop", async () => {
+    installWindow("file:///index.html");
+    window.localStorage.setItem(LAST_VISITED_ROUTE_KEY, JSON.stringify("/workspace/%"));
+
+    const view = render(
+      <RouterProvider>
+        <PathnameObserver />
+      </RouterProvider>
+    );
+
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/");
+    });
+  });
+
+  test("ignores desktop routes that only share a project/analytics prefix", async () => {
+    installWindow("file:///index.html");
+    window.localStorage.setItem(LAST_VISITED_ROUTE_KEY, JSON.stringify("/projectevil"));
+
+    let view = render(
+      <RouterProvider>
+        <PathnameObserver />
+      </RouterProvider>
+    );
+
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/");
+    });
+
+    cleanup();
+    installWindow("file:///index.html");
+    window.localStorage.setItem(LAST_VISITED_ROUTE_KEY, JSON.stringify("/analytics-old"));
+
+    view = render(
+      <RouterProvider>
+        <PathnameObserver />
+      </RouterProvider>
+    );
+
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/");
+    });
+  });
+
+  test("persists route changes so the next desktop load can restore them", async () => {
+    installWindow("file:///index.html");
+    let latestRouter: RouterContext | null = null;
+
+    function Observer() {
+      latestRouter = useRouter();
+      return <PathnameObserver />;
+    }
+
+    const view = render(
+      <RouterProvider>
+        <Observer />
+      </RouterProvider>
+    );
+
+    await waitFor(() => {
+      expect(latestRouter).not.toBeNull();
+      expect(view.getByTestId("pathname").textContent).toBe("/");
+    });
+
+    act(() => {
+      latestRouter!.navigateToWorkspace("persist-me");
+    });
+
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/workspace/persist-me");
+      expect(window.localStorage.getItem(LAST_VISITED_ROUTE_KEY)).toBe(
+        JSON.stringify("/workspace/persist-me")
+      );
+    });
+  });
+  test("keeps the last meaningful desktop route when navigation briefly hits /", async () => {
+    installWindow("file:///index.html");
+    let latestRouter: RouterContext | null = null;
+
+    function Observer() {
+      latestRouter = useRouter();
+      return <PathnameObserver />;
+    }
+
+    const view = render(
+      <RouterProvider>
+        <Observer />
+      </RouterProvider>
+    );
+
+    await waitFor(() => {
+      expect(latestRouter).not.toBeNull();
+      expect(view.getByTestId("pathname").textContent).toBe("/");
+    });
+
+    act(() => {
+      latestRouter!.navigateToWorkspace("persist-me");
+    });
+
+    await waitFor(() => {
+      expect(window.localStorage.getItem(LAST_VISITED_ROUTE_KEY)).toBe(
+        JSON.stringify("/workspace/persist-me")
+      );
+    });
+
+    act(() => {
+      latestRouter!.navigateToHome();
+    });
+
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/");
+    });
+
+    expect(window.localStorage.getItem(LAST_VISITED_ROUTE_KEY)).toBe(
+      JSON.stringify("/workspace/persist-me")
+    );
+  });
+});
+
 describe("standalone PWA startup", () => {
   afterEach(() => {
     cleanup();
@@ -199,7 +413,6 @@ describe("standalone PWA startup", () => {
 
     await waitFor(() => {
       expect(view.getByTestId("pathname").textContent).toBe("/");
-      expect(window.sessionStorage.getItem("muxStandaloneSessionInitialized")).toBe("1");
     });
   });
 
@@ -241,8 +454,10 @@ describe("standalone PWA startup", () => {
   });
 
   test("still restores the current route on reloads inside the same standalone window", async () => {
-    installWindow("https://mux.example.com/workspace/reload-me", { isStandalone: true });
-    window.sessionStorage.setItem("muxStandaloneSessionInitialized", "1");
+    installWindow("https://mux.example.com/workspace/reload-me", {
+      isStandalone: true,
+      navigationType: "reload",
+    });
 
     const view = render(
       <RouterProvider>

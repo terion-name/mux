@@ -75,7 +75,12 @@ function updateAgentDefaultEntry(
     updated.thinkingLevel = enforceThinkingPolicy(updated.modelString, updated.thinkingLevel);
   }
 
-  if (!updated.modelString && !updated.thinkingLevel && updated.enabled === undefined) {
+  if (
+    !updated.modelString &&
+    !updated.thinkingLevel &&
+    updated.enabled === undefined &&
+    updated.advisorEnabled === undefined
+  ) {
     delete next[normalizedId];
   } else {
     next[normalizedId] = updated;
@@ -174,6 +179,7 @@ function areTaskSettingsEqual(a: TaskSettings, b: TaskSettings): boolean {
     a.maxParallelAgentTasks === b.maxParallelAgentTasks &&
     a.maxTaskNestingDepth === b.maxTaskNestingDepth &&
     a.proposePlanImplementReplacesChatHistory === b.proposePlanImplementReplacesChatHistory &&
+    a.preserveSubagentsUntilArchive === b.preserveSubagentsUntilArchive &&
     a.planSubagentExecutorRouting === b.planSubagentExecutorRouting &&
     a.planSubagentDefaultsToOrchestrator === b.planSubagentDefaultsToOrchestrator &&
     a.bashOutputCompactionMinLines === b.bashOutputCompactionMinLines &&
@@ -209,6 +215,9 @@ function areAgentAiDefaultsEqual(a: AgentAiDefaults, b: AgentAiDefaults): boolea
       return false;
     }
     if ((aEntry?.enabled ?? undefined) !== (bEntry?.enabled ?? undefined)) {
+      return false;
+    }
+    if ((aEntry?.advisorEnabled ?? undefined) !== (bEntry?.advisorEnabled ?? undefined)) {
       return false;
     }
   }
@@ -257,6 +266,7 @@ export function TasksSection() {
   );
   const newWorkspaceDefaultAgentId = coerceAgentId(globalDefaultAgentIdRaw);
   const portableDesktopEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
+  const advisorToolEnabled = useExperimentValue(EXPERIMENT_IDS.ADVISOR_TOOL);
 
   // Resolve the workspace's active model so that when a sub-agent's model is
   // "Inherit", we show thinking levels for the workspace model (falling back to
@@ -498,6 +508,12 @@ export function TasksSection() {
     );
   };
 
+  const setPreserveSubagentsUntilArchive = (value: boolean) => {
+    setTaskSettings((prev) =>
+      normalizeTaskSettings({ ...prev, preserveSubagentsUntilArchive: value })
+    );
+  };
+
   const setPlanSubagentExecutorRouting = (value: string) => {
     if (!isPlanSubagentExecutorRouting(value)) {
       return;
@@ -558,6 +574,22 @@ export function TasksSection() {
     );
   };
 
+  const setAgentAdvisorEnabled = (agentId: string, value: boolean) => {
+    setAgentAiDefaults((prev) =>
+      updateAgentDefaultEntry(prev, agentId, (updated) => {
+        updated.advisorEnabled = value;
+      })
+    );
+  };
+
+  const resetAgentAdvisorEnabled = (agentId: string) => {
+    setAgentAiDefaults((prev) =>
+      updateAgentDefaultEntry(prev, agentId, (updated) => {
+        delete updated.advisorEnabled;
+      })
+    );
+  };
+
   const listedAgents = agents.length > 0 ? agents : FALLBACK_AGENTS;
   const enabledAgentIdSet = new Set(enabledAgentIds);
 
@@ -591,6 +623,14 @@ export function TasksSection() {
     const modelValue = entry?.modelString ?? INHERIT;
     const thinkingValue = entry?.thinkingLevel ?? INHERIT;
     const enabledOverride = entry?.enabled;
+    const advisorEnabledOverride = entry?.advisorEnabled;
+    const advisorEnabledValue = advisorEnabledOverride ?? false;
+    const advisorEnabledTitle =
+      advisorEnabledOverride === undefined
+        ? "Advisor disabled by default."
+        : advisorEnabledOverride
+          ? "Advisor enabled (local override)."
+          : "Advisor disabled (local override).";
 
     const enablementLocked =
       agent.id === "exec" || agent.id === "plan" || agent.id === "compact" || agent.id === "mux";
@@ -680,32 +720,62 @@ export function TasksSection() {
             ) : null}
           </div>
 
-          <div className="flex shrink-0 items-center gap-3">
-            {enablementHint ? <div className="text-muted text-xs">{enablementHint}</div> : null}
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <div className="flex items-center gap-2">
-                  <div className="text-muted text-xs">Enabled</div>
-                  <Switch
-                    checked={enabledValue}
-                    disabled={enablementLocked}
-                    onCheckedChange={(checked) => setAgentEnabled(agent.id, checked)}
-                    aria-label={`Toggle ${agent.id} enabled`}
-                  />
-                </div>
-              </TooltipTrigger>
-              <TooltipContent>{enablementTitle}</TooltipContent>
-            </Tooltip>
-            {enabledOverride !== undefined ? (
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="px-2"
-                onClick={() => resetAgentEnabled(agent.id)}
-              >
-                Reset
-              </Button>
+          <div className="flex shrink-0 flex-col items-end gap-2">
+            <div className="flex items-center gap-3">
+              {enablementHint ? <div className="text-muted text-xs">{enablementHint}</div> : null}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <div className="flex items-center gap-2">
+                    <div className="text-muted text-xs">Enabled</div>
+                    <Switch
+                      checked={enabledValue}
+                      disabled={enablementLocked}
+                      onCheckedChange={(checked) => setAgentEnabled(agent.id, checked)}
+                      aria-label={`Toggle ${agent.id} enabled`}
+                    />
+                  </div>
+                </TooltipTrigger>
+                <TooltipContent>{enablementTitle}</TooltipContent>
+              </Tooltip>
+              {enabledOverride !== undefined ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="px-2"
+                  onClick={() => resetAgentEnabled(agent.id)}
+                >
+                  Reset
+                </Button>
+              ) : null}
+            </div>
+            {advisorToolEnabled ? (
+              <div className="flex items-center gap-3">
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <div className="flex items-center gap-2">
+                      <div className="text-muted text-xs">Advisor</div>
+                      <Switch
+                        checked={advisorEnabledValue}
+                        onCheckedChange={(checked) => setAgentAdvisorEnabled(agent.id, checked)}
+                        aria-label={`Toggle ${agent.id} advisor`}
+                      />
+                    </div>
+                  </TooltipTrigger>
+                  <TooltipContent>{advisorEnabledTitle}</TooltipContent>
+                </Tooltip>
+                {advisorEnabledOverride !== undefined ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="px-2"
+                    onClick={() => resetAgentAdvisorEnabled(agent.id)}
+                  >
+                    Reset
+                  </Button>
+                ) : null}
+              </div>
             ) : null}
           </div>
         </div>
@@ -766,6 +836,14 @@ export function TasksSection() {
     const entry = agentAiDefaults[agentId];
     const modelValue = entry?.modelString ?? INHERIT;
     const thinkingValue = entry?.thinkingLevel ?? INHERIT;
+    const advisorEnabledOverride = entry?.advisorEnabled;
+    const advisorEnabledValue = advisorEnabledOverride ?? false;
+    const advisorEnabledTitle =
+      advisorEnabledOverride === undefined
+        ? "Advisor disabled by default."
+        : advisorEnabledOverride
+          ? "Advisor enabled (local override)."
+          : "Advisor disabled (local override).";
     const effectiveModel = modelValue !== INHERIT ? modelValue : inheritedEffectiveModel;
     const allowedThinkingLevels = getThinkingPolicyForModel(effectiveModel);
 
@@ -774,8 +852,40 @@ export function TasksSection() {
         key={agentId}
         className="border-border-medium bg-background-secondary rounded-md border p-3"
       >
-        <div className="text-foreground text-sm font-medium">{agentId}</div>
-        <div className="text-muted text-xs">Not discovered in the current workspace</div>
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-foreground text-sm font-medium">{agentId}</div>
+            <div className="text-muted text-xs">Not discovered in the current workspace</div>
+          </div>
+          {advisorToolEnabled ? (
+            <div className="flex shrink-0 items-center gap-3">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <div className="flex items-center gap-2">
+                    <div className="text-muted text-xs">Advisor</div>
+                    <Switch
+                      checked={advisorEnabledValue}
+                      onCheckedChange={(checked) => setAgentAdvisorEnabled(agentId, checked)}
+                      aria-label={`Toggle ${agentId} advisor`}
+                    />
+                  </div>
+                </TooltipTrigger>
+                <TooltipContent>{advisorEnabledTitle}</TooltipContent>
+              </Tooltip>
+              {advisorEnabledOverride !== undefined ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="px-2"
+                  onClick={() => resetAgentAdvisorEnabled(agentId)}
+                >
+                  Reset
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
 
         <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
           <div className="space-y-1">
@@ -914,6 +1024,23 @@ export function TasksSection() {
               checked={taskSettings.proposePlanImplementReplacesChatHistory ?? false}
               onCheckedChange={setProposePlanImplementReplacesChatHistory}
               aria-label="Toggle plan Implement replaces conversation with plan"
+            />
+          </div>
+
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex-1">
+              <div className="text-foreground text-sm">
+                Preserve subagents until the workspace gets archived
+              </div>
+              <div className="text-muted text-xs">
+                Completed sub-agent workspaces stay visible and expandable until an ancestor
+                workspace is archived, then cleanup runs automatically.
+              </div>
+            </div>
+            <Switch
+              checked={taskSettings.preserveSubagentsUntilArchive ?? false}
+              onCheckedChange={setPreserveSubagentsUntilArchive}
+              aria-label="Toggle preserve subagents until archive"
             />
           </div>
 

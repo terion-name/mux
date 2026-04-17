@@ -17,7 +17,6 @@ import type { ThinkingLevel } from "@/common/types/thinking";
 import type { WorkspaceSelection } from "@/browser/components/ProjectSidebar/ProjectSidebar";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { MuxDeepLinkPayload } from "@/common/types/deepLink";
-import { MUX_HELP_CHAT_WORKSPACE_ID } from "@/common/constants/muxChat";
 import {
   deleteWorkspaceStorage,
   getAgentIdKey,
@@ -44,6 +43,7 @@ import {
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
   type LaunchBehavior,
 } from "@/common/constants/storage";
+import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { useAPI } from "@/browser/contexts/API";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import {
@@ -157,6 +157,12 @@ function migrateLocalGatewayPrefsToBackend(
   }
 }
 
+function shouldSeedWorkspaceAgentIdFromBackend(metadata: FrontendWorkspaceMetadata): boolean {
+  // Main workspaces own their live agent selection in localStorage. Child/task
+  // workspaces are backend-defined and locked, so they must re-seed from metadata.
+  return metadata.parentWorkspaceId != null;
+}
+
 /**
  * Seed per-workspace localStorage from backend workspace metadata.
  *
@@ -170,10 +176,12 @@ function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadat
 
   const workspaceId = metadata.id;
 
-  // Seed the workspace agentId (tasks/subagents) so the UI renders correctly on reload.
-  // Main workspaces default to the locally-selected agentId (stored in localStorage).
   const metadataAgentId = metadata.agentId ?? metadata.agentType;
-  if (typeof metadataAgentId === "string" && metadataAgentId.trim().length > 0) {
+  if (
+    shouldSeedWorkspaceAgentIdFromBackend(metadata) &&
+    typeof metadataAgentId === "string" &&
+    metadataAgentId.trim().length > 0
+  ) {
     const key = getAgentIdKey(workspaceId);
     const normalized = normalizeAgentId(metadataAgentId);
     const existing = readPersistedState<string | undefined>(key, undefined);
@@ -468,7 +476,11 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
 
   // UI-only workspace creation drafts (placeholders)
   workspaceDraftsByProject: WorkspaceDraftsByProject;
-  createWorkspaceDraft: (projectPath: string, sectionId?: string) => void;
+  createWorkspaceDraft: (
+    projectPath: string,
+    sectionId?: string,
+    options?: { replace?: boolean }
+  ) => void;
   updateWorkspaceDraftSection: (
     projectPath: string,
     draftId: string,
@@ -487,6 +499,56 @@ const WorkspaceActionsContext = createContext<
 
 interface WorkspaceProviderProps {
   children: ReactNode;
+}
+
+/**
+ * Startup auto-navigation should yield once the user already has meaningful route state.
+ * Desktop launch-project is the exception: its first pass may override a restored
+ * file:// route when the backend reports explicit startup intent.
+ */
+function shouldBlockStartupAutoNavigation(options: {
+  hasExplicitRootRoute: boolean;
+  hasBlockingRouteState: boolean;
+  shouldOverrideRestoredDesktopRoute?: boolean;
+}): boolean {
+  return (
+    options.hasExplicitRootRoute ||
+    (!options.shouldOverrideRestoredDesktopRoute && options.hasBlockingRouteState)
+  );
+}
+
+function getMostRecentVisibleProjectPath(
+  workspaceMetadata: Map<string, FrontendWorkspaceMetadata>,
+  workspaceRecency: Record<string, number>,
+  getProjectConfig: (projectPath: string) => { projectKind?: "user" | "system" } | undefined
+): string | null {
+  const recentWorkspace = [...workspaceMetadata.values()]
+    .filter((workspace) => {
+      const projectConfig = getProjectConfig(workspace.projectPath);
+      if (!projectConfig) {
+        return false;
+      }
+      if (projectConfig.projectKind !== "system") {
+        return true;
+      }
+
+      return workspace.projectPath === MULTI_PROJECT_CONFIG_KEY;
+    })
+    .sort((a, b) => {
+      const aRecency = workspaceRecency[a.id] ?? 0;
+      const bRecency = workspaceRecency[b.id] ?? 0;
+      if (aRecency !== bRecency) {
+        return bRecency - aRecency;
+      }
+
+      const aCreatedAtRaw = Date.parse(a.createdAt ?? "");
+      const bCreatedAtRaw = Date.parse(b.createdAt ?? "");
+      const aCreatedAt = Number.isFinite(aCreatedAtRaw) ? aCreatedAtRaw : 0;
+      const bCreatedAt = Number.isFinite(bCreatedAtRaw) ? bCreatedAtRaw : 0;
+      return bCreatedAt - aCreatedAt;
+    })[0];
+
+  return recentWorkspace?.projectPath ?? null;
 }
 
 export function WorkspaceProvider(props: WorkspaceProviderProps) {
@@ -539,6 +601,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const {
     resolveProjectPath,
     resolveNewChatProjectPath,
+    getProjectConfig,
     hasAnyProject,
     refreshProjects,
     loading: projectsLoading,
@@ -564,13 +627,13 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     // When the user navigates to settings, currentWorkspaceId becomes null
     // (URL is /settings/...). Preserve the active workspace subscription so
     // chat messages aren't cleared. Only null it out when truly leaving a
-    // workspace context (e.g., navigating to Home).
+    // workspace context (for example, via the compatibility root route).
     if (currentWorkspaceId) {
       workspaceStore.setActiveWorkspaceId(currentWorkspaceId);
     } else if (!currentSettingsSection && !isAnalyticsOpen) {
       // Only null out the active workspace when truly leaving a workspace
-      // context (e.g., navigating to Home). Settings and analytics pages
-      // should preserve the subscription so chat messages aren't cleared.
+      // context (for example, via the compatibility root route). Settings and
+      // analytics pages should preserve the subscription so chat messages aren't cleared.
       workspaceStore.setActiveWorkspaceId(null);
     }
   }, [workspaceStore, currentWorkspaceId, currentSettingsSection, isAnalyticsOpen]);
@@ -794,17 +857,35 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     return toWorkspaceSelection(metadata);
   }, [currentWorkspaceId, workspaceMetadata]);
 
+  const hasBlockingStartupRouteState =
+    selectedWorkspace != null ||
+    currentSettingsSection != null ||
+    isAnalyticsOpen ||
+    pendingNewWorkspaceProject != null;
+
+  const resolveFallbackProjectPath = useCallback(() => {
+    const recentProjectPath = getMostRecentVisibleProjectPath(
+      workspaceMetadata,
+      workspaceStore.getWorkspaceRecency(),
+      getProjectConfig
+    );
+    return recentProjectPath ?? resolveNewChatProjectPath({});
+  }, [workspaceMetadata, workspaceStore, getProjectConfig, resolveNewChatProjectPath]);
+
   // Keep a ref to the current selectedWorkspace for use in functional updates.
   // Update synchronously so route-driven selection changes are visible before
   // any async creation callbacks decide whether to auto-navigate.
   const selectedWorkspaceRef = useRef(selectedWorkspace);
   selectedWorkspaceRef.current = selectedWorkspace;
-  // Sticky in-memory flag to preserve explicit Home navigation intent.
-  // Prevents server launch-project auto-selection from bouncing users away from /.
-  const hasUserNavigatedHomeRef = useRef(false);
+  // Sticky in-memory flag to preserve explicit root-route navigation intent.
+  // Prevents startup-only launch-project/new-chat fallbacks from overriding later
+  // user-driven visits to the compatibility "/" route.
+  const hasExplicitRootRouteRef = useRef(false);
   const hasProcessedInitialLocationRef = useRef(false);
 
-  const hasAutoCreatedRef = useRef(false);
+  const hasCheckedDesktopLaunchProjectRef = useRef(false);
+  const hasHandledStartupRootRouteRef = useRef(false);
+  const hasSkippedPostStartupRootRedirectRef = useRef(false);
   const hasCheckedStaleRouteRef = useRef(false);
 
   useEffect(() => {
@@ -814,10 +895,10 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       return;
     }
 
-    // Browser history can land on / without going through setSelectedWorkspace(null).
-    // Mark that as explicit Home intent so launch-project doesn't bounce the user away.
+    // Browser history can still land on / even though the dedicated home page is gone.
+    // Treat that as explicit root navigation so startup-only auto-routing stays out of the way.
     if (location.pathname === "/") {
-      hasUserNavigatedHomeRef.current = true;
+      hasExplicitRootRouteRef.current = true;
     }
   }, [location.pathname]);
 
@@ -833,12 +914,12 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       selectedWorkspaceRef.current = newValue;
 
       if (newValue) {
-        hasUserNavigatedHomeRef.current = false;
+        hasExplicitRootRouteRef.current = false;
         navigateToWorkspace(newValue.workspaceId);
         // Persist to localStorage for next session
         updatePersistedState(SELECTED_WORKSPACE_KEY, newValue);
       } else {
-        hasUserNavigatedHomeRef.current = true;
+        hasExplicitRootRouteRef.current = true;
         navigateToHome();
         updatePersistedState(SELECTED_WORKSPACE_KEY, null);
       }
@@ -848,12 +929,13 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
   /**
    * Clear the workspace selection and navigate to a specific project page
-   * instead of home.  Use this when deselecting a workspace where we know
-   * which project the user was working in (archive, delete fallback, etc.).
+   * instead of bouncing through the compatibility root route. Use this when
+   * deselecting a workspace where we know which project the user was working in.
    */
   const clearSelectionToProject = useCallback(
     (projectPath: string) => {
       selectedWorkspaceRef.current = null;
+      hasExplicitRootRouteRef.current = false;
       updatePersistedState(SELECTED_WORKSPACE_KEY, null);
       navigateToProject(projectPath);
     },
@@ -917,24 +999,22 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   useEffect(() => {
     if (loading || !api) return;
 
-    // Skip if we already have a selected workspace (from localStorage or URL hash)
-    if (selectedWorkspace) return;
-
-    // If the user explicitly went Home, preserve that intent instead of
-    // immediately re-selecting a launch-project workspace.
-    if (hasUserNavigatedHomeRef.current) return;
-
-    // Skip if user is on the settings or analytics page — navigating to
-    // /settings/:section or /analytics clears the workspace from the URL,
-    // making selectedWorkspace null. Without this guard the effect would
-    // auto-select a workspace and navigate away immediately.
-    if (currentSettingsSection) return;
-    if (isAnalyticsOpen) return;
-
-    // Skip if user is in the middle of creating a workspace
-    if (pendingNewWorkspaceProject) return;
+    const shouldOverrideRestoredDesktopRoute =
+      window.location.protocol === "file:" && !hasCheckedDesktopLaunchProjectRef.current;
+    if (
+      shouldBlockStartupAutoNavigation({
+        hasExplicitRootRoute: hasExplicitRootRouteRef.current,
+        hasBlockingRouteState: hasBlockingStartupRouteState,
+        shouldOverrideRestoredDesktopRoute,
+      })
+    ) {
+      return;
+    }
 
     let cancelled = false;
+    if (shouldOverrideRestoredDesktopRoute) {
+      hasCheckedDesktopLaunchProjectRef.current = true;
+    }
 
     const checkLaunchProject = async () => {
       // Only available in server mode (checked via platform/capabilities in future)
@@ -951,17 +1031,20 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         if (cancelled) return;
 
         if (projectWorkspaces.length > 0) {
-          // Select the first workspace in the project.
-          // Use functional update to avoid race: user may have clicked a workspace
-          // while this async call was in flight.
           const metadata = projectWorkspaces[0];
-          setSelectedWorkspace((current) => current ?? toWorkspaceSelection(metadata));
+          if (shouldOverrideRestoredDesktopRoute) {
+            setSelectedWorkspace(toWorkspaceSelection(metadata));
+          } else {
+            // Use functional update to avoid race: user may have clicked a workspace
+            // while this async call was in flight.
+            setSelectedWorkspace((current) => current ?? toWorkspaceSelection(metadata));
+          }
           return;
         }
 
         // If --add-project created a project but there are no workspaces yet, route
         // directly to the project creation view so first-time users can start
-        // chatting immediately instead of landing on the empty dashboard.
+        // chatting immediately instead of parking on the compatibility root route.
         navigateToProject(launchProjectPath);
       } catch (error) {
         if (!cancelled) {
@@ -985,6 +1068,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     currentSettingsSection,
     isAnalyticsOpen,
     pendingNewWorkspaceProject,
+    hasBlockingStartupRouteState,
     workspaceMetadata,
     setSelectedWorkspace,
     navigateToProject,
@@ -1000,9 +1084,6 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
     if (!currentWorkspaceId) return;
     if (workspaceMetadata.has(currentWorkspaceId)) return;
-
-    // mux-chat registers asynchronously after initial load — don't treat it as stale.
-    if (currentWorkspaceId === MUX_HELP_CHAT_WORKSPACE_ID) return;
 
     // If metadata is empty, a transient backend failure may have caused
     // workspace.list to return nothing — don't clear a potentially valid route.
@@ -1038,7 +1119,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
           // If the currently-selected workspace is being archived, navigate away *before*
           // removing it from the active metadata map. Otherwise we can briefly render the
-          // welcome screen while still on `/workspace/:id`.
+          // root-route empty shell while still on `/workspace/:id`.
           //
           // Prefer the next workspace in sidebar DOM order (like Ctrl+J) so the user
           // stays in flow; fall back to the project page when no siblings remain.
@@ -1236,7 +1317,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           // state checks for all workspaces.
 
           // If the removed workspace was selected (URL was on this workspace),
-          // navigate to its project page instead of going home
+          // navigate to its project page instead of bouncing through root.
           if (wasSelected && projectPath) {
             navigateToProject(projectPath);
           }
@@ -1434,14 +1515,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   );
   const beginWorkspaceCreation = useCallback(
     (projectPath: string, sectionId?: string) => {
-      if (workspaceMetadata.get(MUX_HELP_CHAT_WORKSPACE_ID)?.projectPath === projectPath) {
-        navigateToWorkspace(MUX_HELP_CHAT_WORKSPACE_ID);
-        return;
-      }
-
       navigateToProject(projectPath, sectionId);
     },
-    [navigateToProject, navigateToWorkspace, workspaceMetadata]
+    [navigateToProject]
   );
   // Persist section selection + URL updates so draft section switches stick across navigation.
   const updateWorkspaceDraftSection = useCallback(
@@ -1490,7 +1566,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   );
 
   const createWorkspaceDraft = useCallback(
-    (projectPath: string, sectionId?: string) => {
+    (projectPath: string, sectionId?: string, options?: { replace?: boolean }) => {
       // Read directly from localStorage to get the freshest value, avoiding stale closure issues.
       // The React state (workspaceDraftsByProject) may be out of date if this is called rapidly.
       const freshDrafts = normalizeWorkspaceDraftsByProject(
@@ -1502,7 +1578,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       // instead of creating yet another empty draft.
       const existingEmptyDraftId = findExistingEmptyDraft(existingDrafts, projectPath, sectionId);
       if (existingEmptyDraftId) {
-        navigateToProject(projectPath, sectionId, existingEmptyDraftId);
+        navigateToProject(projectPath, sectionId, existingEmptyDraftId, {
+          replace: options?.replace,
+        });
         return;
       }
 
@@ -1540,54 +1618,54 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         };
       });
 
-      navigateToProject(projectPath, sectionId, draftId);
+      navigateToProject(projectPath, sectionId, draftId, { replace: options?.replace });
     },
     [navigateToProject, setWorkspaceDraftsByProjectState]
   );
 
   useEffect(() => {
-    if (loading || hasAutoCreatedRef.current) return;
-    if (selectedWorkspace) return;
+    if (loading || projectsLoading || hasHandledStartupRootRouteRef.current) return;
 
-    // Preserve explicit Home navigation intent.
-    if (hasUserNavigatedHomeRef.current) return;
-
-    // Don't auto-create while the user is on global routes.
-    if (currentSettingsSection || isAnalyticsOpen) return;
-
-    // Skip if user is in the middle of creating a workspace.
-    if (pendingNewWorkspaceProject) return;
+    if (
+      shouldBlockStartupAutoNavigation({
+        hasExplicitRootRoute: hasExplicitRootRouteRef.current,
+        hasBlockingRouteState: hasBlockingStartupRouteState,
+      })
+    ) {
+      return;
+    }
 
     const behavior = readPersistedState<LaunchBehavior>(LAUNCH_BEHAVIOR_KEY, "dashboard");
-    if (behavior !== "new-chat") return;
-
     let cancelled = false;
 
-    const autoCreate = async () => {
+    const resolveStartupRootRoute = async () => {
       // Defer to launch-project whenever the backend reports one so explicit startup
-      // intent can win before local new-chat auto-create fallback runs.
+      // intent can win before the local fallback chooses a project route.
       try {
         const launchProject = await api?.server.getLaunchProject(undefined);
         if (cancelled || launchProject) return;
       } catch {
-        // Ignore backend capability errors and continue with local auto-create fallback.
+        // Ignore backend capability errors and continue with the local startup fallback.
       }
 
       if (cancelled) return;
 
-      hasAutoCreatedRef.current = true;
+      const fallbackProjectPath = resolveFallbackProjectPath();
+      if (!fallbackProjectPath) return;
 
-      const workspaceRecency = workspaceStore.getWorkspaceRecency();
-      const recentWorkspace = [...workspaceMetadata.values()]
-        .filter((workspace) => workspace.projectPath && workspace.id !== MUX_HELP_CHAT_WORKSPACE_ID)
-        .sort((a, b) => (workspaceRecency[b.id] ?? 0) - (workspaceRecency[a.id] ?? 0))[0];
+      hasHandledStartupRootRouteRef.current = true;
 
-      if (!recentWorkspace) return;
+      // The old landing page is gone. Treat "/" as a compatibility entrypoint and
+      // immediately replace it with a concrete project route instead of rendering a dashboard.
+      if (behavior === "new-chat") {
+        createWorkspaceDraft(fallbackProjectPath, undefined, { replace: true });
+        return;
+      }
 
-      createWorkspaceDraft(recentWorkspace.projectPath);
+      navigateToProject(fallbackProjectPath, undefined, undefined, { replace: true });
     };
 
-    void autoCreate();
+    void resolveStartupRootRoute();
 
     return () => {
       cancelled = true;
@@ -1595,14 +1673,26 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   }, [
     api,
     loading,
-    selectedWorkspace,
-    currentSettingsSection,
-    isAnalyticsOpen,
-    pendingNewWorkspaceProject,
-    workspaceMetadata,
-    workspaceStore,
+    projectsLoading,
+    hasBlockingStartupRouteState,
+    resolveFallbackProjectPath,
     createWorkspaceDraft,
+    navigateToProject,
   ]);
+
+  useEffect(() => {
+    if (!hasSkippedPostStartupRootRedirectRef.current) {
+      hasSkippedPostStartupRootRedirectRef.current = true;
+      return;
+    }
+    if (loading || projectsLoading) return;
+    if (location.pathname !== "/") return;
+
+    const fallbackProjectPath = resolveFallbackProjectPath();
+    if (!fallbackProjectPath) return;
+
+    navigateToProject(fallbackProjectPath, undefined, undefined, { replace: true });
+  }, [loading, projectsLoading, location.pathname, resolveFallbackProjectPath, navigateToProject]);
 
   const openWorkspaceDraft = useCallback(
     (projectPath: string, draftId: string, sectionId?: string | null) => {

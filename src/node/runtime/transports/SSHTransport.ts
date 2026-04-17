@@ -15,6 +15,8 @@ export interface SpawnOptions {
   forcePTY?: boolean;
   timeout?: number;
   abortSignal?: AbortSignal;
+  /** Absolute client-side deadline (Date.now milliseconds) for queueing + execution. */
+  deadlineMs?: number;
 }
 
 export interface PtySessionParams {
@@ -29,12 +31,6 @@ export interface SSHTransport {
 
   /** Determine if an exit code represents a connection-level failure for this transport. */
   isConnectionFailure(exitCode: number, stderr: string): boolean;
-
-  /** Mark connection as healthy (after successful command). */
-  markHealthy(): void;
-
-  /** Report connection failure (triggers backoff). */
-  reportFailure(error: string): void;
 
   /** Pre-flight connection check with backoff enforcement. */
   acquireConnection(options?: {

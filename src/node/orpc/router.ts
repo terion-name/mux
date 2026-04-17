@@ -197,6 +197,39 @@ async function disposeLspWorkspacesForProjects(
   );
 }
 
+function normalizeOptionalConfigString(value: string | null | undefined): string | undefined {
+  const trimmedValue = value?.trim();
+  if (!trimmedValue) {
+    return undefined;
+  }
+
+  return trimmedValue;
+}
+
+function normalizeOptionalConfigThinkingLevel(value: string | null | undefined) {
+  return coerceThinkingLevel(value);
+}
+
+function normalizeAdvisorMaxUsesPerTurn(value: number | null | undefined): number | null {
+  if (value == null) {
+    return null;
+  }
+
+  assert(Number.isInteger(value), "Advisor max uses per turn must be an integer");
+  assert(value > 0, "Advisor max uses per turn must be positive");
+  return value;
+}
+
+function normalizeAdvisorMaxOutputTokens(value: number | null | undefined): number | null {
+  if (value == null) {
+    return null;
+  }
+
+  assert(Number.isInteger(value), "Advisor max output tokens must be an integer");
+  assert(value > 0, "Advisor max output tokens must be positive");
+  return value;
+}
+
 function normalizeMuxMessageFromDisk(value: unknown): MuxMessage | null {
   if (!value || typeof value !== "object") {
     return null;
@@ -622,6 +655,10 @@ export const router = (authToken?: string) => {
             routePriority: config.routePriority,
             routeOverrides: config.routeOverrides,
             defaultModel: config.defaultModel,
+            advisorModelString: config.advisorModelString ?? null,
+            advisorThinkingLevel: config.advisorThinkingLevel ?? null,
+            advisorMaxUsesPerTurn: config.advisorMaxUsesPerTurn,
+            advisorMaxOutputTokens: config.advisorMaxOutputTokens,
             hiddenModels: config.hiddenModels,
             coderWorkspaceArchiveBehavior:
               config.coderWorkspaceArchiveBehavior ?? DEFAULT_CODER_ARCHIVE_BEHAVIOR,
@@ -636,6 +673,8 @@ export const router = (authToken?: string) => {
             muxGovernorUrl,
             muxGovernorEnrolled,
             llmDebugLogs: config.llmDebugLogs === true,
+            heartbeatDefaultPrompt: config.heartbeatDefaultPrompt ?? undefined,
+            heartbeatDefaultIntervalMs: config.heartbeatDefaultIntervalMs ?? undefined,
             onePasswordAccountName: config.onePasswordAccountName ?? null,
           };
         }),
@@ -930,6 +969,28 @@ export const router = (authToken?: string) => {
             const normalizedTaskSettings = normalizeTaskSettings(input.taskSettings);
             const result = { ...config, taskSettings: normalizedTaskSettings };
 
+            if (input.advisorModelString !== undefined) {
+              result.advisorModelString = normalizeOptionalConfigString(input.advisorModelString);
+            }
+
+            if (input.advisorThinkingLevel !== undefined) {
+              result.advisorThinkingLevel = normalizeOptionalConfigThinkingLevel(
+                input.advisorThinkingLevel
+              );
+            }
+
+            if (input.advisorMaxUsesPerTurn !== undefined) {
+              result.advisorMaxUsesPerTurn = normalizeAdvisorMaxUsesPerTurn(
+                input.advisorMaxUsesPerTurn
+              );
+            }
+
+            if (input.advisorMaxOutputTokens !== undefined) {
+              result.advisorMaxOutputTokens = normalizeAdvisorMaxOutputTokens(
+                input.advisorMaxOutputTokens
+              );
+            }
+
             if (input.agentAiDefaults !== undefined) {
               const normalized = normalizeAgentAiDefaults(input.agentAiDefaults);
               result.agentAiDefaults = Object.keys(normalized).length > 0 ? normalized : undefined;
@@ -1018,6 +1079,33 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) => {
           await context.config.editConfig((config) => {
             config.llmDebugLogs = input.enabled;
+            return config;
+          });
+        }),
+      updateHeartbeatDefaultPrompt: t
+        .input(schemas.config.updateHeartbeatDefaultPrompt.input)
+        .output(schemas.config.updateHeartbeatDefaultPrompt.output)
+        .handler(async ({ context, input }) => {
+          await context.config.editConfig((config) => {
+            const trimmed = input.defaultPrompt?.trim();
+            if (trimmed && trimmed.length > 0) {
+              config.heartbeatDefaultPrompt = trimmed;
+            } else {
+              delete config.heartbeatDefaultPrompt;
+            }
+            return config;
+          });
+        }),
+      updateHeartbeatDefaultIntervalMs: t
+        .input(schemas.config.updateHeartbeatDefaultIntervalMs.input)
+        .output(schemas.config.updateHeartbeatDefaultIntervalMs.output)
+        .handler(async ({ context, input }) => {
+          await context.config.editConfig((config) => {
+            if (input.intervalMs != null) {
+              config.heartbeatDefaultIntervalMs = input.intervalMs;
+            } else {
+              delete config.heartbeatDefaultIntervalMs;
+            }
             return config;
           });
         }),
@@ -3122,6 +3210,7 @@ export const router = (authToken?: string) => {
               enabled: input.enabled,
               intervalMs: input.intervalMs,
               ...(input.message != null ? { message: input.message } : {}),
+              ...(input.contextMode != null ? { contextMode: input.contextMode } : {}),
             })
           ),
       },
@@ -3641,7 +3730,7 @@ export const router = (authToken?: string) => {
           // 1. Subscribe to new events (including those triggered by replay)
           //
           // IMPORTANT: We subscribe before replay so we can receive stream replay (`replayStream()`)
-          // and init replay events (which do not set `replay: true`).
+          // and init replay events (which now set `replay: true` like other replayed payloads).
           //
           // Live stream deltas can overlap with replayed deltas on reconnect. Buffer live stream
           // events during replay and flush after `caught-up`, skipping any deltas already delivered

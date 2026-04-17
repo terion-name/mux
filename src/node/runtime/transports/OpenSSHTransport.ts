@@ -1,11 +1,9 @@
 import { spawn } from "child_process";
-import { log } from "@/node/services/log";
 
 import { spawnPtyProcess } from "../ptySpawn";
 import { expandTildeForSSH } from "../tildeExpansion";
 import {
   appendOpenSSHHostKeyPolicyArgs,
-  getControlPath,
   sshConnectionPool,
   type SSHConnectionConfig,
 } from "../sshConnectionPool";
@@ -18,14 +16,30 @@ import type {
   PtySessionParams,
 } from "./SSHTransport";
 
-export class OpenSSHTransport implements SSHTransport {
-  private readonly config: SSHConnectionConfig;
-  private readonly controlPath: string;
+const MAX_REPORTED_FAILURE_STDERR_CHARS = 1000;
+const OPENSSH_EXEC_SHARD_COUNT = 4;
+const nextShardByConnection = new Map<string, number>();
 
-  constructor(config: SSHConnectionConfig) {
-    this.config = config;
-    this.controlPath = getControlPath(config);
+function summarizeFailureStderr(stderr: string, exitCode: number): string {
+  const trimmed = stderr.trim();
+  if (trimmed.length === 0) {
+    return `SSH exited with code ${exitCode}`;
   }
+  if (trimmed.length <= MAX_REPORTED_FAILURE_STDERR_CHARS) {
+    return trimmed;
+  }
+  return `${trimmed.slice(0, MAX_REPORTED_FAILURE_STDERR_CHARS)}…`;
+}
+
+function getShardedControlPath(config: SSHConnectionConfig): string {
+  const baseControlPath = sshConnectionPool.getControlPath(config);
+  const nextShard = nextShardByConnection.get(baseControlPath) ?? 0;
+  nextShardByConnection.set(baseControlPath, (nextShard + 1) % OPENSSH_EXEC_SHARD_COUNT);
+  return `${baseControlPath}-${nextShard}`;
+}
+
+export class OpenSSHTransport implements SSHTransport {
+  constructor(private readonly config: SSHConnectionConfig) {}
 
   isConnectionFailure(exitCode: number, _stderr: string): boolean {
     return exitCode === 255;
@@ -33,14 +47,6 @@ export class OpenSSHTransport implements SSHTransport {
 
   getConfig(): SSHTransportConfig {
     return this.config;
-  }
-
-  markHealthy(): void {
-    sshConnectionPool.markHealthy(this.config);
-  }
-
-  reportFailure(error: string): void {
-    sshConnectionPool.reportFailure(this.config, error);
   }
 
   async acquireConnection(options?: {
@@ -58,39 +64,63 @@ export class OpenSSHTransport implements SSHTransport {
   }
 
   async spawnRemoteProcess(fullCommand: string, options: SpawnOptions): Promise<SpawnResult> {
+    const remainingWaitMs =
+      options.deadlineMs != null ? Math.max(0, options.deadlineMs - Date.now()) : undefined;
+    const controlPath = getShardedControlPath(this.config);
     await sshConnectionPool.acquireConnection(this.config, {
       abortSignal: options.abortSignal,
+      timeoutMs: remainingWaitMs,
+      maxWaitMs: remainingWaitMs,
+      controlPath,
     });
 
-    // Note: use -tt (not -t) so PTY allocation works even when stdin is a pipe.
-    const sshArgs: string[] = [options.forcePTY ? "-tt" : "-T", ...this.buildSSHArgs()];
+    // Shard short-lived SSH execs across a few deterministic ControlPaths so the host no longer
+    // funnels all multiplexed sessions through one implicit master socket.
+    const sshArgs: string[] = [
+      options.forcePTY ? "-tt" : "-T",
+      ...this.buildBaseSSHArgs(),
+      "-o",
+      "ControlMaster=auto",
+      "-o",
+      `ControlPath=${controlPath}`,
+      "-o",
+      "ControlPersist=60",
+    ];
 
     const connectTimeout =
       options.timeout !== undefined ? Math.min(Math.ceil(options.timeout), 15) : 15;
     sshArgs.push("-o", `ConnectTimeout=${connectTimeout}`);
     sshArgs.push("-o", "ServerAliveInterval=5");
     sshArgs.push("-o", "ServerAliveCountMax=2");
-    // Non-interactive execs must never hang on host-key or password prompts.
-    // Host-key trust policy is capability-scoped (verification service wired),
-    // while responder liveness only affects whether prompts can be shown.
     sshArgs.push("-o", "BatchMode=yes");
     appendOpenSSHHostKeyPolicyArgs(sshArgs);
-
     sshArgs.push(this.config.host, fullCommand);
 
-    log.debug(`SSH exec on ${this.config.host}`);
     const process = spawn("ssh", sshArgs, {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
 
-    return { process };
+    return {
+      process,
+      onExit: (exitCode, stderr) => {
+        if (this.isConnectionFailure(exitCode, stderr)) {
+          sshConnectionPool.reportFailure(this.config, summarizeFailureStderr(stderr, exitCode));
+          return;
+        }
+        sshConnectionPool.markHealthy(this.config);
+      },
+      onError: (error) => {
+        sshConnectionPool.reportFailure(this.config, error.message);
+      },
+    };
   }
 
   async createPtySession(params: PtySessionParams): Promise<PtyHandle> {
-    await sshConnectionPool.acquireConnection(this.config, { maxWaitMs: 0 });
+    await this.acquireConnection({ maxWaitMs: 0 });
 
-    const args: string[] = [...this.buildSSHArgs()];
+    const args: string[] = [...this.buildBaseSSHArgs()];
+    args.push("-o", "ControlMaster=no");
     args.push("-o", "ConnectTimeout=15");
     args.push("-o", "ServerAliveInterval=5");
     args.push("-o", "ServerAliveCountMax=2");
@@ -113,7 +143,7 @@ export class OpenSSHTransport implements SSHTransport {
     });
   }
 
-  private buildSSHArgs(): string[] {
+  private buildBaseSSHArgs(): string[] {
     const args: string[] = [];
 
     if (this.config.port) {
@@ -125,10 +155,6 @@ export class OpenSSHTransport implements SSHTransport {
     }
 
     args.push("-o", "LogLevel=FATAL");
-    args.push("-o", "ControlMaster=auto");
-    args.push("-o", `ControlPath=${this.controlPath}`);
-    args.push("-o", "ControlPersist=60");
-
     return args;
   }
 }

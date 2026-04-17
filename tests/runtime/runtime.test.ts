@@ -33,7 +33,12 @@ import {
 import { execBuffered, readFileString, writeFileString } from "@/node/utils/runtime/helpers";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { RuntimeError } from "@/node/runtime/Runtime";
-import { computeBaseRepoPath, type SSHRuntime } from "@/node/runtime/SSHRuntime";
+import { computeBaseRepoPath, SSHRuntime } from "@/node/runtime/SSHRuntime";
+import {
+  buildLegacyRemoteProjectLayout,
+  buildRemoteProjectLayout,
+  getRemoteWorkspacePath,
+} from "@/node/runtime/remoteProjectLayout";
 import { createSSHTransport } from "@/node/runtime/transports";
 import { runFullInit } from "@/node/runtime/runtimeFactory";
 import { sshConnectionPool } from "@/node/runtime/sshConnectionPool";
@@ -955,14 +960,15 @@ describeIntegration("Runtime integration tests", () => {
    * SSHRuntime-specific workspace operation tests
    * WorktreeRuntime workspace tests are covered by the matrix above
    *
-   * Note: SSHRuntime.getWorkspacePath uses srcBaseDir + projectName + workspaceName.
-   * The projectPath argument is only used to extract the project name (basename).
-   * So the actual workspace path is: /home/testuser/workspace/{projectName}/{workspaceName}
+   * Note: SSHRuntime derives workspace paths from the hashed remote project layout
+   * when a persisted workspacePath is not available.
+   * These tests build the same layout helpers as production code before asserting paths.
    */
   describe("SSHRuntime workspace operations", () => {
     const testForRuntime = test;
     const srcBaseDir = "/home/testuser/workspace";
     const createSSHRuntime = (): Runtime => createTestRuntime("ssh", srcBaseDir, sshConfig);
+    const getLayout = (projectPath: string) => buildRemoteProjectLayout(srcBaseDir, projectPath);
 
     describe("renameWorkspace", () => {
       testForRuntime("successfully renames directory", async () => {
@@ -972,9 +978,9 @@ describeIntegration("Runtime integration tests", () => {
         // projectPath is used to extract project name - can be any path ending with projectName
         const projectPath = `/some/path/${projectName}`;
 
-        // The runtime will construct paths as: srcBaseDir/projectName/workspaceName
-        const oldWorkspacePath = `${srcBaseDir}/${projectName}/worktree-1`;
-        const newWorkspacePath = `${srcBaseDir}/${projectName}/worktree-renamed`;
+        const layout = getLayout(projectPath);
+        const oldWorkspacePath = getRemoteWorkspacePath(layout, "worktree-1");
+        const newWorkspacePath = getRemoteWorkspacePath(layout, "worktree-renamed");
 
         // Create the workspace directory structure where the runtime expects it
         await execBuffered(
@@ -1009,7 +1015,7 @@ describeIntegration("Runtime integration tests", () => {
         }
 
         // Cleanup
-        await execBuffered(runtime, `rm -rf "${srcBaseDir}/${projectName}"`, {
+        await execBuffered(runtime, `rm -rf "${layout.projectRoot}"`, {
           cwd: "/home/testuser",
           timeout: 30,
         });
@@ -1039,8 +1045,9 @@ describeIntegration("Runtime integration tests", () => {
         const sourceWorkspaceName = "source";
         const newWorkspaceName = "forked";
 
-        const sourceWorkspacePath = `${srcBaseDir}/${projectName}/${sourceWorkspaceName}`;
-        const newWorkspacePath = `${srcBaseDir}/${projectName}/${newWorkspaceName}`;
+        const layout = getLayout(projectPath);
+        const sourceWorkspacePath = getRemoteWorkspacePath(layout, sourceWorkspaceName);
+        const newWorkspacePath = getRemoteWorkspacePath(layout, newWorkspaceName);
 
         // Create a source workspace repo with a non-trunk branch checked out.
         await execBuffered(
@@ -1136,7 +1143,7 @@ describeIntegration("Runtime integration tests", () => {
         expect(initResult.success).toBe(true);
 
         // Cleanup
-        await execBuffered(runtime, `rm -rf "${srcBaseDir}/${projectName}"`, {
+        await execBuffered(runtime, `rm -rf "${layout.projectRoot}"`, {
           cwd: "/home/testuser",
           timeout: 30,
         });
@@ -1148,7 +1155,8 @@ describeIntegration("Runtime integration tests", () => {
         const runtime = createSSHRuntime();
         const projectName = `delete-test-${Date.now()}-${Math.random().toString(36).substring(7)}`;
         const projectPath = `/some/path/${projectName}`;
-        const workspacePath = `${srcBaseDir}/${projectName}/worktree-delete-test`;
+        const layout = getLayout(projectPath);
+        const workspacePath = getRemoteWorkspacePath(layout, "worktree-delete-test");
 
         // Create the workspace directory structure where the runtime expects it
         await execBuffered(
@@ -1182,7 +1190,7 @@ describeIntegration("Runtime integration tests", () => {
         }
 
         // Cleanup
-        await execBuffered(runtime, `rm -rf "${srcBaseDir}/${projectName}"`, {
+        await execBuffered(runtime, `rm -rf "${layout.projectRoot}"`, {
           cwd: "/home/testuser",
           timeout: 30,
         });
@@ -1213,27 +1221,30 @@ describeIntegration("Runtime integration tests", () => {
     const srcBaseDir = "/home/testuser/workspace";
     const createSSHRuntime = (): SSHRuntime =>
       createTestRuntime("ssh", srcBaseDir, sshConfig) as SSHRuntime;
+    const getLayout = (projectPath: string) => buildRemoteProjectLayout(srcBaseDir, projectPath);
 
     test("computeBaseRepoPath returns correct path", async () => {
+      const layout = getLayout("/some/path/my-project");
       const result = computeBaseRepoPath(srcBaseDir, "/some/path/my-project");
-      expect(result).toBe(`${srcBaseDir}/my-project/.mux-base.git`);
+      expect(result).toBe(layout.baseRepoPath);
     }, 10000);
 
     test("forkWorkspace uses worktree when base repo exists", async () => {
       const runtime = createSSHRuntime();
       const projectName = `wt-fork-${Date.now()}-${Math.random().toString(36).substring(7)}`;
       const projectPath = `/some/path/${projectName}`;
-      const baseRepoPath = `${srcBaseDir}/${projectName}/.mux-base.git`;
-      const sourceWorkspacePath = `${srcBaseDir}/${projectName}/source`;
+      const layout = getLayout(projectPath);
+      const baseRepoPath = layout.baseRepoPath;
+      const sourceWorkspacePath = getRemoteWorkspacePath(layout, "source");
       const newWorkspaceName = "forked-wt";
-      const newWorkspacePath = `${srcBaseDir}/${projectName}/${newWorkspaceName}`;
+      const newWorkspacePath = getRemoteWorkspacePath(layout, newWorkspaceName);
 
       try {
         // 1. Create a bare base repo and populate it with a commit.
         await execBuffered(
           runtime,
           [
-            `mkdir -p "${srcBaseDir}/${projectName}"`,
+            `mkdir -p "${layout.projectRoot}"`,
             `git init --bare "${baseRepoPath}"`,
             // Create a temp repo, commit, and push to the bare repo.
             `TMPCLONE=$(mktemp -d)`,
@@ -1308,7 +1319,7 @@ describeIntegration("Runtime integration tests", () => {
         expect(worktreeList.stdout).toContain(newWorkspaceName);
       } finally {
         // Cleanup: remove all worktrees and the project directory.
-        await execBuffered(runtime, `rm -rf "${srcBaseDir}/${projectName}"`, {
+        await execBuffered(runtime, `rm -rf "${layout.projectRoot}"`, {
           cwd: "/home/testuser",
           timeout: 30,
         });
@@ -1319,9 +1330,10 @@ describeIntegration("Runtime integration tests", () => {
       const runtime = createSSHRuntime();
       const projectName = `wt-legacy-fork-${Date.now()}-${Math.random().toString(36).substring(7)}`;
       const projectPath = `/some/path/${projectName}`;
-      const sourceWorkspacePath = `${srcBaseDir}/${projectName}/legacy-source`;
+      const layout = getLayout(projectPath);
+      const sourceWorkspacePath = getRemoteWorkspacePath(layout, "legacy-source");
       const newWorkspaceName = "legacy-forked";
-      const newWorkspacePath = `${srcBaseDir}/${projectName}/${newWorkspaceName}`;
+      const newWorkspacePath = getRemoteWorkspacePath(layout, newWorkspaceName);
 
       try {
         // Create a legacy workspace (standalone git clone, no base repo).
@@ -1344,7 +1356,7 @@ describeIntegration("Runtime integration tests", () => {
         // Verify no base repo exists.
         const baseCheck = await execBuffered(
           runtime,
-          `test -d "${srcBaseDir}/${projectName}/.mux-base.git" && echo "exists" || echo "missing"`,
+          `test -d "${layout.baseRepoPath}" && echo "exists" || echo "missing"`,
           { cwd: "/home/testuser", timeout: 30 }
         );
         expect(baseCheck.stdout.trim()).toBe("missing");
@@ -1376,7 +1388,7 @@ describeIntegration("Runtime integration tests", () => {
         });
         expect(fileCheck.stdout.trim()).toBe("legacy content");
       } finally {
-        await execBuffered(runtime, `rm -rf "${srcBaseDir}/${projectName}"`, {
+        await execBuffered(runtime, `rm -rf "${layout.projectRoot}"`, {
           cwd: "/home/testuser",
           timeout: 30,
         });
@@ -1387,17 +1399,18 @@ describeIntegration("Runtime integration tests", () => {
       const runtime = createSSHRuntime();
       const projectName = `wt-mixed-fork-${Date.now()}-${Math.random().toString(36).substring(7)}`;
       const projectPath = `/some/path/${projectName}`;
-      const baseRepoPath = `${srcBaseDir}/${projectName}/.mux-base.git`;
-      const sourceWorkspacePath = `${srcBaseDir}/${projectName}/legacy-ws`;
+      const layout = getLayout(projectPath);
+      const baseRepoPath = layout.baseRepoPath;
+      const sourceWorkspacePath = getRemoteWorkspacePath(layout, "legacy-ws");
       const newWorkspaceName = "forked-mixed";
-      const newWorkspacePath = `${srcBaseDir}/${projectName}/${newWorkspaceName}`;
+      const newWorkspacePath = getRemoteWorkspacePath(layout, newWorkspaceName);
 
       try {
         // 1. Create a bare base repo with a commit on 'main' (simulates a previous initWorkspace).
         await execBuffered(
           runtime,
           [
-            `mkdir -p "${srcBaseDir}/${projectName}"`,
+            `mkdir -p "${layout.projectRoot}"`,
             `git init --bare "${baseRepoPath}"`,
             `TMPCLONE=$(mktemp -d)`,
             `git clone "${baseRepoPath}" "$TMPCLONE/work"`,
@@ -1466,7 +1479,7 @@ describeIntegration("Runtime integration tests", () => {
         });
         expect(fileCheck.stdout.trim()).toBe("legacy content");
       } finally {
-        await execBuffered(runtime, `rm -rf "${srcBaseDir}/${projectName}"`, {
+        await execBuffered(runtime, `rm -rf "${layout.projectRoot}"`, {
           cwd: "/home/testuser",
           timeout: 30,
         });
@@ -1477,16 +1490,17 @@ describeIntegration("Runtime integration tests", () => {
       const runtime = createSSHRuntime();
       const projectName = `wt-delete-${Date.now()}-${Math.random().toString(36).substring(7)}`;
       const projectPath = `/some/path/${projectName}`;
-      const baseRepoPath = `${srcBaseDir}/${projectName}/.mux-base.git`;
+      const layout = getLayout(projectPath);
+      const baseRepoPath = layout.baseRepoPath;
       const workspaceName = "to-delete";
-      const workspacePath = `${srcBaseDir}/${projectName}/${workspaceName}`;
+      const workspacePath = getRemoteWorkspacePath(layout, workspaceName);
 
       try {
         // Create bare base repo with a commit.
         await execBuffered(
           runtime,
           [
-            `mkdir -p "${srcBaseDir}/${projectName}"`,
+            `mkdir -p "${layout.projectRoot}"`,
             `git init --bare "${baseRepoPath}"`,
             `TMPCLONE=$(mktemp -d)`,
             `git clone "${baseRepoPath}" "$TMPCLONE/work"`,
@@ -1539,7 +1553,7 @@ describeIntegration("Runtime integration tests", () => {
         });
         expect(worktreeList.stdout).not.toContain(workspaceName);
       } finally {
-        await execBuffered(runtime, `rm -rf "${srcBaseDir}/${projectName}"`, {
+        await execBuffered(runtime, `rm -rf "${layout.projectRoot}"`, {
           cwd: "/home/testuser",
           timeout: 30,
         });
@@ -1550,7 +1564,8 @@ describeIntegration("Runtime integration tests", () => {
       const runtime = createSSHRuntime();
       const projectName = `wt-del-legacy-${Date.now()}-${Math.random().toString(36).substring(7)}`;
       const projectPath = `/some/path/${projectName}`;
-      const workspacePath = `${srcBaseDir}/${projectName}/legacy-ws`;
+      const layout = getLayout(projectPath);
+      const workspacePath = getRemoteWorkspacePath(layout, "legacy-ws");
 
       try {
         // Create a legacy workspace (standalone git clone, .git is a directory).
@@ -1577,27 +1592,28 @@ describeIntegration("Runtime integration tests", () => {
         );
         expect(afterCheck.stdout.trim()).toBe("missing");
       } finally {
-        await execBuffered(runtime, `rm -rf "${srcBaseDir}/${projectName}"`, {
+        await execBuffered(runtime, `rm -rf "${layout.projectRoot}"`, {
           cwd: "/home/testuser",
           timeout: 30,
         });
       }
     }, 60000);
 
-    test("renameWorkspace uses git worktree move for worktree-based workspaces", async () => {
+    test("renameWorkspace uses git worktree move and deleteWorkspace still cleans up the renamed branch", async () => {
       const runtime = createSSHRuntime();
       const projectName = `wt-rename-${Date.now()}-${Math.random().toString(36).substring(7)}`;
       const projectPath = `/some/path/${projectName}`;
-      const baseRepoPath = `${srcBaseDir}/${projectName}/.mux-base.git`;
-      const oldWorkspacePath = `${srcBaseDir}/${projectName}/old-name`;
-      const newWorkspacePath = `${srcBaseDir}/${projectName}/new-name`;
+      const layout = getLayout(projectPath);
+      const baseRepoPath = layout.baseRepoPath;
+      const oldWorkspacePath = getRemoteWorkspacePath(layout, "old-name");
+      const newWorkspacePath = getRemoteWorkspacePath(layout, "new-name");
 
       try {
         // Set up bare base repo with a commit.
         await execBuffered(
           runtime,
           [
-            `mkdir -p "${srcBaseDir}/${projectName}"`,
+            `mkdir -p "${layout.projectRoot}"`,
             `git init --bare "${baseRepoPath}"`,
             `TMPCLONE=$(mktemp -d)`,
             `git clone "${baseRepoPath}" "$TMPCLONE/work"`,
@@ -1648,13 +1664,187 @@ describeIntegration("Runtime integration tests", () => {
         });
         expect(worktreeList.stdout).toContain("/new-name");
         expect(worktreeList.stdout).not.toContain("/old-name");
+
+        const deleteResult = await runtime.deleteWorkspace(projectPath, "new-name", true);
+        expect(deleteResult.success).toBe(true);
+
+        const deletedPathCheck = await execBuffered(
+          runtime,
+          `test -d "${newWorkspacePath}" && echo "exists" || echo "missing"`,
+          { cwd: "/home/testuser", timeout: 30 }
+        );
+        expect(deletedPathCheck.stdout.trim()).toBe("missing");
+
+        const branchCheck = await execBuffered(
+          runtime,
+          `git -C "${baseRepoPath}" branch --list old-name`,
+          { cwd: "/home/testuser", timeout: 30 }
+        );
+        expect(branchCheck.stdout.trim()).toBe("");
       } finally {
-        await execBuffered(runtime, `rm -rf "${srcBaseDir}/${projectName}"`, {
+        await execBuffered(runtime, `rm -rf "${layout.projectRoot}"`, {
           cwd: "/home/testuser",
           timeout: 30,
         });
       }
     }, 60000);
+
+    test("renameWorkspace and deleteWorkspace keep using the legacy base repo for upgraded SSH worktrees", async () => {
+      if (!sshConfig) {
+        throw new Error("SSH config unavailable");
+      }
+
+      const config = {
+        host: "testuser@localhost",
+        srcBaseDir,
+        identityFile: sshConfig.privateKeyPath,
+        port: sshConfig.port,
+      };
+      const runtime = new SSHRuntime(config, createSSHTransport(config, false), {
+        projectPath: "/unused",
+        workspaceName: "unused",
+      });
+      const projectName = `wt-legacy-rename-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      const projectPath = `/some/path/${projectName}`;
+      const legacyLayout = buildLegacyRemoteProjectLayout(srcBaseDir, projectPath);
+      const baseRepoPath = legacyLayout.baseRepoPath;
+      const oldWorkspacePath = getRemoteWorkspacePath(legacyLayout, "old-name");
+      const newWorkspacePath = getRemoteWorkspacePath(legacyLayout, "new-name");
+      const legacyRuntime = new SSHRuntime(config, createSSHTransport(config, false), {
+        projectPath,
+        workspaceName: "old-name",
+        workspacePath: oldWorkspacePath,
+      });
+
+      try {
+        await execBuffered(
+          runtime,
+          [
+            `mkdir -p "${legacyLayout.projectRoot}"`,
+            `git init --bare "${baseRepoPath}"`,
+            `TMPCLONE=$(mktemp -d)`,
+            `git clone "${baseRepoPath}" "$TMPCLONE/work"`,
+            `cd "$TMPCLONE/work"`,
+            `git config user.email "test@test.com"`,
+            `git config user.name "Test"`,
+            `echo "x" > x.txt && git add x.txt && git commit -m "init"`,
+            `git push origin HEAD:main`,
+            `rm -rf "$TMPCLONE"`,
+          ].join(" && "),
+          { cwd: "/home/testuser", timeout: 30 }
+        );
+
+        await execBuffered(
+          runtime,
+          `git -C "${baseRepoPath}" worktree add "${oldWorkspacePath}" -b old-name main`,
+          { cwd: "/home/testuser", timeout: 30 }
+        );
+
+        const renameResult = await legacyRuntime.renameWorkspace(
+          projectPath,
+          "old-name",
+          "new-name"
+        );
+        expect(renameResult.success).toBe(true);
+        if (!renameResult.success) return;
+
+        const legacyWorktreeList = await execBuffered(
+          runtime,
+          `git -C "${baseRepoPath}" worktree list`,
+          { cwd: "/home/testuser", timeout: 30 }
+        );
+        expect(legacyWorktreeList.stdout).toContain("/new-name");
+        expect(legacyWorktreeList.stdout).not.toContain("/old-name");
+
+        const renamedLegacyRuntime = new SSHRuntime(config, createSSHTransport(config, false), {
+          projectPath,
+          workspaceName: "new-name",
+          workspacePath: newWorkspacePath,
+        });
+        const deleteResult = await renamedLegacyRuntime.deleteWorkspace(
+          projectPath,
+          "new-name",
+          true
+        );
+        expect(deleteResult.success).toBe(true);
+
+        const deletedPathCheck = await execBuffered(
+          runtime,
+          `test -d "${newWorkspacePath}" && echo "exists" || echo "missing"`,
+          { cwd: "/home/testuser", timeout: 30 }
+        );
+        expect(deletedPathCheck.stdout.trim()).toBe("missing");
+
+        const branchCheck = await execBuffered(
+          runtime,
+          `git -C "${baseRepoPath}" branch --list old-name`,
+          { cwd: "/home/testuser", timeout: 30 }
+        );
+        expect(branchCheck.stdout.trim()).toBe("");
+      } finally {
+        await execBuffered(runtime, `rm -rf "${legacyLayout.projectRoot}"`, {
+          cwd: "/home/testuser",
+          timeout: 30,
+        });
+      }
+    }, 60000);
+
+    test("exec handles a concurrent burst on one SSH host", async () => {
+      const runtime = createSSHRuntime();
+      const projectName = `ssh-burst-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      const tmpDir = await import("os").then((os) => os.tmpdir());
+      const localProjectPath = `${tmpDir}/${projectName}`;
+      const layout = getLayout(localProjectPath);
+      const workspaceName = "burst-ws";
+      const workspacePath = getRemoteWorkspacePath(layout, workspaceName);
+      const { execSync } = await import("child_process");
+
+      try {
+        execSync(
+          [
+            `mkdir -p "${localProjectPath}"`,
+            `cd "${localProjectPath}"`,
+            `git init -b main`,
+            `git config user.email "test@test.com"`,
+            `git config user.name "Test"`,
+            `echo "content" > file.txt`,
+            `git add file.txt`,
+            `git commit -m "initial"`,
+          ].join(" && "),
+          { stdio: "pipe" }
+        );
+
+        const initResult = await runtime.initWorkspace({
+          projectPath: localProjectPath,
+          branchName: workspaceName,
+          trunkBranch: "main",
+          workspacePath,
+          initLogger: noopInitLogger,
+        });
+        if (!initResult.success) {
+          throw new Error(`initWorkspace failed: ${initResult.error}`);
+        }
+
+        const results = await Promise.all(
+          Array.from({ length: 12 }, async (_value, index) => {
+            const result = await execBuffered(
+              runtime,
+              `printf '%s' ${JSON.stringify(String(index))} > burst-${index}.txt && cat burst-${index}.txt`,
+              { cwd: workspacePath, timeout: 30 }
+            );
+            expect(result.exitCode).toBe(0);
+            expect(result.stdout.trim()).toBe(String(index));
+          })
+        );
+        expect(results).toHaveLength(12);
+      } finally {
+        execSync(`rm -rf "${localProjectPath}"`);
+        await execBuffered(runtime, `rm -rf "${layout.projectRoot}"`, {
+          cwd: "/home/testuser",
+          timeout: 30,
+        });
+      }
+    }, 120000);
   });
 
   /**
@@ -1673,14 +1863,13 @@ describeIntegration("Runtime integration tests", () => {
     test("initWorkspace does not populate refs/remotes/origin in the base repo from the bundle", async () => {
       const runtime = createSSHRuntime();
 
-      // projectName must match the basename of the local project path so that
-      // getBaseRepoPath(localProjectPath) resolves to the expected baseRepoPath.
       const projectName = `sync-no-remotes-${Date.now()}-${Math.random().toString(36).substring(7)}`;
       const tmpDir = await import("os").then((os) => os.tmpdir());
       const localProjectPath = `${tmpDir}/${projectName}`;
+      const layout = buildRemoteProjectLayout(srcBaseDir, localProjectPath);
       const branchName = "test-ws";
-      const workspacePath = `${srcBaseDir}/${projectName}/${branchName}`;
-      const baseRepoPath = `${srcBaseDir}/${projectName}/.mux-base.git`;
+      const workspacePath = getRemoteWorkspacePath(layout, branchName);
+      const baseRepoPath = layout.baseRepoPath;
 
       const { execSync } = await import("child_process");
       try {
@@ -1742,7 +1931,7 @@ describeIntegration("Runtime integration tests", () => {
           expect(baseRefs.stdout).not.toContain("refs/remotes/origin/main");
           expect(baseRefs.stdout).not.toContain("refs/remotes/origin/stale-branch");
         } finally {
-          await execBuffered(runtime, `rm -rf "${srcBaseDir}/${projectName}"`, {
+          await execBuffered(runtime, `rm -rf "${layout.projectRoot}"`, {
             cwd: "/home/testuser",
             timeout: 30,
           });
@@ -1752,15 +1941,147 @@ describeIntegration("Runtime integration tests", () => {
       }
     }, 120000);
 
+    test("initWorkspace reuses snapshots and preserves remote-only tags across later resyncs", async () => {
+      const runtime = createSSHRuntime();
+
+      const projectName = `sync-remote-tags-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      const tmpDir = await import("os").then((os) => os.tmpdir());
+      const localProjectPath = `${tmpDir}/${projectName}`;
+      const layout = buildRemoteProjectLayout(srcBaseDir, localProjectPath);
+      const firstWorkspacePath = getRemoteWorkspacePath(layout, "tags-a");
+      const secondWorkspacePath = getRemoteWorkspacePath(layout, "tags-b");
+      const thirdWorkspacePath = getRemoteWorkspacePath(layout, "tags-c");
+      const baseRepoPath = layout.baseRepoPath;
+
+      const createCapturingInitLogger = (steps: string[]) => ({
+        ...noopInitLogger,
+        logStep(step: string) {
+          steps.push(step);
+        },
+      });
+
+      const { execSync } = await import("child_process");
+      try {
+        execSync(
+          [
+            `mkdir -p "${localProjectPath}"`,
+            `cd "${localProjectPath}"`,
+            `git init -b main`,
+            `git config user.email "test@test.com"`,
+            `git config user.name "Test"`,
+            `echo "version-a" > file.txt`,
+            `git add file.txt`,
+            `git commit -m "initial"`,
+          ].join(" && "),
+          { stdio: "pipe" }
+        );
+
+        const firstInit = await runtime.initWorkspace({
+          projectPath: localProjectPath,
+          branchName: "tags-a",
+          trunkBranch: "main",
+          workspacePath: firstWorkspacePath,
+          initLogger: noopInitLogger,
+        });
+        if (!firstInit.success) {
+          throw new Error(`first initWorkspace failed: ${firstInit.error}`);
+        }
+
+        const initialBaseHead = await execBuffered(
+          runtime,
+          `git -C "${baseRepoPath}" rev-parse refs/mux-bundle/main`,
+          { cwd: "/home/testuser", timeout: 30 }
+        );
+        const initialBaseHeadOid = initialBaseHead.stdout.trim();
+        expect(initialBaseHead.exitCode).toBe(0);
+        expect(initialBaseHeadOid).not.toBe("");
+
+        const addRemoteOnlyTag = await execBuffered(
+          runtime,
+          `git -C "${baseRepoPath}" update-ref refs/tags/remote-only ${initialBaseHeadOid}`,
+          { cwd: "/home/testuser", timeout: 30 }
+        );
+        expect(addRemoteOnlyTag.exitCode).toBe(0);
+
+        const reuseSteps: string[] = [];
+        const secondInit = await runtime.initWorkspace({
+          projectPath: localProjectPath,
+          branchName: "tags-b",
+          trunkBranch: "main",
+          workspacePath: secondWorkspacePath,
+          initLogger: createCapturingInitLogger(reuseSteps),
+        });
+        if (!secondInit.success) {
+          throw new Error(`second initWorkspace failed: ${secondInit.error}`);
+        }
+        expect(reuseSteps).toContain("Reusing existing remote project snapshot");
+
+        const remoteOnlyTagBeforeResync = await execBuffered(
+          runtime,
+          `git -C "${baseRepoPath}" rev-parse refs/tags/remote-only`,
+          { cwd: "/home/testuser", timeout: 30 }
+        );
+        expect(remoteOnlyTagBeforeResync.exitCode).toBe(0);
+        expect(remoteOnlyTagBeforeResync.stdout.trim()).toBe(initialBaseHeadOid);
+
+        execSync(
+          [
+            `cd "${localProjectPath}"`,
+            `echo "version-b" > file.txt`,
+            `git add file.txt`,
+            `git commit -m "second"`,
+          ].join(" && "),
+          { stdio: "pipe" }
+        );
+        const secondCommit = execSync(`git -C "${localProjectPath}" rev-parse HEAD`, {
+          encoding: "utf8",
+        }).trim();
+
+        const thirdInit = await runtime.initWorkspace({
+          projectPath: localProjectPath,
+          branchName: "tags-c",
+          trunkBranch: "main",
+          workspacePath: thirdWorkspacePath,
+          initLogger: noopInitLogger,
+        });
+        if (!thirdInit.success) {
+          throw new Error(`third initWorkspace failed: ${thirdInit.error}`);
+        }
+
+        const updatedBaseHead = await execBuffered(
+          runtime,
+          `git -C "${baseRepoPath}" rev-parse refs/mux-bundle/main`,
+          { cwd: "/home/testuser", timeout: 30 }
+        );
+        expect(updatedBaseHead.exitCode).toBe(0);
+        expect(updatedBaseHead.stdout.trim()).toBe(secondCommit);
+
+        const remoteOnlyTagAfterResync = await execBuffered(
+          runtime,
+          `git -C "${baseRepoPath}" rev-parse refs/tags/remote-only`,
+          { cwd: "/home/testuser", timeout: 30 }
+        );
+        expect(remoteOnlyTagAfterResync.exitCode).toBe(0);
+        expect(remoteOnlyTagAfterResync.stdout.trim()).toBe(initialBaseHeadOid);
+      } finally {
+        execSync(`rm -rf "${localProjectPath}"`);
+        await execBuffered(runtime, `rm -rf "${layout.projectRoot}"`, {
+          cwd: "/home/testuser",
+          timeout: 30,
+        });
+      }
+    }, 120000);
+
     test("initWorkspace strips shared core.bare from pre-existing base repos before checkout", async () => {
       const runtime = createSSHRuntime();
 
       const projectName = `sync-heal-bare-${Date.now()}-${Math.random().toString(36).substring(7)}`;
       const tmpDir = await import("os").then((os) => os.tmpdir());
       const localProjectPath = `${tmpDir}/${projectName}`;
+      const layout = buildRemoteProjectLayout(srcBaseDir, localProjectPath);
       const branchName = "worktree-heal";
-      const workspacePath = `${srcBaseDir}/${projectName}/${branchName}`;
-      const baseRepoPath = `${srcBaseDir}/${projectName}/.mux-base.git`;
+      const workspacePath = getRemoteWorkspacePath(layout, branchName);
+      const baseRepoPath = layout.baseRepoPath;
 
       const { execSync } = await import("child_process");
       try {
@@ -1780,7 +2101,7 @@ describeIntegration("Runtime integration tests", () => {
 
         await execBuffered(
           runtime,
-          `mkdir -p "${srcBaseDir}/${projectName}" && git init --bare "${baseRepoPath}"`,
+          `mkdir -p "${layout.projectRoot}" && git init --bare "${baseRepoPath}"`,
           { cwd: "/home/testuser", timeout: 30 }
         );
 
@@ -1824,7 +2145,192 @@ describeIntegration("Runtime integration tests", () => {
         expect(workspaceCoreBareCheck.exitCode).toBe(1);
       } finally {
         execSync(`rm -rf "${localProjectPath}"`);
-        await execBuffered(runtime, `rm -rf "${srcBaseDir}/${projectName}"`, {
+        await execBuffered(runtime, `rm -rf "${layout.projectRoot}"`, {
+          cwd: "/home/testuser",
+          timeout: 30,
+        });
+      }
+    }, 120000);
+
+    test("initWorkspace reimports when the snapshot marker outlives the base repo", async () => {
+      const runtime = createSSHRuntime();
+
+      const projectName = `sync-heal-marker-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      const tmpDir = await import("os").then((os) => os.tmpdir());
+      const localProjectPath = `${tmpDir}/${projectName}`;
+      const layout = buildRemoteProjectLayout(srcBaseDir, localProjectPath);
+      const firstWorkspaceName = "marker-a";
+      const secondWorkspaceName = "marker-b";
+      const firstWorkspacePath = getRemoteWorkspacePath(layout, firstWorkspaceName);
+      const secondWorkspacePath = getRemoteWorkspacePath(layout, secondWorkspaceName);
+      const baseRepoPath = layout.baseRepoPath;
+
+      const { execSync } = await import("child_process");
+      try {
+        execSync(
+          [
+            `mkdir -p "${localProjectPath}"`,
+            `cd "${localProjectPath}"`,
+            `git init -b main`,
+            `git config user.email "test@test.com"`,
+            `git config user.name "Test"`,
+            `echo "content" > file.txt`,
+            `git add file.txt`,
+            `git commit -m "initial"`,
+          ].join(" && "),
+          { stdio: "pipe" }
+        );
+
+        const firstInit = await runtime.initWorkspace({
+          projectPath: localProjectPath,
+          branchName: firstWorkspaceName,
+          trunkBranch: "main",
+          workspacePath: firstWorkspacePath,
+          initLogger: noopInitLogger,
+        });
+        if (!firstInit.success) {
+          throw new Error(`first initWorkspace failed: ${firstInit.error}`);
+        }
+
+        const snapshotMarkerCheck = await execBuffered(
+          runtime,
+          `test -f "${layout.currentSnapshotPath}" && cat "${layout.currentSnapshotPath}"`,
+          { cwd: "/home/testuser", timeout: 30 }
+        );
+        expect(snapshotMarkerCheck.stdout.trim()).not.toBe("");
+
+        await execBuffered(
+          runtime,
+          `rm -rf "${baseRepoPath}" && git init --bare "${baseRepoPath}"`,
+          { cwd: "/home/testuser", timeout: 30 }
+        );
+
+        const secondInit = await runtime.initWorkspace({
+          projectPath: localProjectPath,
+          branchName: secondWorkspaceName,
+          trunkBranch: "main",
+          workspacePath: secondWorkspacePath,
+          initLogger: noopInitLogger,
+        });
+        if (!secondInit.success) {
+          throw new Error(`second initWorkspace failed: ${secondInit.error}`);
+        }
+
+        const baseRefs = await execBuffered(
+          runtime,
+          `git -C "${baseRepoPath}" for-each-ref --format='%(refname)' refs/mux-bundle/`,
+          { cwd: "/home/testuser", timeout: 30 }
+        );
+        expect(baseRefs.stdout).toContain("refs/mux-bundle/main");
+
+        const insideWorkTreeCheck = await execBuffered(
+          runtime,
+          `git -C "${secondWorkspacePath}" rev-parse --is-inside-work-tree`,
+          { cwd: "/home/testuser", timeout: 30 }
+        );
+        expect(insideWorkTreeCheck.stdout.trim()).toBe("true");
+      } finally {
+        execSync(`rm -rf "${localProjectPath}"`);
+        await execBuffered(runtime, `rm -rf "${layout.projectRoot}"`, {
+          cwd: "/home/testuser",
+          timeout: 30,
+        });
+      }
+    }, 120000);
+
+    test("initWorkspace reimports when an older snapshot marker exists but bundle refs were advanced", async () => {
+      const runtime = createSSHRuntime();
+
+      const projectName = `sync-heal-history-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      const tmpDir = await import("os").then((os) => os.tmpdir());
+      const localProjectPath = `${tmpDir}/${projectName}`;
+      const layout = buildRemoteProjectLayout(srcBaseDir, localProjectPath);
+      const firstWorkspacePath = getRemoteWorkspacePath(layout, "history-a");
+      const secondWorkspacePath = getRemoteWorkspacePath(layout, "history-b");
+      const thirdWorkspacePath = getRemoteWorkspacePath(layout, "history-c");
+      const baseRepoPath = layout.baseRepoPath;
+
+      const { execSync } = await import("child_process");
+      try {
+        execSync(
+          [
+            `mkdir -p "${localProjectPath}"`,
+            `cd "${localProjectPath}"`,
+            `git init -b main`,
+            `git config user.email "test@test.com"`,
+            `git config user.name "Test"`,
+            `echo "version-a" > file.txt`,
+            `git add file.txt`,
+            `git commit -m "initial"`,
+          ].join(" && "),
+          { stdio: "pipe" }
+        );
+        const firstCommit = execSync(`git -C "${localProjectPath}" rev-parse HEAD`, {
+          encoding: "utf8",
+        }).trim();
+
+        const firstInit = await runtime.initWorkspace({
+          projectPath: localProjectPath,
+          branchName: "history-a",
+          trunkBranch: "main",
+          workspacePath: firstWorkspacePath,
+          initLogger: noopInitLogger,
+        });
+        if (!firstInit.success) {
+          throw new Error(`first initWorkspace failed: ${firstInit.error}`);
+        }
+
+        execSync(
+          [
+            `cd "${localProjectPath}"`,
+            `echo "version-b" > file.txt`,
+            `git add file.txt`,
+            `git commit -m "second"`,
+          ].join(" && "),
+          { stdio: "pipe" }
+        );
+
+        const secondInit = await runtime.initWorkspace({
+          projectPath: localProjectPath,
+          branchName: "history-b",
+          trunkBranch: "main",
+          workspacePath: secondWorkspacePath,
+          initLogger: noopInitLogger,
+        });
+        if (!secondInit.success) {
+          throw new Error(`second initWorkspace failed: ${secondInit.error}`);
+        }
+
+        execSync(`git -C "${localProjectPath}" reset --hard ${firstCommit}`, {
+          stdio: "pipe",
+        });
+
+        const thirdInit = await runtime.initWorkspace({
+          projectPath: localProjectPath,
+          branchName: "history-c",
+          trunkBranch: "main",
+          workspacePath: thirdWorkspacePath,
+          initLogger: noopInitLogger,
+        });
+        if (!thirdInit.success) {
+          throw new Error(`third initWorkspace failed: ${thirdInit.error}`);
+        }
+
+        const fileCheck = await execBuffered(runtime, `cat "${thirdWorkspacePath}/file.txt"`, {
+          cwd: "/home/testuser",
+          timeout: 30,
+        });
+        expect(fileCheck.stdout.trim()).toBe("version-a");
+
+        const baseHead = await execBuffered(
+          runtime,
+          `git -C "${baseRepoPath}" rev-parse refs/mux-bundle/main`,
+          { cwd: "/home/testuser", timeout: 30 }
+        );
+        expect(baseHead.stdout.trim()).toBe(firstCommit);
+      } finally {
+        execSync(`rm -rf "${localProjectPath}"`);
+        await execBuffered(runtime, `rm -rf "${layout.projectRoot}"`, {
           cwd: "/home/testuser",
           timeout: 30,
         });
@@ -1852,9 +2358,10 @@ describeIntegration("Runtime integration tests", () => {
       const localProjectPath = `${tmpDir}/${projectName}`;
       const wsAName = "ws-a";
       const wsBName = "ws-b";
-      const wsAPath = `${srcBaseDir}/${projectName}/${wsAName}`;
-      const wsBPath = `${srcBaseDir}/${projectName}/${wsBName}`;
-      const baseRepoPath = `${srcBaseDir}/${projectName}/.mux-base.git`;
+      const layout = buildRemoteProjectLayout(srcBaseDir, localProjectPath);
+      const wsAPath = getRemoteWorkspacePath(layout, wsAName);
+      const wsBPath = getRemoteWorkspacePath(layout, wsBName);
+      const baseRepoPath = layout.baseRepoPath;
 
       const { execSync } = await import("child_process");
 
@@ -1958,7 +2465,7 @@ describeIntegration("Runtime integration tests", () => {
         expect(worktreeList.stdout).toContain(wsBName);
       } finally {
         execSync(`rm -rf "${localProjectPath}"`);
-        await execBuffered(runtime, `rm -rf "${srcBaseDir}/${projectName}"`, {
+        await execBuffered(runtime, `rm -rf "${layout.projectRoot}"`, {
           cwd: "/home/testuser",
           timeout: 30,
         });
@@ -2291,6 +2798,7 @@ describeIntegration("Runtime integration tests", () => {
    */
   describe("CoderSSHRuntime workspace operations", () => {
     const srcBaseDir = "/home/testuser/src";
+    const getLayout = (projectPath: string) => buildRemoteProjectLayout(srcBaseDir, projectPath);
 
     // Create a CoderSSHRuntime with mock CoderService
     const createCoderSSHRuntime = async () => {
@@ -2326,7 +2834,8 @@ describeIntegration("Runtime integration tests", () => {
 
         const sourceWorkspaceName = "source";
         const newWorkspaceName = "forked";
-        const sourceWorkspacePath = `${srcBaseDir}/${projectName}/${sourceWorkspaceName}`;
+        const layout = getLayout(projectPath);
+        const sourceWorkspacePath = getRemoteWorkspacePath(layout, sourceWorkspaceName);
 
         // Create a source workspace repo
         await execBuffered(
@@ -2415,8 +2924,9 @@ describeIntegration("Runtime integration tests", () => {
         const projectPath = `/some/path/${projectName}`;
         const sourceWorkspaceName = "source";
         const newWorkspaceName = "forked";
-        const sourceWorkspacePath = `${srcBaseDir}/${projectName}/${sourceWorkspaceName}`;
-        const forkedWorkspacePath = `${srcBaseDir}/${projectName}/${newWorkspaceName}`;
+        const layout = getLayout(projectPath);
+        const sourceWorkspacePath = getRemoteWorkspacePath(layout, sourceWorkspaceName);
+        const forkedWorkspacePath = getRemoteWorkspacePath(layout, newWorkspaceName);
 
         // Create a source workspace repo
         await execBuffered(

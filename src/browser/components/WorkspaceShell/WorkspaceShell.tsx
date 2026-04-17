@@ -2,7 +2,11 @@ import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
 import React, { useCallback, useRef } from "react";
 import { cn } from "@/common/lib/utils";
 import { LoadingAnimation } from "../LoadingAnimation/LoadingAnimation";
-import { RIGHT_SIDEBAR_WIDTH_KEY, getReviewImmersiveKey } from "@/common/constants/storage";
+import {
+  LEFT_SIDEBAR_WIDTH_KEY,
+  RIGHT_SIDEBAR_WIDTH_KEY,
+  getReviewImmersiveKey,
+} from "@/common/constants/storage";
 import { useResizableSidebar } from "@/browser/hooks/useResizableSidebar";
 import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { useOpenTerminal } from "@/browser/hooks/useOpenTerminal";
@@ -15,6 +19,12 @@ import { useWorkspaceState } from "@/browser/stores/WorkspaceStore";
 import { useReviews } from "@/browser/hooks/useReviews";
 import type { ReviewNoteData } from "@/common/types/review";
 import { ConnectionStatusToast } from "../ConnectionStatusToast/ConnectionStatusToast";
+import {
+  LEFT_SIDEBAR_COLLAPSED_WIDTH_PX,
+  LEFT_SIDEBAR_DEFAULT_WIDTH_PX,
+  LEFT_SIDEBAR_MAX_WIDTH_PX,
+  LEFT_SIDEBAR_MIN_WIDTH_PX,
+} from "@/constants/layout";
 import { ChatPane } from "../ChatPane/ChatPane";
 
 // ChatPane uses tailwind `min-w-96`.
@@ -27,6 +37,32 @@ const RIGHT_SIDEBAR_ABS_MAX_WIDTH_PX = 1200;
 // Guard against subpixel rounding (e.g. zoom/devicePixelRatio) producing a 1px horizontal
 // overflow that would trigger the WorkspaceShell scrollbar.
 const RIGHT_SIDEBAR_OVERFLOW_GUARD_PX = 1;
+
+export function estimateWorkspaceShellFallbackWidthPx(args: {
+  viewportWidthPx: number;
+  isStacked: boolean;
+  leftSidebarCollapsed: boolean;
+  persistedLeftSidebarWidthPx: unknown;
+}): number {
+  if (args.isStacked) {
+    return args.viewportWidthPx;
+  }
+
+  const persistedLeftSidebarWidthPx =
+    typeof args.persistedLeftSidebarWidthPx === "number" &&
+    Number.isFinite(args.persistedLeftSidebarWidthPx)
+      ? args.persistedLeftSidebarWidthPx
+      : LEFT_SIDEBAR_DEFAULT_WIDTH_PX;
+
+  const estimatedLeftSidebarWidthPx = args.leftSidebarCollapsed
+    ? LEFT_SIDEBAR_COLLAPSED_WIDTH_PX
+    : Math.max(
+        LEFT_SIDEBAR_MIN_WIDTH_PX,
+        Math.min(LEFT_SIDEBAR_MAX_WIDTH_PX, persistedLeftSidebarWidthPx)
+      );
+
+  return Math.max(0, args.viewportWidthPx - estimatedLeftSidebarWidthPx);
+}
 
 interface WorkspaceShellProps {
   workspaceId: string;
@@ -76,14 +112,24 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   const isStacked =
     typeof window !== "undefined" && window.matchMedia("(max-width: 768px)").matches;
 
+  const [persistedLeftSidebarWidthPx] = usePersistedState<unknown>(
+    LEFT_SIDEBAR_WIDTH_KEY,
+    LEFT_SIDEBAR_DEFAULT_WIDTH_PX,
+    { listener: true }
+  );
   const containerWidthPx = shellSize?.width ?? 0;
-  // happy-dom / early-mount fallback: treat 0 as "unknown"
+  // Before ResizeObserver reports the real shell width, estimate it from the persisted left
+  // sidebar width so a wide right sidebar doesn't first paint at a viewport-wide clamp and
+  // then visibly snap narrower once the shell is measured.
   const usableWidthPx =
     containerWidthPx > 0
       ? containerWidthPx
-      : typeof window !== "undefined"
-        ? window.innerWidth
-        : 1200;
+      : estimateWorkspaceShellFallbackWidthPx({
+          viewportWidthPx: typeof window !== "undefined" ? window.innerWidth : 1200,
+          isStacked,
+          leftSidebarCollapsed: props.leftSidebarCollapsed,
+          persistedLeftSidebarWidthPx,
+        });
 
   // Prevent ChatPane + RightSidebar from overflowing the workspace shell (which would show a
   // horizontal scrollbar due to WorkspaceShell's `overflow-x-auto`).
@@ -136,7 +182,7 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   });
   const backgroundBashError = useBackgroundBashError();
 
-  if (!workspaceState || workspaceState.loading) {
+  if (!workspaceState) {
     return (
       <WorkspacePlaceholder
         title="Loading workspace..."
@@ -146,13 +192,23 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
     );
   }
 
-  // Web-only: during workspace switches, the WebSocket subscription needs time to
-  // catch up. Show a splash instead of flashing stale cached messages.
-  // Electron's MessageChannel is near-instant so this gate is unnecessary there.
-  if (workspaceState.isHydratingTranscript && !window.api) {
+  const shouldKeepChatPaneMountedDuringHydration =
+    workspaceState.isHydratingTranscript && !workspaceState.isStreamStarting;
+
+  // User rationale: a just-created chat should keep showing its startup barrier instead of
+  // flashing generic loading/catch-up placeholders before the first send reaches onChat.
+  // Keep the chat pane mounted during transcript hydration so the composer does not disappear
+  // while a workspace is opening. ChatPane already owns the transcript-level loading placeholder,
+  // so swapping the whole shell here causes the vertical tear reproduced in both browser and
+  // Electron repros when an unseen workspace is opened.
+  if (
+    workspaceState.loading &&
+    !workspaceState.isStreamStarting &&
+    !shouldKeepChatPaneMountedDuringHydration
+  ) {
     return (
       <WorkspacePlaceholder
-        title="Catching up with the agent..."
+        title="Loading workspace..."
         showAnimation
         className={props.className}
       />
@@ -178,9 +234,10 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
       )}
       style={{ containerType: "inline-size" }}
     >
-      {/* Keyed by workspaceId to prevent cross-workspace message-list flashes. */}
+      {/* Keep the transcript viewport mounted across workspace switches so the browser doesn't
+          visually tear the pane while the new workspace content hydrates. ChatPane resets its
+          per-workspace local UI state internally, and the composer remains keyed by workspaceId. */}
       <ChatPane
-        key={`chat-${props.workspaceId}`}
         workspaceId={props.workspaceId}
         workspaceState={workspaceState}
         projectPath={props.projectPath}

@@ -8,6 +8,7 @@ import {
   type RouteContext,
 } from "@/common/routing";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { isGatewayModelAccessibleFromAuthoritativeCatalog } from "@/common/utils/providers/gatewayModelCatalog";
 
 import { useProvidersConfig } from "./useProvidersConfig";
 
@@ -134,6 +135,16 @@ export function useRouting(): RoutingState {
     [providersConfig]
   );
 
+  const isGatewayModelAccessible = useCallback(
+    (gateway: string, modelId: string) =>
+      isGatewayModelAccessibleFromAuthoritativeCatalog(
+        gateway,
+        modelId,
+        providersConfig?.[gateway]?.models
+      ),
+    [providersConfig]
+  );
+
   const persistRoutePreferences = useCallback(
     (priority: string[], overrides: Record<string, string>) => {
       if (!api?.config?.updateRoutePreferences) {
@@ -192,7 +203,8 @@ export function useRouting(): RoutingState {
         normalized,
         routePriority,
         routeOverrides,
-        isConfigured
+        isConfigured,
+        isGatewayModelAccessible
       );
 
       const route = resolved.routeProvider === resolved.origin ? "direct" : resolved.routeProvider;
@@ -209,7 +221,7 @@ export function useRouting(): RoutingState {
         displayName: getRouteDisplayName(route),
       };
     },
-    [isConfigured, routeOverrides, routePriority]
+    [isConfigured, isGatewayModelAccessible, routeOverrides, routePriority]
   );
 
   // Resolve ignoring per-model overrides — answers "what would Auto pick?"
@@ -220,7 +232,8 @@ export function useRouting(): RoutingState {
         normalized,
         routePriority,
         {}, // empty overrides — priority-walk only
-        isConfigured
+        isConfigured,
+        isGatewayModelAccessible
       );
 
       const route = resolved.routeProvider === resolved.origin ? "direct" : resolved.routeProvider;
@@ -230,12 +243,13 @@ export function useRouting(): RoutingState {
         displayName: getRouteDisplayName(route),
       };
     },
-    [isConfigured, routePriority]
+    [isConfigured, isGatewayModelAccessible, routePriority]
   );
 
   const availableRoutes = useCallback(
-    (canonicalModel: string): AvailableRoute[] => listAvailableRoutes(canonicalModel, isConfigured),
-    [isConfigured]
+    (canonicalModel: string): AvailableRoute[] =>
+      listAvailableRoutes(canonicalModel, isConfigured, isGatewayModelAccessible),
+    [isConfigured, isGatewayModelAccessible]
   );
 
   return {

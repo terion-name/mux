@@ -11,8 +11,6 @@ import {
   usePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import { useDebouncedValue } from "@/browser/hooks/useDebouncedValue";
-import { useWorkspaceFallbackModel } from "@/browser/hooks/useWorkspaceFallbackModel";
-import { useWorkspaceUnread } from "@/browser/hooks/useWorkspaceUnread";
 import { useRuntimeStatusStoreRaw } from "@/browser/stores/RuntimeStatusStore";
 import { useWorkspaceStoreRaw, type WorkspaceStore } from "@/browser/stores/WorkspaceStore";
 import {
@@ -73,7 +71,6 @@ import { useSettings } from "@/browser/contexts/SettingsContext";
 
 import { AgentListItem, type WorkspaceSelection } from "../AgentListItem/AgentListItem";
 import { TaskGroupListItem } from "./TaskGroupListItem";
-import { WorkspaceStatusIndicator } from "../WorkspaceStatusIndicator/WorkspaceStatusIndicator";
 import { TitleEditProvider, useTitleEdit } from "@/browser/contexts/WorkspaceTitleEditContext";
 import { useConfirmDialog } from "@/browser/contexts/ConfirmDialogContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
@@ -85,7 +82,6 @@ import {
 } from "@/browser/components/PositionedMenu/PositionedMenu";
 import {
   ChevronRight,
-  CircleHelp,
   EllipsisVertical,
   Folder,
   FolderOpen,
@@ -95,7 +91,6 @@ import {
   Trash,
   Plus,
 } from "lucide-react";
-import { MUX_HELP_CHAT_WORKSPACE_ID } from "@/common/constants/muxChat";
 import { useWorkspaceActions } from "@/browser/contexts/WorkspaceContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
@@ -107,6 +102,7 @@ import { WorkspaceDragLayer } from "../WorkspaceDragLayer/WorkspaceDragLayer";
 import { SectionDragLayer } from "../SectionDragLayer/SectionDragLayer";
 import { DraggableSection } from "../DraggableSection/DraggableSection";
 import { Separator } from "../Separator/Separator";
+import { ScrollArea } from "../ScrollArea/ScrollArea";
 import type { SectionConfig } from "@/common/types/project";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isMultiProject } from "@/common/utils/multiProject";
@@ -125,39 +121,6 @@ export type { WorkspaceSelection } from "../AgentListItem/AgentListItem";
 // Draggable project item moved to module scope to avoid remounting on every parent render.
 // Defining components inside another component causes a new function identity each render,
 // which forces React to unmount/remount the subtree. That led to hover flicker and high CPU.
-
-/**
- * Compact button for opening Chat with Mux, showing an unread dot when there are
- * new messages since the user last viewed the workspace.
- */
-const MuxChatHelpButton: React.FC<{
-  onClick: () => void;
-  isSelected: boolean;
-}> = ({ onClick, isSelected }) => {
-  const { isUnread: hasUnread } = useWorkspaceUnread(MUX_HELP_CHAT_WORKSPACE_ID);
-  const isUnread = hasUnread && !isSelected;
-
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button
-          onClick={onClick}
-          className="text-muted hover:text-primary relative flex shrink-0 cursor-pointer items-center border-none bg-transparent p-0 transition-colors"
-          aria-label="Open Chat with Mux"
-        >
-          <CircleHelp className="h-3.5 w-3.5" />
-          {isUnread && (
-            <span
-              className="bg-accent absolute -top-0.5 -right-0.5 h-1.5 w-1.5 rounded-full"
-              aria-label="Unread messages"
-            />
-          )}
-        </button>
-      </TooltipTrigger>
-      <TooltipContent side="bottom">Chat with Mux</TooltipContent>
-    </Tooltip>
-  );
-};
 
 /**
  * Subscribe sidebar-level attention derivation to workspace updates.
@@ -283,8 +246,13 @@ function useWorkspaceAttentionSubscription(
 // Keep the project header visible while scrolling through long workspace lists.
 // Project rows are also drag handles, so disable text selection to avoid
 // highlighting the whole sidebar before a reorder gesture locks in.
+// pr-2 matches AgentListItem LIST_ITEM_BASE_CLASSES so project kebab aligns with workspace rows.
 const PROJECT_ITEM_BASE_CLASS =
-  "group sticky top-0 z-10 py-2 pl-2 pr-3 flex select-none items-center border-l-transparent bg-surface-primary transition-colors duration-150";
+  "group sticky top-0 z-30 py-2 pl-2 pr-1 flex select-none items-center border-l-transparent bg-surface-primary transition-colors duration-150";
+
+// Shared classes for the chevron toggle buttons on project/section headers.
+const PROJECT_TOGGLE_BUTTON_CLASSES =
+  "text-secondary hover:bg-hover hover:border-border-light mr-1.5 flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent p-0 transition-all duration-200";
 
 function getProjectFallbackLabel(projectPath: string): string {
   const abbreviatedPath = PlatformPaths.abbreviate(projectPath);
@@ -314,7 +282,7 @@ function getProjectItemClassName(opts: {
     opts.isDragging ? "cursor-grabbing opacity-35 [&_*]:!cursor-grabbing" : "cursor-grab",
     opts.isOver && "bg-accent/[0.08]",
     opts.selected && "bg-hover border-l-accent",
-    "hover:[&_button]:opacity-100 hover:[&_[data-drag-handle]]:opacity-100"
+    "hover:[&_button]:opacity-100 hover:[&_button]:pointer-events-auto hover:[&_[data-drag-handle]]:opacity-100"
   );
 }
 type DraggableProjectItemProps = React.PropsWithChildren<{
@@ -537,7 +505,7 @@ const ProjectDragLayer: React.FC = () => {
   const { basename } = PlatformPaths.splitAbbreviated(abbrevPath);
 
   return (
-    <div className="pointer-events-none fixed inset-0 z-[9999] cursor-grabbing">
+    <div className="pointer-events-none fixed inset-0 z-9999 cursor-grabbing">
       <div style={{ transform: `translate(${currentOffset.x + 10}px, ${currentOffset.y + 10}px)` }}>
         <div className={cn(PROJECT_ITEM_BASE_CLASS, "w-fit max-w-64 rounded-sm shadow-lg")}>
           <span className="text-secondary mr-2 flex h-5 w-5 shrink-0 items-center justify-center">
@@ -551,18 +519,6 @@ const ProjectDragLayer: React.FC = () => {
     </div>
   );
 };
-
-function MuxChatStatusIndicator() {
-  const fallbackModel = useWorkspaceFallbackModel(MUX_HELP_CHAT_WORKSPACE_ID);
-
-  return (
-    <WorkspaceStatusIndicator
-      workspaceId={MUX_HELP_CHAT_WORKSPACE_ID}
-      fallbackModel={fallbackModel}
-      isCreating={false}
-    />
-  );
-}
 
 /**
  * Handles F2 (edit title) and Shift+F2 (generate new title) keybinds.
@@ -578,9 +534,6 @@ function SidebarTitleEditKeybinds(props: {
 
   const regenerateTitleForWorkspace = useCallback(
     (workspaceId: string) => {
-      if (workspaceId === MUX_HELP_CHAT_WORKSPACE_ID) {
-        return;
-      }
       wrapGenerateTitle(workspaceId, () => {
         if (!api) {
           return Promise.resolve({ success: false, error: "Not connected to server" });
@@ -597,7 +550,6 @@ function SidebarTitleEditKeybinds(props: {
       if (!props.selectedWorkspace) return;
       if (isEditableElement(e.target)) return;
       const wsId = props.selectedWorkspace.workspaceId;
-      if (wsId === MUX_HELP_CHAT_WORKSPACE_ID) return;
 
       if (matchesKeybind(e, KEYBINDS.EDIT_WORKSPACE_TITLE)) {
         e.preventDefault();
@@ -807,35 +759,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     },
     [openWorkspaceDraft, collapsed, onToggleCollapsed, persistMobileSidebarScrollTop]
   );
-
-  const handleOpenMuxChat = useCallback(() => {
-    // Read metadata imperatively from the store (no subscription) to avoid
-    // making this callback depend on the metadata Map.
-    const meta = workspaceStore.getWorkspaceMetadata(MUX_HELP_CHAT_WORKSPACE_ID);
-
-    handleSelectWorkspace(
-      meta
-        ? {
-            workspaceId: meta.id,
-            projectPath: meta.projectPath,
-            projectName: meta.projectName,
-            namedWorkspacePath: meta.namedWorkspacePath,
-          }
-        : {
-            // Fallback: navigate by ID; metadata will fill in once refreshed.
-            workspaceId: MUX_HELP_CHAT_WORKSPACE_ID,
-            projectPath: "",
-            projectName: "Mux",
-            namedWorkspacePath: "",
-          }
-    );
-
-    if (!meta) {
-      refreshWorkspaceMetadata().catch((error) => {
-        console.error("Failed to refresh workspace metadata", error);
-      });
-    }
-  }, [handleSelectWorkspace, refreshWorkspaceMetadata, workspaceStore]);
 
   const handleGoHome = useCallback(() => {
     // Selecting null delegates to WorkspaceContext's home-navigation + selection reset flow.
@@ -1711,9 +1634,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       // Create new workspace for the project of the selected workspace
       if (matchesKeybind(e, KEYBINDS.NEW_WORKSPACE) && selectedWorkspace) {
         e.preventDefault();
-        if (selectedWorkspace.workspaceId === MUX_HELP_CHAT_WORKSPACE_ID) {
-          return;
-        }
         handleAddWorkspace(selectedWorkspace.projectPath);
       } else if (matchesKeybind(e, KEYBINDS.ARCHIVE_WORKSPACE) && selectedWorkspace) {
         e.preventDefault();
@@ -1724,11 +1644,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [selectedWorkspace, handleAddWorkspace, handleArchiveWorkspace]);
-
-  // Chat-with-Mux workspace registration is async at startup. Avoid mounting
-  // mux-chat header widgets until metadata exists so their hooks don't assert.
-  const muxChatWorkspaceExists =
-    workspaceStore.getWorkspaceMetadata(MUX_HELP_CHAT_WORKSPACE_ID) !== undefined;
 
   return (
     <TitleEditProvider onUpdateTitle={onUpdateTitle}>
@@ -1745,7 +1660,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
           className={cn(
             // The sidebar doubles as a drag surface, so keep copy selection disabled
             // unless a child input explicitly opts back into text selection.
-            "font-primary bg-surface-primary border-border-light flex flex-1 select-none flex-col overflow-hidden border-r",
+            "font-primary bg-surface-primary border-border-light relative flex flex-1 select-none flex-col overflow-hidden border-r",
             // In desktop mode when collapsed, hide border (LeftSidebar handles the partial border)
             isDesktopMode() && collapsed && "border-r-0"
           )}
@@ -1763,15 +1678,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                   >
                     <MuxLogo className="h-5 w-[44px]" aria-hidden="true" />
                   </button>
-                  {muxChatWorkspaceExists && (
-                    <>
-                      <MuxChatHelpButton
-                        onClick={handleOpenMuxChat}
-                        isSelected={selectedWorkspace?.workspaceId === MUX_HELP_CHAT_WORKSPACE_ID}
-                      />
-                      <MuxChatStatusIndicator />
-                    </>
-                  )}
                 </div>
                 <button
                   onClick={onAddProject}
@@ -1782,10 +1688,11 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                   <span>Add Project</span>
                 </button>
               </div>
-              <div
-                ref={projectListScrollRef}
-                onScroll={handleProjectListScroll}
-                className="flex-1 overflow-x-hidden overflow-y-auto"
+              <ScrollArea
+                className="flex-1"
+                viewportRef={projectListScrollRef}
+                onViewportScroll={handleProjectListScroll}
+                viewportClassName="overflow-x-hidden"
               >
                 {multiProjectWorkspaces.length > 0 && (
                   <div>
@@ -1793,7 +1700,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                       <button
                         onClick={() => toggleProject(MULTI_PROJECT_SIDEBAR_SECTION_ID)}
                         aria-label={`${isMultiProjectSectionExpanded ? "Collapse" : "Expand"} multi-project workspaces`}
-                        className="text-secondary hover:bg-hover hover:border-border-light mr-1.5 flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent p-0 transition-all duration-200"
+                        className={PROJECT_TOGGLE_BUTTON_CLASSES}
                       >
                         <span className="relative flex h-4 w-4 items-center justify-center">
                           <ChevronRight
@@ -1936,13 +1843,14 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                             }}
                             aria-label={`${isExpanded ? "Collapse" : "Expand"} project ${projectName}`}
                             data-project-path={projectPath}
-                            className="text-secondary hover:bg-hover hover:border-border-light mr-1.5 flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent p-0 transition-all duration-200"
+                            className={PROJECT_TOGGLE_BUTTON_CLASSES}
                           >
-                            {/* Mobile: nudge folder icon left so it visually centers above connector line. */}
-                            <span className="relative flex h-4 w-4 -translate-x-2 items-center justify-center md:translate-x-0">
+                            <span className="relative flex h-4 w-4 items-center justify-center">
                               <ChevronRight
                                 className="absolute inset-0 h-4 w-4 opacity-0 transition-[opacity,transform] duration-200 group-hover:opacity-100"
-                                style={{ transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)" }}
+                                style={{
+                                  transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)",
+                                }}
                               />
                               {isExpanded ? (
                                 <FolderOpen
@@ -1962,7 +1870,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                             </span>
                           </button>
                           <div
-                            className="flex min-w-0 flex-1 items-center pr-2"
+                            className="flex min-w-0 flex-1 items-center pr-1"
                             onContextMenu={(event) => handleOpenProjectMenu(event, projectPath)}
                           >
                             <Tooltip>
@@ -2006,7 +1914,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                     }}
                                   />
                                 ) : (
-                                  <div className="text-muted-dark flex min-w-0 items-center gap-1.5 text-sm">
+                                  <div className="text-muted-dark flex min-w-0 items-baseline gap-1.5 text-sm">
                                     <span
                                       className={cn(
                                         "min-w-0 flex-1 truncate font-medium",
@@ -2019,10 +1927,10 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                     </span>
                                     <span
                                       className={cn(
-                                        "shrink-0",
+                                        "shrink-0 text-xs",
                                         projectHasAttention
-                                          ? "text-content-primary"
-                                          : "text-content-secondary"
+                                          ? "text-content-secondary"
+                                          : "text-muted"
                                       )}
                                     >
                                       ({projectAgentCount})
@@ -2042,7 +1950,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                 }}
                                 aria-label={`New chat in ${projectName}`}
                                 data-project-path={projectPath}
-                                className="text-content-secondary hover:bg-hover hover:border-border-light mr-1 flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent text-sm leading-none transition-all duration-200"
+                                className="text-content-secondary hover:bg-hover hover:border-border-light pointer-events-none flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent text-sm leading-none opacity-0 transition-all duration-200 focus-visible:pointer-events-auto focus-visible:opacity-100"
                               >
                                 <Plus className="h-4 w-4 shrink-0" strokeWidth={1.8} />
                               </button>
@@ -2060,7 +1968,12 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                 }}
                                 aria-label={`Project options for ${projectName}`}
                                 data-project-path={projectPath}
-                                className="text-content-secondary hover:bg-hover hover:border-border-light flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent transition-all duration-200"
+                                className={cn(
+                                  "text-content-secondary hover:bg-hover hover:border-border-light flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent transition-all duration-200 focus-visible:pointer-events-auto focus-visible:opacity-100",
+                                  projectContextMenu.isOpen && projectMenuTargetPath === projectPath
+                                    ? "pointer-events-auto opacity-100"
+                                    : "pointer-events-none opacity-0"
+                                )}
                               >
                                 <EllipsisVertical className="h-4 w-4 shrink-0" strokeWidth={1.8} />
                               </button>
@@ -2074,17 +1987,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                             id={workspaceListId}
                             role="region"
                             aria-label={`Workspaces for ${projectName}`}
-                            className="relative pt-1"
+                            className="pt-1"
                           >
-                            <div
-                              aria-hidden="true"
-                              className="bg-border pointer-events-none absolute top-1 bottom-0 left-4.5 w-px"
-                              style={
-                                projectFolderColor
-                                  ? { backgroundColor: projectFolderColor }
-                                  : undefined
-                              }
-                            />
                             {(() => {
                               // Archived workspaces are excluded from workspaceMetadata so won't appear here
 
@@ -2620,8 +2524,10 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                     lastRunningSiblingIndex >= 0 &&
                                     siblingIndex < lastRunningSiblingIndex;
 
-                                  const ancestorTrunks: Array<{ depth: number; active: boolean }> =
-                                    [];
+                                  const ancestorTrunks: Array<{
+                                    depth: number;
+                                    active: boolean;
+                                  }> = [];
                                   const visitedAncestorIds = new Set<string>();
                                   let ancestorId: string | undefined = parentId;
                                   while (ancestorId && !visitedAncestorIds.has(ancestorId)) {
@@ -2970,7 +2876,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                     );
                   })
                 )}
-              </div>
+              </ScrollArea>
             </>
           )}
           <SidebarCollapseButton
@@ -3140,6 +3046,13 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             prefix="Failed to remove section"
             onDismiss={sectionRemoveError.clearError}
           />
+          {!(isDesktopMode() && collapsed) && (
+            // Keep the sidebar divider above sticky row content and scroll-layer visuals.
+            <div
+              aria-hidden
+              className="bg-border-light pointer-events-none absolute inset-y-0 right-0 z-40 w-px"
+            />
+          )}
         </div>
       </DndProvider>
     </TitleEditProvider>

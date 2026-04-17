@@ -16,6 +16,7 @@ import type {
 import { MockAiRouter } from "./mockAiRouter";
 import { buildMockStreamEventsFromReply } from "./mockAiStreamAdapter";
 import type {
+  CompletedMessagePart,
   StreamStartEvent,
   StreamDeltaEvent,
   StreamEndEvent,
@@ -107,6 +108,8 @@ async function tokenizeWithMockModel(text: string, context: string): Promise<num
   return tokens;
 }
 
+const MOCK_PARTIAL_WRITE_THROTTLE_MS = 100;
+
 interface MockPlayerDeps {
   aiService: AIService;
   historyService: HistoryService;
@@ -120,6 +123,11 @@ interface StreamStartGate {
 interface ActiveStream {
   timers: Array<ReturnType<typeof setTimeout>>;
   messageId: string;
+  historySequence: number;
+  startTime: number;
+  model: string;
+  parts: MuxMessage["parts"];
+  partialWriteTimer: ReturnType<typeof setTimeout> | null;
   eventQueue: Array<() => Promise<void>>;
   isProcessing: boolean;
   cancelled: boolean;
@@ -217,13 +225,13 @@ export class MockAiStreamPlayer {
       }
     });
   }
-  stop(workspaceId: string): void {
+  private async stopActiveStream(workspaceId: string): Promise<void> {
     const active = this.activeStreams.get(workspaceId);
     if (!active) return;
 
     active.cancelled = true;
 
-    // Emit stream-abort event to mirror real streaming behavior
+    // Emit stream-abort event to mirror real streaming behavior before we await disk cleanup.
     this.deps.aiService.emit("stream-abort", {
       type: "stream-abort",
       workspaceId,
@@ -232,6 +240,31 @@ export class MockAiStreamPlayer {
     });
 
     this.cleanup(workspaceId);
+
+    // User-initiated mock interrupts should not leave behind resumable partial state.
+    const deletePartialResult = await this.deps.historyService.deletePartial(workspaceId);
+    if (!deletePartialResult.success) {
+      log.error(
+        `Failed to clear mock partial on stop for ${active.messageId}: ${deletePartialResult.error}`
+      );
+    }
+  }
+
+  async stop(workspaceId: string): Promise<void> {
+    await this.stopActiveStream(workspaceId);
+  }
+
+  private async deleteAssistantPlaceholder(workspaceId: string, messageId: string): Promise<void> {
+    const deleteResult = await this.deps.historyService.deleteMessage(workspaceId, messageId);
+    if (!deleteResult.success) {
+      log.error(
+        `Failed to delete aborted mock assistant placeholder (${messageId}): ${deleteResult.error}`
+      );
+    }
+  }
+
+  private isCurrentActiveStream(workspaceId: string, active: ActiveStream): boolean {
+    return !active.cancelled && this.activeStreams.get(workspaceId) === active;
   }
 
   async play(
@@ -341,20 +374,21 @@ export class MockAiStreamPlayer {
     }
 
     if (abortSignal?.aborted) {
-      const deleteResult = await this.deps.historyService.deleteMessage(workspaceId, messageId);
-      if (!deleteResult.success) {
-        log.error(
-          `Failed to delete aborted mock assistant placeholder (${messageId}): ${deleteResult.error}`
-        );
-      }
+      await this.deleteAssistantPlaceholder(workspaceId, messageId);
       return Ok(undefined);
     }
 
     historySequence = assistantMessage.metadata?.historySequence ?? historySequence;
 
-    // Cancel any existing stream before starting a new one
+    // Cancel any existing stream before starting a new one. Await partial cleanup so the old
+    // stream cannot delete the replacement stream's partial snapshot after it begins writing.
     if (this.isStreaming(workspaceId)) {
-      this.stop(workspaceId);
+      await this.stopActiveStream(workspaceId);
+    }
+
+    if (abortSignal?.aborted) {
+      await this.deleteAssistantPlaceholder(workspaceId, messageId);
+      return Ok(undefined);
     }
 
     this.scheduleEvents(workspaceId, events, messageId, historySequence);
@@ -381,6 +415,11 @@ export class MockAiStreamPlayer {
     this.activeStreams.set(workspaceId, {
       timers,
       messageId,
+      historySequence,
+      startTime: Date.now(),
+      model: KNOWN_MODELS.OPUS.id,
+      parts: [],
+      partialWriteTimer: null,
       eventQueue: [],
       isProcessing: false,
       cancelled: false,
@@ -424,6 +463,183 @@ export class MockAiStreamPlayer {
     active.isProcessing = false;
   }
 
+  private appendTextPart(active: ActiveStream, text: string, timestamp: number): void {
+    const lastPart = active.parts[active.parts.length - 1];
+    if (lastPart?.type === "text") {
+      lastPart.text += text;
+      return;
+    }
+
+    active.parts.push({
+      type: "text",
+      text,
+      timestamp,
+    });
+  }
+
+  private appendReasoningPart(active: ActiveStream, text: string, timestamp: number): void {
+    const lastPart = active.parts[active.parts.length - 1];
+    if (lastPart?.type === "reasoning") {
+      lastPart.text += text;
+      return;
+    }
+
+    active.parts.push({
+      type: "reasoning",
+      text,
+      timestamp,
+    });
+  }
+
+  private setToolPartInput(
+    active: ActiveStream,
+    event: Extract<MockAssistantEvent, { kind: "tool-start" }>,
+    timestamp: number
+  ): void {
+    const existingIndex = active.parts.findIndex(
+      (part) => part.type === "dynamic-tool" && part.toolCallId === event.toolCallId
+    );
+    const nextPart: MuxMessage["parts"][number] = {
+      type: "dynamic-tool",
+      state: "input-available",
+      toolCallId: event.toolCallId,
+      toolName: event.toolName,
+      input: event.args,
+      timestamp,
+    };
+
+    if (existingIndex >= 0) {
+      active.parts[existingIndex] = nextPart;
+      return;
+    }
+
+    active.parts.push(nextPart);
+  }
+
+  private setToolPartOutput(
+    active: ActiveStream,
+    event: Extract<MockAssistantEvent, { kind: "tool-end" }>,
+    timestamp: number
+  ): void {
+    const existingIndex = active.parts.findIndex(
+      (part) => part.type === "dynamic-tool" && part.toolCallId === event.toolCallId
+    );
+    const previousPart = existingIndex >= 0 ? active.parts[existingIndex] : undefined;
+    const nextPart: MuxMessage["parts"][number] = {
+      type: "dynamic-tool",
+      state: "output-available",
+      toolCallId: event.toolCallId,
+      toolName: event.toolName,
+      input:
+        previousPart?.type === "dynamic-tool"
+          ? previousPart.input
+          : { prompt: "mock tool input unavailable" },
+      output: event.result,
+      timestamp,
+    };
+
+    if (existingIndex >= 0) {
+      active.parts[existingIndex] = nextPart;
+      return;
+    }
+
+    active.parts.push(nextPart);
+  }
+
+  private schedulePartialWrite(workspaceId: string, active: ActiveStream): void {
+    if (active.cancelled || active.partialWriteTimer !== null) {
+      return;
+    }
+
+    active.partialWriteTimer = setTimeout(() => {
+      active.partialWriteTimer = null;
+      this.enqueueEvent(workspaceId, active.messageId, async () => {
+        const current = this.activeStreams.get(workspaceId);
+        if (!current || current !== active || current.cancelled) {
+          return;
+        }
+        await this.writePartialFromActiveStream(workspaceId, current);
+        await this.clearStalePartialAfterWrite(workspaceId, current);
+      });
+    }, MOCK_PARTIAL_WRITE_THROTTLE_MS);
+  }
+
+  // Mock mode used to keep only the empty assistant placeholder in chat.jsonl until stream-end.
+  // When a browser workspace switch backgrounded that turn mid-stream, reopening the workspace
+  // had no authoritative partial transcript to merge back in. Persisting the in-flight assistant
+  // parts here keeps mock-mode reconnects aligned with the real stream manager.
+  private async writePartialFromActiveStream(
+    workspaceId: string,
+    active: ActiveStream
+  ): Promise<void> {
+    if (active.parts.length === 0 || active.cancelled) {
+      return;
+    }
+
+    const partialMessage: MuxMessage = {
+      id: active.messageId,
+      role: "assistant",
+      metadata: {
+        historySequence: active.historySequence,
+        timestamp: active.startTime,
+        model: active.model,
+        partial: true,
+      },
+      parts: structuredClone(active.parts),
+    };
+
+    const writeResult = await this.deps.historyService.writePartial(workspaceId, partialMessage);
+    if (!writeResult.success) {
+      log.error(`Failed to write mock partial for ${active.messageId}: ${writeResult.error}`);
+    }
+  }
+
+  private async clearStalePartialAfterWrite(
+    workspaceId: string,
+    active: ActiveStream
+  ): Promise<void> {
+    if (this.isCurrentActiveStream(workspaceId, active)) {
+      return;
+    }
+
+    // stopActiveStream()/replacement can cancel the stream after the pre-write ownership check
+    // but before the async partial write finishes. Re-check here and delete only if the stale
+    // stream still owns partial.json so a replacement stream's newer snapshot survives.
+    const deletePartialResult = await this.deps.historyService.deletePartialIfMessageIdMatches(
+      workspaceId,
+      active.messageId
+    );
+    if (!deletePartialResult.success) {
+      log.error(
+        `Failed to clear stale mock partial after write for ${active.messageId}: ${deletePartialResult.error}`
+      );
+    }
+  }
+
+  private buildCompletedParts(
+    active: ActiveStream,
+    completedParts: StreamEndEvent["parts"]
+  ): CompletedMessagePart[] {
+    if (active.parts.length === 0) {
+      return completedParts;
+    }
+
+    const nextParts = structuredClone(active.parts) as CompletedMessagePart[];
+    const completedTextPart = completedParts.find((part) => part.type === "text");
+    if (!completedTextPart) {
+      return nextParts;
+    }
+
+    const lastTextIndex = nextParts.findLastIndex((part) => part.type === "text");
+    if (lastTextIndex >= 0) {
+      nextParts[lastTextIndex] = completedTextPart;
+      return nextParts;
+    }
+
+    nextParts.push(completedTextPart);
+    return nextParts;
+  }
+
   private async dispatchEvent(
     workspaceId: string,
     event: MockAssistantEvent,
@@ -447,6 +663,8 @@ export class MockAiStreamPlayer {
           ...(event.mode && { mode: event.mode }),
           ...(event.thinkingLevel && { thinkingLevel: event.thinkingLevel }),
         };
+        active.model = event.model;
+        active.startTime = payload.startTime;
         this.deps.aiService.emit("stream-start", payload);
         break;
       }
@@ -462,6 +680,8 @@ export class MockAiStreamPlayer {
           tokens,
           timestamp: Date.now(),
         };
+        this.appendReasoningPart(active, event.text, payload.timestamp);
+        this.schedulePartialWrite(workspaceId, active);
         this.deps.aiService.emit("reasoning-delta", payload);
         break;
       }
@@ -480,6 +700,8 @@ export class MockAiStreamPlayer {
           tokens,
           timestamp: Date.now(),
         };
+        this.setToolPartInput(active, event, payload.timestamp);
+        this.schedulePartialWrite(workspaceId, active);
         this.deps.aiService.emit("tool-call-start", payload);
         break;
       }
@@ -506,6 +728,8 @@ export class MockAiStreamPlayer {
           result: event.result,
           timestamp: Date.now(),
         };
+        this.setToolPartOutput(active, event, payload.timestamp);
+        this.schedulePartialWrite(workspaceId, active);
         this.deps.aiService.emit("tool-call-end", payload);
         break;
       }
@@ -526,11 +750,28 @@ export class MockAiStreamPlayer {
           tokens,
           timestamp: Date.now(),
         };
+        this.appendTextPart(active, event.text, payload.timestamp);
+        this.schedulePartialWrite(workspaceId, active);
         this.deps.aiService.emit("stream-delta", payload);
         break;
       }
       case "stream-error": {
         const payload: MockStreamErrorEvent = event;
+        if (!this.isCurrentActiveStream(workspaceId, active)) {
+          return;
+        }
+
+        const deletePartialResult = await this.deps.historyService.deletePartial(workspaceId);
+        if (!deletePartialResult.success) {
+          log.error(`Failed to clear mock partial for ${messageId}: ${deletePartialResult.error}`);
+        }
+
+        // Replacement streams can cancel this handler while deletePartial() is in flight.
+        // Ignore the stale error once the original active stream has been cancelled or replaced.
+        if (!this.isCurrentActiveStream(workspaceId, active)) {
+          return;
+        }
+
         this.deps.aiService.emit(
           "error",
           createErrorEvent(workspaceId, {
@@ -543,6 +784,11 @@ export class MockAiStreamPlayer {
         break;
       }
       case "stream-end": {
+        if (active.partialWriteTimer) {
+          clearTimeout(active.partialWriteTimer);
+          active.partialWriteTimer = null;
+        }
+        const completedParts = this.buildCompletedParts(active, event.parts);
         const payload: StreamEndEvent = {
           type: "stream-end",
           workspaceId,
@@ -551,7 +797,7 @@ export class MockAiStreamPlayer {
             model: event.metadata.model,
             systemMessageTokens: event.metadata.systemMessageTokens,
           },
-          parts: event.parts,
+          parts: completedParts,
         };
 
         // Update history with completed message (mirrors real StreamManager behavior).
@@ -565,7 +811,7 @@ export class MockAiStreamPlayer {
             const completedMessage: MuxMessage = {
               id: messageId,
               role: "assistant",
-              parts: event.parts,
+              parts: completedParts,
               metadata: {
                 ...existingMessage.metadata,
                 model: event.metadata.model,
@@ -582,8 +828,16 @@ export class MockAiStreamPlayer {
             }
           }
         }
+        if (!this.isCurrentActiveStream(workspaceId, active)) {
+          return;
+        }
 
-        if (active.cancelled) return;
+        const deletePartialResult = await this.deps.historyService.deletePartial(workspaceId);
+        if (!deletePartialResult.success) {
+          log.error(`Failed to clear mock partial for ${messageId}: ${deletePartialResult.error}`);
+        }
+
+        if (!this.isCurrentActiveStream(workspaceId, active)) return;
 
         this.deps.aiService.emit("stream-end", payload);
         this.cleanup(workspaceId);
@@ -597,6 +851,11 @@ export class MockAiStreamPlayer {
     if (!active) return;
 
     active.cancelled = true;
+
+    if (active.partialWriteTimer) {
+      clearTimeout(active.partialWriteTimer);
+      active.partialWriteTimer = null;
+    }
 
     // Clear all pending timers
     for (const timer of active.timers) {

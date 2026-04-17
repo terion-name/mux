@@ -12,61 +12,55 @@ import { Switch } from "@/browser/components/Switch/Switch";
 import { useWorkspaceHeartbeat } from "@/browser/hooks/useWorkspaceHeartbeat";
 import assert from "@/common/utils/assert";
 import {
+  clampIntervalMinutes,
+  formatIntervalMinutes,
+  HEARTBEAT_DEFAULT_INTERVAL_MINUTES,
+  HEARTBEAT_MAX_INTERVAL_MINUTES,
+  HEARTBEAT_MIN_INTERVAL_MINUTES,
+  intervalMinutesToMs,
+  parseIntervalMinutes,
+} from "@/browser/utils/heartbeatIntervalMinutes";
+import {
+  HEARTBEAT_DEFAULT_CONTEXT_MODE,
   HEARTBEAT_DEFAULT_INTERVAL_MS,
   HEARTBEAT_DEFAULT_MESSAGE_BODY,
-  HEARTBEAT_MAX_INTERVAL_MS,
-  HEARTBEAT_MIN_INTERVAL_MS,
+  type HeartbeatContextMode,
 } from "@/constants/heartbeat";
 
-const MS_PER_MINUTE = 60_000;
-const HEARTBEAT_MIN_INTERVAL_MINUTES = HEARTBEAT_MIN_INTERVAL_MS / MS_PER_MINUTE;
-const HEARTBEAT_MAX_INTERVAL_MINUTES = HEARTBEAT_MAX_INTERVAL_MS / MS_PER_MINUTE;
-const HEARTBEAT_DEFAULT_INTERVAL_MINUTES = HEARTBEAT_DEFAULT_INTERVAL_MS / MS_PER_MINUTE;
+const HEARTBEAT_CONTEXT_MODE_OPTIONS: Array<{
+  value: HeartbeatContextMode;
+  label: string;
+  helperText: string;
+}> = [
+  {
+    value: "normal",
+    label: "Use existing context",
+    helperText: "Send the heartbeat on the current request context.",
+  },
+  {
+    value: "compact",
+    label: "Compact before heartbeat",
+    helperText: "Runs a real compaction, then sends the heartbeat on the compacted context.",
+  },
+  {
+    value: "reset",
+    label: "Reset context before heartbeat",
+    helperText:
+      "Adds a visible context-reset marker, preserves history, and sends the heartbeat on a fresh request context without generating a summary.",
+  },
+];
 
-assert(
-  Number.isInteger(HEARTBEAT_MIN_INTERVAL_MINUTES),
-  "Workspace heartbeat minimum interval must be a whole number of minutes"
-);
-assert(
-  Number.isInteger(HEARTBEAT_MAX_INTERVAL_MINUTES),
-  "Workspace heartbeat maximum interval must be a whole number of minutes"
-);
-assert(
-  Number.isInteger(HEARTBEAT_DEFAULT_INTERVAL_MINUTES),
-  "Workspace heartbeat default interval must be a whole number of minutes"
-);
+function getHeartbeatContextModeHelperText(mode: HeartbeatContextMode): string {
+  return (
+    HEARTBEAT_CONTEXT_MODE_OPTIONS.find((option) => option.value === mode)?.helperText ??
+    HEARTBEAT_CONTEXT_MODE_OPTIONS[0].helperText
+  );
+}
 
 interface WorkspaceHeartbeatModalProps {
   workspaceId: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-}
-
-function formatIntervalMinutes(intervalMs: number): string {
-  if (!Number.isFinite(intervalMs)) {
-    return String(HEARTBEAT_DEFAULT_INTERVAL_MINUTES);
-  }
-
-  const roundedMinutes = Math.round(intervalMs / MS_PER_MINUTE);
-  return String(clampIntervalMinutes(roundedMinutes));
-}
-
-function parseIntervalMinutes(value: string): number | null {
-  const trimmedValue = value.trim();
-  if (trimmedValue.length === 0 || !/^\d+$/.test(trimmedValue)) {
-    return null;
-  }
-
-  const minutes = Number.parseInt(trimmedValue, 10);
-  return Number.isInteger(minutes) ? minutes : null;
-}
-
-function clampIntervalMinutes(minutes: number): number {
-  assert(Number.isInteger(minutes), "Workspace heartbeat minutes must be a whole number");
-  return Math.min(
-    HEARTBEAT_MAX_INTERVAL_MINUTES,
-    Math.max(HEARTBEAT_MIN_INTERVAL_MINUTES, minutes)
-  );
 }
 
 function getValidationErrorMessage(value: string): string | null {
@@ -92,12 +86,18 @@ function getDraftMessageForSave(value: string): string {
 }
 
 export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
-  const { settings, isLoading, isSaving, error, save } = useWorkspaceHeartbeat({
-    workspaceId: props.open ? props.workspaceId : null,
-  });
+  const { settings, isLoading, isSaving, error, save, globalDefaultPrompt } = useWorkspaceHeartbeat(
+    {
+      workspaceId: props.open ? props.workspaceId : null,
+    }
+  );
+  const settingsContextMode = settings.contextMode ?? HEARTBEAT_DEFAULT_CONTEXT_MODE;
   const [draftEnabled, setDraftEnabled] = useState(false);
   const [draftIntervalMinutes, setDraftIntervalMinutes] = useState(
     formatIntervalMinutes(HEARTBEAT_DEFAULT_INTERVAL_MS)
+  );
+  const [draftContextMode, setDraftContextMode] = useState<HeartbeatContextMode>(
+    HEARTBEAT_DEFAULT_CONTEXT_MODE
   );
   const [draftMessage, setDraftMessage] = useState("");
   const [draftDirty, setDraftDirty] = useState(false);
@@ -106,7 +106,7 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
   const messageTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const lastSyncedSettingsRef = useRef<Pick<
     typeof settings,
-    "enabled" | "intervalMs" | "message"
+    "enabled" | "intervalMs" | "contextMode" | "message"
   > | null>(null);
 
   useEffect(() => {
@@ -117,6 +117,7 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
       lastSyncedSettings == null ||
       lastSyncedSettings.enabled !== settings.enabled ||
       lastSyncedSettings.intervalMs !== settings.intervalMs ||
+      lastSyncedSettings.contextMode !== settingsContextMode ||
       lastSyncedSettings.message !== settings.message;
 
     previousOpenRef.current = props.open;
@@ -130,11 +131,13 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
     if (didOpen || workspaceChanged || (!draftDirty && settingsChanged)) {
       setDraftEnabled(settings.enabled);
       setDraftIntervalMinutes(formatIntervalMinutes(settings.intervalMs));
+      setDraftContextMode(settingsContextMode);
       setDraftMessage(settings.message ?? "");
       setDraftDirty(false);
       lastSyncedSettingsRef.current = {
         enabled: settings.enabled,
         intervalMs: settings.intervalMs,
+        contextMode: settingsContextMode,
         message: settings.message,
       };
     }
@@ -146,6 +149,7 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
     settings.enabled,
     settings.intervalMs,
     settings.message,
+    settingsContextMode,
   ]);
 
   const validationError = getValidationErrorMessage(draftIntervalMinutes);
@@ -179,7 +183,8 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
 
     const didSave = await save({
       enabled: draftEnabled,
-      intervalMs: parsedMinutes * MS_PER_MINUTE,
+      intervalMs: intervalMinutesToMs(parsedMinutes),
+      contextMode: draftContextMode,
       // Read directly from the textarea on save so the final keystroke is preserved even if the
       // click lands before React finishes flushing the last state update.
       message: getDraftMessageForSave(messageTextareaRef.current?.value ?? draftMessage),
@@ -258,6 +263,39 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
                 </div>
               </div>
 
+              <div className="mt-4 space-y-2">
+                <label htmlFor="workspace-heartbeat-context-mode" className="block">
+                  <div className="text-foreground text-sm font-medium">Context</div>
+                  <div className="text-muted mt-1 text-xs">
+                    Choose whether heartbeats reuse, compact, or reset request context.
+                  </div>
+                </label>
+                <select
+                  id="workspace-heartbeat-context-mode"
+                  value={draftContextMode}
+                  onChange={(event: React.ChangeEvent<HTMLSelectElement>) => {
+                    const nextContextMode =
+                      HEARTBEAT_CONTEXT_MODE_OPTIONS.find(
+                        (option) => option.value === event.target.value
+                      )?.value ?? HEARTBEAT_DEFAULT_CONTEXT_MODE;
+                    setDraftContextMode(nextContextMode);
+                    setDraftDirty(true);
+                  }}
+                  disabled={isSaving}
+                  className="border-border-medium bg-background-secondary text-foreground focus:border-accent focus:ring-accent h-9 w-full rounded-md border px-3 text-sm focus:ring-1 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                  aria-label="Heartbeat context mode"
+                >
+                  {HEARTBEAT_CONTEXT_MODE_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-muted text-xs">
+                  {getHeartbeatContextModeHelperText(draftContextMode)}
+                </p>
+              </div>
+
               {draftEnabled && (
                 <div className="mt-4 space-y-2">
                   <label htmlFor="workspace-heartbeat-message" className="block">
@@ -277,7 +315,7 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
                     }}
                     disabled={isSaving}
                     className="border-border-medium bg-background-secondary text-foreground focus:border-accent focus:ring-accent min-h-[120px] w-full resize-y rounded-md border p-3 text-sm leading-relaxed focus:ring-1 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                    placeholder={HEARTBEAT_DEFAULT_MESSAGE_BODY}
+                    placeholder={globalDefaultPrompt ?? HEARTBEAT_DEFAULT_MESSAGE_BODY}
                     aria-label="Heartbeat message"
                   />
                 </div>

@@ -235,14 +235,6 @@ export class SSH2Transport implements SSHTransport {
     return this.config;
   }
 
-  markHealthy(): void {
-    ssh2ConnectionPool.markHealthy(this.config);
-  }
-
-  reportFailure(error: string): void {
-    ssh2ConnectionPool.reportFailure(this.config, error);
-  }
-
   async acquireConnection(options?: {
     abortSignal?: AbortSignal;
     timeoutMs?: number;
@@ -297,7 +289,15 @@ export class SSH2Transport implements SSHTransport {
       });
 
       const process = new SSH2ChildProcess(channel) as unknown as ChildProcess;
-      return { process };
+      return {
+        process,
+        onExit: () => {
+          ssh2ConnectionPool.markHealthy(this.config);
+        },
+        onError: (error) => {
+          ssh2ConnectionPool.reportFailure(this.config, getErrorMessage(error));
+        },
+      };
     } catch (error) {
       ssh2ConnectionPool.reportFailure(this.config, getErrorMessage(error));
       throw new RuntimeErrorClass(

@@ -20,6 +20,7 @@ import type { AgentAiDefaults } from "./agentAiDefaults";
 import type { RuntimeEnablementId } from "./runtime";
 import type { TaskSettings, SubagentAiDefaults } from "./tasks";
 import type { LayoutPresetsConfig } from "./uiLayouts";
+import type { ThinkingLevel } from "./thinking";
 
 export type Workspace = z.infer<typeof WorkspaceConfigSchema>;
 
@@ -91,6 +92,10 @@ export interface ProjectsConfig {
   muxGatewayEnabled?: boolean;
   /** Enable recording AI SDK devtools logs to ~/.mux/sessions/<workspace>/devtools.jsonl */
   llmDebugLogs?: boolean;
+  /** Default heartbeat prompt used when a workspace heartbeat does not set its own message. */
+  heartbeatDefaultPrompt?: string;
+  /** Default heartbeat interval used when a workspace heartbeat does not set its own cadence. */
+  heartbeatDefaultIntervalMs?: number;
   muxGatewayModels?: string[];
   routePriority?: string[];
   routeOverrides?: Record<string, string>;
@@ -100,6 +105,14 @@ export interface ProjectsConfig {
    * Mirrors the browser localStorage cache (DEFAULT_MODEL_KEY).
    */
   defaultModel?: string;
+  /** Global advisor model override for the experimental advisor tool. */
+  advisorModelString?: string;
+  /** Global advisor reasoning override for the experimental advisor tool. */
+  advisorThinkingLevel?: ThinkingLevel;
+  /** Positive per-turn advisor cap; null/undefined means unlimited. */
+  advisorMaxUsesPerTurn?: number | null;
+  /** Positive max-output-tokens cap for advisor responses; null/undefined means unlimited. */
+  advisorMaxOutputTokens?: number | null;
   /**
    * Hidden model IDs (shared via ~/.mux/config.json).
    * Mirrors the browser localStorage cache (HIDDEN_MODELS_KEY).

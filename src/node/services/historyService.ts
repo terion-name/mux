@@ -17,24 +17,12 @@ import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { safeStringifyForCounting } from "@/common/utils/tokens/safeStringifyForCounting";
 import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
-import { isDurableCompactionBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
+import {
+  isDurableCompactedMarker,
+  isDurableCompactionBoundaryMarker,
+} from "@/common/utils/messages/compactionBoundary";
 import { getErrorMessage } from "@/common/utils/errors";
-
-function isPositiveInteger(value: unknown): value is number {
-  return (
-    typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value > 0
-  );
-}
-
-function isNonNegativeInteger(value: unknown): value is number {
-  return (
-    typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0
-  );
-}
-
-function hasDurableCompactedMarker(value: unknown): value is true | "user" | "idle" {
-  return value === true || value === "user" || value === "idle";
-}
+import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers";
 
 function hasDurableCompactionBoundary(metadata: MuxMetadata | undefined): boolean {
   if (metadata?.compactionBoundary !== true) {
@@ -42,7 +30,7 @@ function hasDurableCompactionBoundary(metadata: MuxMetadata | undefined): boolea
   }
 
   // Self-healing read path: malformed boundary markers should be ignored.
-  if (!hasDurableCompactedMarker(metadata.compacted)) {
+  if (!isDurableCompactedMarker(metadata.compacted)) {
     return false;
   }
 
@@ -893,6 +881,35 @@ export class HistoryService {
         }
         const errorMessage = getErrorMessage(error);
         return Err(`Failed to delete partial: ${errorMessage}`);
+      }
+    });
+  }
+
+  /**
+   * Delete the partial message file only when it still belongs to the expected message.
+   * Returns true when a matching partial was deleted, false when the partial was missing
+   * or belonged to a different message.
+   */
+  async deletePartialIfMessageIdMatches(
+    workspaceId: string,
+    messageId: string
+  ): Promise<Result<boolean>> {
+    return this.fileLocks.withLock(workspaceId, async () => {
+      try {
+        const partialPath = this.getPartialPath(workspaceId);
+        const data = await fs.readFile(partialPath, "utf-8");
+        const partialMessage = normalizeLegacyMuxMetadata(JSON.parse(data) as MuxMessage);
+        if (partialMessage.id !== messageId) {
+          return Ok(false);
+        }
+        await fs.unlink(partialPath);
+        return Ok(true);
+      } catch (error) {
+        if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+          return Ok(false);
+        }
+        const errorMessage = getErrorMessage(error);
+        return Err(`Failed to delete matching partial: ${errorMessage}`);
       }
     });
   }

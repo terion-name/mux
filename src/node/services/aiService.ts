@@ -14,21 +14,26 @@ import type { SendMessageOptions, ProvidersConfigMap } from "@/common/orpc/types
 
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 import { DEFAULT_LSP_PROVISIONING_MODE } from "@/common/config/schemas/appConfigOnDisk";
+import { ADVISOR_DEFAULT_MAX_USES_PER_TURN } from "@/common/constants/advisor";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 
-import type { MuxMessage } from "@/common/types/message";
+import type { ModelMessage, MuxMessage } from "@/common/types/message";
 import { createMuxMessage } from "@/common/types/message";
 import type { Config } from "@/node/config";
-import { StreamManager } from "./streamManager";
+import { StreamManager, type StreamTextOnChunk } from "./streamManager";
 import type { InitStateManager } from "./initStateManager";
 import type { SendMessageError } from "@/common/types/errors";
-import { getToolsForModel } from "@/common/utils/tools/tools";
+import { getToolsForModel, type AdvisorStepCaptureRef } from "@/common/utils/tools/tools";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import {
+  createRuntimeContextForWorkspace,
+  resolveWorkspaceExecutionPath,
+} from "@/node/runtime/runtimeHelpers";
+import { getWorkspacePathHintForProject } from "@/node/services/workspaceProjectRepos";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import { getMuxEnv, getRuntimeType } from "@/node/runtime/initHook";
-import { MUX_HELP_CHAT_AGENT_ID, MUX_HELP_CHAT_WORKSPACE_ID } from "@/common/constants/muxChat";
-import { getSrcBaseDir } from "@/common/types/runtime";
+import { getSrcBaseDir, isSSHRuntime } from "@/common/types/runtime";
 import { ContainerManager } from "@/node/multiProject/containerManager";
 import { secretsToRecord, type ExternalSecretResolver } from "@/common/types/secrets";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
@@ -52,6 +57,8 @@ import { createErrorEvent } from "./utils/sendMessageError";
 import { createAssistantMessageId } from "./utils/messageIds";
 import type { SessionUsageService } from "./sessionUsageService";
 import { sumUsageHistory, getTotalCost } from "@/common/utils/tokens/usageAggregator";
+import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { readToolInstructions } from "./systemMessage";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { DevToolsService } from "@/node/services/devToolsService";
@@ -74,7 +81,9 @@ import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import { uniqueSuffix } from "@/common/utils/hasher";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 
+import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { THINKING_LEVEL_OFF, type ThinkingLevel } from "@/common/types/thinking";
+import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 
 import type {
   ErrorEvent,
@@ -143,17 +152,6 @@ export interface StreamMessageOptions {
   openaiTruncationModeOverride?: "auto" | "disabled";
 }
 
-// ---------------------------------------------------------------------------
-// Utility: deep-clone with structuredClone fallback
-// ---------------------------------------------------------------------------
-
-/** Deep-clone a value using structuredClone (with JSON fallback). */
-function safeClone<T>(value: T): T {
-  return typeof structuredClone === "function"
-    ? structuredClone(value)
-    : (JSON.parse(JSON.stringify(value)) as T);
-}
-
 /**
  * Recursively merge user-provided provider extras under Mux-built provider options.
  * Mux values win on leaf conflicts; both sides' non-conflicting nested fields are preserved.
@@ -173,6 +171,29 @@ function mergeProviderExtrasUnderMux(
   }
 
   return merged;
+}
+
+function markProviderMetadataCostsIncluded(
+  providerMetadata: Record<string, unknown> | undefined,
+  costsIncluded: boolean | undefined
+): Record<string, unknown> | undefined {
+  if (!costsIncluded) {
+    return providerMetadata;
+  }
+
+  const muxMetadata = providerMetadata?.mux;
+  const existingMux =
+    muxMetadata && typeof muxMetadata === "object"
+      ? (muxMetadata as Record<string, unknown>)
+      : undefined;
+
+  return {
+    ...(providerMetadata ?? {}),
+    mux: {
+      ...(existingMux ?? {}),
+      costsIncluded: true,
+    },
+  };
 }
 
 interface ToolExecutionContext {
@@ -207,6 +228,35 @@ export function resolveMuxProjectRootForHostFs(
 ): string {
   const runtimeType = metadata.runtimeConfig.type;
   return runtimeType === "ssh" || runtimeType === "docker" ? metadata.projectPath : workspacePath;
+}
+
+function resolveMuxToolScope(
+  config: Config,
+  metadata: WorkspaceMetadata,
+  workspacePath: string
+): MuxToolScope {
+  const projectConfig = config.loadConfigOrDefault().projects.get(metadata.projectPath);
+  if (
+    projectConfig?.projectKind === "system" &&
+    metadata.projectPath !== MULTI_PROJECT_CONFIG_KEY
+  ) {
+    // Preserve ~/.mux-backed tool behavior for legacy system workspaces after removing
+    // Chat with Mux. Multi-project workspaces still point at a real checkout under _multi,
+    // so they stay project-scoped.
+    return {
+      type: "global",
+      muxHome: config.rootDir,
+    };
+  }
+
+  const runtimeType = metadata.runtimeConfig.type;
+  return {
+    type: "project",
+    muxHome: config.rootDir,
+    projectRoot: resolveMuxProjectRootForHostFs(metadata, workspacePath),
+    projectStorageAuthority:
+      runtimeType === "ssh" || runtimeType === "docker" ? "runtime" : "host-local",
+  };
 }
 
 function derivePromptCacheScope(metadata: WorkspaceMetadata): string {
@@ -471,7 +521,7 @@ export class AIService extends EventEmitter {
               },
             };
 
-            this.lastLlmRequestByWorkspace.set(data.workspaceId, safeClone(updated));
+            this.lastLlmRequestByWorkspace.set(data.workspaceId, structuredClone(updated));
           }
         }
       } catch (error) {
@@ -982,9 +1032,18 @@ export class AIService extends EventEmitter {
         });
       };
 
-      if (!this.config.findWorkspace(workspaceId)) {
+      const workspace = this.config.findWorkspace(workspaceId);
+      if (!workspace) {
         return Err({ type: "unknown", raw: `Workspace ${workspaceId} not found in config` });
       }
+
+      const metadataWithPath = {
+        ...metadata,
+        // Existing SSH workspaces may still live at a persisted root that differs from the canonical
+        // hashed project layout, so stream startup seeds the runtime from config for the current
+        // workspace instead of always reconstructing the path from project metadata.
+        namedWorkspacePath: workspace.workspacePath,
+      };
 
       const multiProjectExecutionGate = this.ensureMultiProjectRuntimeExecutionEnabled(
         workspaceId,
@@ -994,8 +1053,12 @@ export class AIService extends EventEmitter {
         return multiProjectExecutionGate;
       }
 
-      const runtime = isMultiProject(metadata)
-        ? new MultiProjectRuntime(
+      const singleProjectContext = isMultiProject(metadata)
+        ? undefined
+        : createRuntimeContextForWorkspace(metadataWithPath);
+      const runtime = singleProjectContext
+        ? singleProjectContext.runtime
+        : new MultiProjectRuntime(
             new ContainerManager(getSrcBaseDir(metadata.runtimeConfig) ?? this.config.srcDir),
             getProjects(metadata).map((project) => ({
               projectPath: project.projectPath,
@@ -1003,21 +1066,34 @@ export class AIService extends EventEmitter {
               runtime: createRuntime(metadata.runtimeConfig, {
                 projectPath: project.projectPath,
                 workspaceName: metadata.name,
+                workspacePath: isSSHRuntime(metadata.runtimeConfig)
+                  ? getWorkspacePathHintForProject(
+                      {
+                        workspaceId,
+                        workspaceName: metadata.name,
+                        workspacePath: workspace.workspacePath,
+                        runtimeConfig: metadata.runtimeConfig,
+                        projectPath: metadata.projectPath,
+                        projectName: metadata.projectName,
+                        projects: metadata.projects,
+                      },
+                      project.projectPath
+                    )
+                  : undefined,
               }),
             })),
             metadata.name
-          )
-        : createRuntime(metadata.runtimeConfig, {
-            projectPath: metadata.projectPath,
-            workspaceName: metadata.name,
-          });
+          );
 
-      // In-place workspaces (CLI/benchmarks) have projectPath === name
-      // Use path directly instead of reconstructing via getWorkspacePath
-      const isInPlace = metadata.projectPath === metadata.name;
-      const workspacePath = isInPlace
-        ? metadata.projectPath
-        : runtime.getWorkspacePath(metadata.projectPath, metadata.name);
+      const workspacePath =
+        singleProjectContext?.workspacePath ??
+        (isSSHRuntime(metadata.runtimeConfig)
+          ? resolveWorkspaceExecutionPath(metadataWithPath, runtime)
+          : // Non-SSH multi-project runtimes intentionally start from their shared container root so
+            // sibling repos stay addressable during agent/tool setup. SSH workspaces are the exception:
+            // upgraded legacy layouts must reuse the persisted root from config until remote layout
+            // detection seeds the new hashed paths.
+            runtime.getWorkspacePath(metadata.projectPath, metadata.name));
 
       // Wait for init to complete before any runtime I/O operations
       // (SSH/devcontainer may not be ready until init finishes pulling the container)
@@ -1089,6 +1165,9 @@ export class AIService extends EventEmitter {
 
       // Resolve agent definition, compute effective mode & tool policy.
       const cfg = this.config.loadConfigOrDefault();
+      const advisorExperimentEnabled =
+        experiments?.advisorTool ??
+        this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.ADVISOR_TOOL) === true;
       emitStartupBreadcrumb("loading_workspace_context");
       const resolveAgentForStreamStartedAt = Date.now();
       const agentResult = await resolveAgentForStream({
@@ -1101,6 +1180,7 @@ export class AIService extends EventEmitter {
         callerToolPolicy: toolPolicy,
         cfg,
         emitError: (event) => this.emit("error", event),
+        isAdvisorExperimentEnabled: advisorExperimentEnabled,
       });
       recordStartupPhaseTiming("resolveAgentForStreamMs", resolveAgentForStreamStartedAt);
       if (!agentResult.success) {
@@ -1118,13 +1198,12 @@ export class AIService extends EventEmitter {
         shouldDisableTaskToolsForDepth,
         effectiveToolPolicy,
       } = agentResult.data;
-      // Only the built-in mux help agent suppresses project secrets and MCP. User-defined
-      // agents can override the same ID and must keep normal workspace capabilities.
-      const isBuiltInMuxHelpAgent =
-        effectiveAgentId === MUX_HELP_CHAT_AGENT_ID && agentDefinition.scope === "built-in";
-
       const projectTrusted = isProjectTrusted(this.config, metadata.projectPath);
       const sharedExecutionTrusted = isWorkspaceTrustedForSharedExecution(metadata, cfg.projects);
+      const agentAdvisorEnabled = cfg.agentAiDefaults?.[effectiveAgentId]?.advisorEnabled === true;
+      const advisorModelString = cfg.advisorModelString?.trim() ?? "";
+      const advisorToolEligible =
+        advisorExperimentEnabled && agentAdvisorEnabled && advisorModelString.length > 0;
 
       const lspPolicyContext: LspPolicyContext = {
         provisioningMode: cfg.lspProvisioningMode ?? DEFAULT_LSP_PROVISIONING_MODE,
@@ -1148,19 +1227,14 @@ export class AIService extends EventEmitter {
       recordStartupPhaseTiming("loadWorkspaceMcpOverridesMs", loadWorkspaceMcpOverridesStartedAt);
 
       // Fetch MCP server config for system prompt (before building message).
-      // The built-in mux help agent must not see project MCP inventory, even outside the
-      // dedicated mux-help workspace; project-scoped overrides of the same ID keep normal access.
       const listMcpServersStartedAt = Date.now();
-      const mcpServers =
-        this.mcpServerManager &&
-        workspaceId !== MUX_HELP_CHAT_WORKSPACE_ID &&
-        !isBuiltInMuxHelpAgent
-          ? await this.mcpServerManager.listServers(
-              metadata.projectPath,
-              mcpOverrides,
-              projectTrusted
-            )
-          : undefined;
+      const mcpServers = this.mcpServerManager
+        ? await this.mcpServerManager.listServers(
+            metadata.projectPath,
+            mcpOverrides,
+            projectTrusted
+          )
+        : undefined;
       recordStartupPhaseTiming("listMcpServersMs", listMcpServersStartedAt);
 
       // Build plan-aware instructions and determine plan→exec transition content.
@@ -1185,17 +1259,7 @@ export class AIService extends EventEmitter {
         });
       recordStartupPhaseTiming("buildPlanInstructionsMs", buildPlanInstructionsStartedAt);
 
-      const runtimeType = metadata.runtimeConfig.type;
-      const muxScope: MuxToolScope =
-        workspaceId === MUX_HELP_CHAT_WORKSPACE_ID
-          ? { type: "global", muxHome: this.config.rootDir }
-          : {
-              type: "project",
-              muxHome: this.config.rootDir,
-              projectRoot: resolveMuxProjectRootForHostFs(metadata, workspacePath),
-              projectStorageAuthority:
-                runtimeType === "ssh" || runtimeType === "docker" ? "runtime" : "host-local",
-            };
+      const muxScope = resolveMuxToolScope(this.config, metadata, workspacePath);
 
       const desktopSessionManager = this.desktopSessionManager;
       const lspQueryEnabled =
@@ -1213,37 +1277,42 @@ export class AIService extends EventEmitter {
               return desktopCapabilityPromise;
             };
 
-      // Build agent system prompt, system message, and discover agents/skills.
+      const buildStreamSystemContextForAdvisor = (advisorToolAvailable: boolean) =>
+        buildStreamSystemContext({
+          runtime,
+          metadata,
+          workspacePath,
+          workspaceId,
+          agentDefinition,
+          agentDiscoveryPath,
+          isSubagentWorkspace,
+          effectiveAdditionalInstructions,
+          planFilePath,
+          modelString,
+          cfg,
+          providersConfig: this.providerService.getConfig(),
+          mcpServers,
+          muxScope,
+          loadDesktopCapability,
+          advisorToolAvailable,
+        });
+
+      // Build provisional agent context before tool policy finalizes the toolset.
+      // The final system prompt is rebuilt after policy application so advisor guidance cannot
+      // survive when the resolved toolset strips the advisor tool.
       const buildStreamSystemContextStartedAt = Date.now();
-      const streamSystemContext = await buildStreamSystemContext({
-        runtime,
-        metadata,
-        workspacePath,
-        workspaceId,
-        agentDefinition,
-        agentDiscoveryPath,
-        isSubagentWorkspace,
-        effectiveAdditionalInstructions,
-        planFilePath,
-        modelString,
-        cfg,
-        providersConfig: this.providerService.getConfig(),
-        mcpServers,
-        muxScope,
-        loadDesktopCapability,
-      });
+      const prePolicyStreamSystemContext =
+        await buildStreamSystemContextForAdvisor(advisorToolEligible);
       recordStartupPhaseTiming("buildStreamSystemContextMs", buildStreamSystemContextStartedAt);
       const { agentSystemPrompt, agentDefinitions, availableSkills, ancestorPlanFilePaths } =
-        streamSystemContext;
-      let systemMessageTokens = streamSystemContext.systemMessageTokens;
-      let systemMessage = streamSystemContext.systemMessage;
+        prePolicyStreamSystemContext;
+      let systemMessageTokens = prePolicyStreamSystemContext.systemMessageTokens;
+      let systemMessage = prePolicyStreamSystemContext.systemMessage;
 
-      // Load project secrets (system workspace never gets secrets injected)
-      const projectSecrets = isBuiltInMuxHelpAgent
-        ? []
-        : isMultiProject(metadata)
-          ? mergeMultiProjectSecrets(metadata, this.config)
-          : this.config.getEffectiveSecrets(metadata.projectPath);
+      // Load project secrets for local tool execution and MCP server startup.
+      const projectSecrets = isMultiProject(metadata)
+        ? mergeMultiProjectSecrets(metadata, this.config)
+        : this.config.getEffectiveSecrets(metadata.projectPath);
 
       // Generate stream token and create temp directory for tools
       const streamToken = this.streamManager.generateStreamToken();
@@ -1252,7 +1321,7 @@ export class AIService extends EventEmitter {
       let mcpStats: MCPWorkspaceStats | undefined;
       let mcpSetupDurationMs = 0;
 
-      if (this.mcpServerManager && !isBuiltInMuxHelpAgent) {
+      if (this.mcpServerManager) {
         const mcpToolSetupStartedAt = Date.now();
         try {
           const result = await this.mcpServerManager.getToolsForWorkspace({
@@ -1273,20 +1342,6 @@ export class AIService extends EventEmitter {
           mcpSetupDurationMs = Date.now() - mcpToolSetupStartedAt;
           startupPhaseTimingsMs.mcpToolSetupMs = mcpSetupDurationMs;
         }
-      }
-
-      if (mcpStats && mcpStats.failedServerCount > 0) {
-        const failedNames = mcpStats.failedServerNames.join(", ");
-        workspaceLog.warn("MCP servers failed to start", { failedNames });
-        // Prepend warning so the model can inform the user about unavailable tools.
-        systemMessage = `[Warning: ${mcpStats.failedServerCount} MCP server(s) failed to start: ${failedNames}. Tools from these servers are unavailable. Check MCP server configuration in Settings.]\n\n${systemMessage}`;
-        // Keep context-size estimation accurate after mutating the system prompt.
-        const metadataModel = resolveModelForMetadata(
-          modelString,
-          this.providerService.getConfig()
-        );
-        const tokenizer = await getTokenizerForModel(modelString, metadataModel);
-        systemMessageTokens = await tokenizer.countTokens(systemMessage);
       }
 
       const createTempDirForStreamStartedAt = Date.now();
@@ -1326,6 +1381,122 @@ export class AIService extends EventEmitter {
         workspaceId.trim().length > 0,
         "AIService.streamMessage requires a non-empty workspaceId"
       );
+      if (advisorExperimentEnabled && agentAdvisorEnabled && advisorModelString.length === 0) {
+        workspaceLog.warn(
+          "Advisor tool enabled for agent without advisorModelString; suppressing",
+          {
+            effectiveAgentId,
+          }
+        );
+      }
+      if (advisorToolEligible) {
+        assert(
+          advisorModelString.length > 0,
+          "AIService advisorModelString must be non-empty when advisor is eligible"
+        );
+      }
+      // Mutable ref updated by StreamManager.prepareStep so the advisor tool reads the live
+      // transcript lazily at execute time instead of capturing a stale snapshot here.
+      const advisorTranscriptRef: { messages?: ModelMessage[] } = {};
+      const advisorStepCaptureRef: AdvisorStepCaptureRef = {
+        currentStepText: "",
+        currentStepReasoning: "",
+        frozenSnapshotsByToolCallId: new Map(),
+      };
+      const onAdvisorChunk: StreamTextOnChunk = ({ chunk }) => {
+        switch (chunk.type) {
+          case "text-delta": {
+            const textDeltaChunk = chunk as {
+              text?: unknown;
+              delta?: unknown;
+              textDelta?: unknown;
+            };
+            // Providers/SDKs can stream advisor text deltas under different field names.
+            const chunkText =
+              typeof textDeltaChunk.textDelta === "string"
+                ? textDeltaChunk.textDelta
+                : typeof textDeltaChunk.delta === "string"
+                  ? textDeltaChunk.delta
+                  : typeof textDeltaChunk.text === "string"
+                    ? textDeltaChunk.text
+                    : "";
+            if (chunkText.length > 0) {
+              advisorStepCaptureRef.currentStepText += chunkText;
+            }
+            return;
+          }
+          case "reasoning-delta": {
+            const reasoningChunk = chunk as {
+              text?: unknown;
+              textDelta?: unknown;
+              delta?: unknown;
+            };
+            // Anthropic signature updates can arrive as reasoning deltas without text.
+            const chunkText =
+              typeof reasoningChunk.text === "string"
+                ? reasoningChunk.text
+                : typeof reasoningChunk.textDelta === "string"
+                  ? reasoningChunk.textDelta
+                  : typeof reasoningChunk.delta === "string"
+                    ? reasoningChunk.delta
+                    : "";
+            if (chunkText.length > 0) {
+              advisorStepCaptureRef.currentStepReasoning += chunkText;
+            }
+            return;
+          }
+          case "tool-call": {
+            if (chunk.toolName !== "advisor") {
+              return;
+            }
+            const toolCallId = chunk.toolCallId?.trim?.() ?? "";
+            // Skip malformed tool calls defensively — the normal tool-error
+            // path will handle bad input; crashing the stream callback would
+            // be worse than missing the snapshot.
+            if (
+              toolCallId.length === 0 ||
+              !isPlainObject(chunk.input) ||
+              advisorStepCaptureRef.frozenSnapshotsByToolCallId.has(toolCallId)
+            ) {
+              return;
+            }
+            advisorStepCaptureRef.frozenSnapshotsByToolCallId.set(toolCallId, {
+              toolCallId,
+              toolName: "advisor",
+              input: { ...chunk.input },
+              stepText: advisorStepCaptureRef.currentStepText,
+              stepReasoning: advisorStepCaptureRef.currentStepReasoning,
+            });
+            return;
+          }
+          default:
+            return;
+        }
+      };
+      // Tool-side generateText() results do not consistently echo mux.costsIncluded in
+      // providerMetadata, so remember the resolved billing mode from model creation and
+      // re-stamp it before converting usage into display/session costs.
+      const toolModelCostsIncludedByModelString = new Map<string, boolean>();
+      // Normalize: undefined -> default, null -> unlimited, positive int -> exact cap.
+      const advisorMaxUses =
+        cfg.advisorMaxUsesPerTurn === null
+          ? null
+          : (cfg.advisorMaxUsesPerTurn ?? ADVISOR_DEFAULT_MAX_USES_PER_TURN);
+      assert(
+        cfg.advisorMaxOutputTokens == null ||
+          (Number.isInteger(cfg.advisorMaxOutputTokens) && cfg.advisorMaxOutputTokens > 0),
+        "AIService advisorMaxOutputTokens must be null, undefined, or a positive integer"
+      );
+      const advisorMaxOutputTokens =
+        cfg.advisorMaxOutputTokens != null && cfg.advisorMaxOutputTokens > 0
+          ? cfg.advisorMaxOutputTokens
+          : undefined;
+      // Clamp the persisted advisor thinking level so the tool metadata matches the
+      // providerOptions actually sent to generateText().
+      const advisorReasoningLevel = enforceThinkingPolicy(
+        advisorModelString,
+        cfg.advisorThinkingLevel ?? THINKING_LEVEL_OFF
+      );
       const muxEnv = getMuxEnv(
         metadata.projectPath,
         getRuntimeType(metadata.runtimeConfig),
@@ -1346,6 +1517,64 @@ export class AIService extends EventEmitter {
           secrets: await secretsToRecord(projectSecrets, this.opResolver),
           muxEnv,
           runtimeTempDir,
+          ...(advisorToolEligible
+            ? {
+                advisorRuntime: {
+                  advisorModelString,
+                  reasoningLevel: advisorReasoningLevel,
+                  maxUsesPerTurn: advisorMaxUses,
+                  maxOutputTokens: advisorMaxOutputTokens,
+                  getTranscriptSnapshot: () => {
+                    const messages = advisorTranscriptRef.messages;
+                    assert(
+                      messages != null,
+                      "AIService advisor transcript ref must be populated before advisor execution"
+                    );
+                    return messages;
+                  },
+                  takeToolCallSnapshot: (toolCallId) => {
+                    const normalizedToolCallId = toolCallId.trim();
+                    assert(normalizedToolCallId.length > 0, "advisor toolCallId must be non-empty");
+                    const snapshot =
+                      advisorStepCaptureRef.frozenSnapshotsByToolCallId.get(normalizedToolCallId);
+                    if (snapshot == null) {
+                      return undefined;
+                    }
+                    const didDelete =
+                      advisorStepCaptureRef.frozenSnapshotsByToolCallId.delete(
+                        normalizedToolCallId
+                      );
+                    assert(didDelete, "advisor tool-call snapshot must be deleted when consumed");
+                    assert(
+                      snapshot.toolName === "advisor",
+                      "advisor snapshot must belong to advisor"
+                    );
+                    return snapshot;
+                  },
+                  createModel: async (ms: string) => {
+                    const advisorModelString = ms.trim();
+                    assert(
+                      advisorModelString.length > 0,
+                      "advisor model string must be non-empty when creating an advisor model"
+                    );
+                    const advisorModel = await this.createModel(advisorModelString, undefined, {
+                      workspaceId,
+                    });
+                    if (!advisorModel.success) {
+                      throw new Error(
+                        `Failed to create advisor model: ${getErrorMessage(advisorModel.error)}`
+                      );
+                    }
+                    toolModelCostsIncludedByModelString.set(
+                      advisorModelString,
+                      modelCostsIncluded(advisorModel.data)
+                    );
+                    return advisorModel.data;
+                  },
+                  abortSignal: combinedAbortSignal,
+                },
+              }
+            : {}),
           openaiWireFormat: effectiveMuxProviderOptions?.openai?.wireFormat,
           backgroundProcessManager: this.backgroundProcessManager,
           // Plan agent configuration for plan file access.
@@ -1390,6 +1619,56 @@ export class AIService extends EventEmitter {
               });
               return undefined;
             }
+          },
+          reportModelUsage: (event) => {
+            void (async () => {
+              try {
+                if (!this.sessionUsageService) {
+                  return;
+                }
+                const eventModel = event.model.trim();
+                assert(eventModel.length > 0, "tool model usage event model must be non-empty");
+                // Persist tool-side model usage under its own model bucket so session costs keep
+                // advisor/system-side pricing separate from the parent chat model.
+                const providerMetadata = markProviderMetadataCostsIncluded(
+                  event.providerMetadata,
+                  toolModelCostsIncludedByModelString.get(eventModel)
+                );
+                const metadataModel = resolveModelForMetadata(
+                  eventModel,
+                  this.providerService.getConfig()
+                );
+                const displayUsage = createDisplayUsage(
+                  event.usage,
+                  eventModel,
+                  providerMetadata,
+                  metadataModel
+                );
+                if (!displayUsage) {
+                  return;
+                }
+                const canonicalModel = normalizeToCanonical(eventModel);
+                await this.sessionUsageService.recordUsage(
+                  workspaceId,
+                  canonicalModel,
+                  displayUsage
+                );
+                this.emit("session-usage-delta", {
+                  type: "session-usage-delta" as const,
+                  workspaceId,
+                  sourceWorkspaceId: workspaceId,
+                  byModelDelta: { [canonicalModel]: displayUsage },
+                  timestamp: Date.now(),
+                });
+              } catch (error) {
+                log.warn("Failed to record tool model usage", {
+                  error,
+                  workspaceId,
+                  toolName: event.toolName,
+                  model: event.model,
+                });
+              }
+            })();
           },
           onConfigChanged: () => this.providerService.notifyConfigChanged(),
           taskService: this.taskService,
@@ -1441,6 +1720,26 @@ export class AIService extends EventEmitter {
         "applyToolPolicyAndExperimentsMs",
         applyToolPolicyAndExperimentsStartedAt
       );
+
+      const advisorToolAvailable = tools.advisor !== undefined;
+      const finalStreamSystemContext =
+        await buildStreamSystemContextForAdvisor(advisorToolAvailable);
+      systemMessageTokens = finalStreamSystemContext.systemMessageTokens;
+      systemMessage = finalStreamSystemContext.systemMessage;
+
+      if (mcpStats && mcpStats.failedServerCount > 0) {
+        const failedNames = mcpStats.failedServerNames.join(", ");
+        workspaceLog.warn("MCP servers failed to start", { failedNames });
+        // Reapply the MCP startup warning after rebuilding the final system prompt.
+        systemMessage = `[Warning: ${mcpStats.failedServerCount} MCP server(s) failed to start: ${failedNames}. Tools from these servers are unavailable. Check MCP server configuration in Settings.]\n\n${systemMessage}`;
+        // Keep context-size estimation accurate after mutating the system prompt.
+        const metadataModel = resolveModelForMetadata(
+          modelString,
+          this.providerService.getConfig()
+        );
+        const tokenizer = await getTokenizerForModel(modelString, metadataModel);
+        systemMessageTokens = await tokenizer.countTokens(systemMessage);
+      }
 
       const toolNamesForSentinel = Object.keys(tools).sort();
 
@@ -1564,7 +1863,8 @@ export class AIService extends EventEmitter {
         effectiveMuxProviderOptions,
         workspaceId,
         this.providerService.getConfig(),
-        routeProvider
+        routeProvider,
+        effectiveThinkingLevel
       );
 
       // --- Model parameter overrides from providers.jsonc ---
@@ -1664,7 +1964,7 @@ export class AIService extends EventEmitter {
       };
 
       try {
-        this.lastLlmRequestByWorkspace.set(workspaceId, safeClone(snapshot));
+        this.lastLlmRequestByWorkspace.set(workspaceId, structuredClone(snapshot));
       } catch (error) {
         const errMsg = getErrorMessage(error);
         workspaceLog.warn("Failed to capture debug LLM request snapshot", { error: errMsg });
@@ -1757,7 +2057,16 @@ export class AIService extends EventEmitter {
         requestHeaders,
         effectiveMuxProviderOptions.anthropic?.cacheTtl ?? undefined,
         forceToolChoice,
-        resolvedOverrides.standard
+        resolvedOverrides.standard,
+        advisorToolEligible ? onAdvisorChunk : undefined,
+        advisorToolEligible
+          ? (stepMessages) => {
+              advisorTranscriptRef.messages = stepMessages;
+              advisorStepCaptureRef.currentStepText = "";
+              advisorStepCaptureRef.currentStepReasoning = "";
+              advisorStepCaptureRef.frozenSnapshotsByToolCallId.clear();
+            }
+          : undefined
       );
       recordStartupPhaseTiming("startStreamMs", startStreamStartedAt);
 
@@ -1868,7 +2177,7 @@ export class AIService extends EventEmitter {
     }
 
     if (this.mockModeEnabled && this.mockAiStreamPlayer) {
-      this.mockAiStreamPlayer.stop(workspaceId);
+      await this.mockAiStreamPlayer.stop(workspaceId);
       return Ok(undefined);
     }
     return this.streamManager.stopStream(workspaceId, options);

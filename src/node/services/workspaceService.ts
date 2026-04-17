@@ -5,12 +5,11 @@ import assert from "@/common/utils/assert";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import { isWorkspaceArchived } from "@/common/utils/archive";
-import { MUX_HELP_CHAT_WORKSPACE_ID } from "@/common/constants/muxChat";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
-import { getMuxHelpChatProjectPath } from "@/node/constants/muxChat";
 import type { Config } from "@/node/config";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
+import { normalizeTaskSettings } from "@/common/types/tasks";
 import { askUserQuestionManager } from "@/node/services/askUserQuestionManager";
 import { delegatedToolCallManager } from "@/node/services/delegatedToolCallManager";
 import { log } from "@/node/services/log";
@@ -38,9 +37,11 @@ import {
 } from "@/node/runtime/runtimeFactory";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import {
+  createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
   resolveWorkspaceExecutionPath,
 } from "@/node/runtime/runtimeHelpers";
+import { getWorkspacePathHintForProject } from "@/node/services/workspaceProjectRepos";
 import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
 import { ensurePrivateDir } from "@/node/utils/fs";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
@@ -53,6 +54,8 @@ import { detectDefaultTrunkBranch, listLocalBranches } from "@/node/git";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { extractEditedFilePaths } from "@/common/utils/messages/extractEditedFiles";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
+import { isDurableCompactedMarker } from "@/common/utils/messages/compactionBoundary";
+import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers";
 import { deriveTodoStatus } from "@/common/utils/todoList";
 import { fileExists } from "@/node/utils/runtime/fileExists";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
@@ -95,7 +98,12 @@ import {
   AskUserQuestionToolResultSchema,
 } from "@/common/utils/tools/toolDefinitions";
 import type { UIMode } from "@/common/types/mode";
-import type { MuxMessageMetadata, MuxMessage } from "@/common/types/message";
+import {
+  pickPreservedSendOptions,
+  type CompactionFollowUpRequest,
+  type MuxMessageMetadata,
+  type MuxMessage,
+} from "@/common/types/message";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import {
   hasSrcBaseDir,
@@ -112,10 +120,14 @@ import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import {
+  HEARTBEAT_CONTEXT_MODE_VALUES,
+  HEARTBEAT_DEFAULT_CONTEXT_MODE,
   HEARTBEAT_DEFAULT_INTERVAL_MS,
   HEARTBEAT_DEFAULT_MESSAGE_BODY,
   HEARTBEAT_MAX_INTERVAL_MS,
   HEARTBEAT_MIN_INTERVAL_MS,
+  HEARTBEAT_RESET_BOUNDARY_MESSAGE,
+  type HeartbeatContextMode,
 } from "@/constants/heartbeat";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import type {
@@ -140,6 +152,7 @@ import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycleHooks";
 import type { TaskService } from "@/node/services/taskService";
+import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import type { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
 import type { LspManager } from "@/node/services/lsp/lspManager";
 
@@ -187,6 +200,14 @@ const MAX_WORKSPACE_NAME_COLLISION_RETRIES = 3;
 // Shared type for workspace-scoped AI settings (model + thinking)
 type WorkspaceAISettings = z.infer<typeof WorkspaceAISettingsSchema>;
 type WorkspaceHeartbeatSettings = z.infer<typeof WorkspaceHeartbeatSettingsSchema>;
+interface HeartbeatExecutionRequest {
+  contextMode: HeartbeatContextMode;
+  sendOptions: SendMessageOptions;
+  heartbeatPrompt: string;
+  muxMetadata: Extract<MuxMessageMetadata, { type: "heartbeat-request" }>;
+  followUp: CompactionFollowUpRequest;
+}
+
 type WorktreeArchiveSnapshotLifecycleService = Pick<
   WorktreeArchiveSnapshotService,
   | "preflightSnapshotForArchive"
@@ -194,22 +215,8 @@ type WorktreeArchiveSnapshotLifecycleService = Pick<
   | "restoreSnapshotAfterUnarchive"
   | "getUnsupportedUntrackedPaths"
 >;
-function normalizeHeartbeatMessageInput(message: string | undefined): string | undefined {
-  if (message == null) {
-    return undefined;
-  }
-
-  assert(typeof message === "string", "Heartbeat message must be a string when provided");
-  const trimmedMessage = message.trim();
-  if (trimmedMessage.length === 0) {
-    return undefined;
-  }
-
-  return trimmedMessage;
-}
-
-// Persisted workspace config can contain non-string or whitespace-only values; normalize the
-// message on read so an invalid override never bricks heartbeat execution.
+// Trim and normalize a heartbeat message for storage. Accepts `unknown` so it safely handles
+// both user input (string | undefined) and persisted config values that may have been corrupted.
 function sanitizeHeartbeatMessage(message: unknown): string | undefined {
   if (typeof message !== "string") {
     return undefined;
@@ -221,6 +228,17 @@ function sanitizeHeartbeatMessage(message: unknown): string | undefined {
   }
 
   return trimmedMessage;
+}
+
+function isHeartbeatContextMode(value: unknown): value is HeartbeatContextMode {
+  return (
+    typeof value === "string" &&
+    HEARTBEAT_CONTEXT_MODE_VALUES.some((candidate) => candidate === value)
+  );
+}
+
+function sanitizeHeartbeatContextMode(value: unknown): HeartbeatContextMode {
+  return isHeartbeatContextMode(value) ? value : HEARTBEAT_DEFAULT_CONTEXT_MODE;
 }
 
 interface WorkspaceAgentStatus {
@@ -535,18 +553,6 @@ async function resetForkedSessionUsage(
   );
 }
 
-function isPositiveInteger(value: unknown): value is number {
-  return (
-    typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value > 0
-  );
-}
-
-function isNonNegativeInteger(value: unknown): value is number {
-  return (
-    typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0
-  );
-}
-
 function getOldestSequencedMessage(
   messages: readonly MuxMessage[]
 ): { message: MuxMessage; historySequence: number } | null {
@@ -577,12 +583,8 @@ interface WorkspaceHistoryLoadMoreResult {
   hasOlder: boolean;
 }
 
-function hasDurableCompactedMarker(value: unknown): value is true | "user" | "idle" {
-  return value === true || value === "user" || value === "idle";
-}
-
 function isCompactedSummaryMessage(message: MuxMessage): boolean {
-  return hasDurableCompactedMarker(message.metadata?.compacted);
+  return isDurableCompactedMarker(message.metadata?.compacted);
 }
 
 function getNextCompactionEpochForAppendBoundary(
@@ -2118,11 +2120,6 @@ export class WorkspaceService extends EventEmitter {
     runtimeConfig?: RuntimeConfig,
     sectionId?: string
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>> {
-    // Chat with Mux is a built-in system workspace; it cannot host additional workspaces.
-    if (projectPath === getMuxHelpChatProjectPath(this.config.rootDir)) {
-      return Err("Cannot create workspaces in the Chat with Mux system project");
-    }
-
     // Validate workspace name
     const validation = validateWorkspaceName(branchName);
     if (!validation.valid) {
@@ -2386,12 +2383,6 @@ export class WorkspaceService extends EventEmitter {
       }));
       const primaryProject = normalizedProjects[0];
       assert(primaryProject, "createMultiProject requires a primary project");
-
-      for (const project of normalizedProjects) {
-        if (project.projectPath === getMuxHelpChatProjectPath(this.config.rootDir)) {
-          return Err("Cannot create workspaces in the Chat with Mux system project");
-        }
-      }
 
       const configSnapshot = this.config.loadConfigOrDefault();
       for (const project of normalizedProjects) {
@@ -2742,10 +2733,6 @@ export class WorkspaceService extends EventEmitter {
   }
 
   async remove(workspaceId: string, force = false): Promise<Result<void>> {
-    if (workspaceId === MUX_HELP_CHAT_WORKSPACE_ID) {
-      return Err("Cannot remove the Chat with Mux system workspace");
-    }
-
     // Idempotent: if already removing, return success to prevent race conditions
     if (this.removingWorkspaces.has(workspaceId)) {
       return Ok(undefined);
@@ -2760,8 +2747,42 @@ export class WorkspaceService extends EventEmitter {
       this.initAbortControllers.delete(workspaceId);
     }
 
+    const persistedWorkspace = this.config.findWorkspace(workspaceId);
+
     // Try to remove from runtime (filesystem)
     try {
+      if (!force) {
+        const config = this.config.loadConfigOrDefault();
+        const taskSettings = normalizeTaskSettings(config.taskSettings);
+        if (
+          taskSettings.preserveSubagentsUntilArchive &&
+          this.taskService?.hasCompletedDescendants?.(workspaceId)
+        ) {
+          const persistedWorkspaceEntry = findWorkspaceEntry(config, workspaceId);
+          const isArchived =
+            persistedWorkspaceEntry != null &&
+            isWorkspaceArchived(
+              persistedWorkspaceEntry.workspace.archivedAt,
+              persistedWorkspaceEntry.workspace.unarchivedAt
+            );
+
+          // Keep the whole parentWorkspaceId chain intact while completed descendants still exist.
+          // Unarchived ancestors must be archived first so descendant cleanup can safely walk that lineage.
+          if (!isArchived) {
+            return Err(
+              "This workspace has preserved completed sub-agent workspaces. Archive the workspace first to trigger cleanup, then try removing it."
+            );
+          }
+
+          // Archived parents can still retain completed descendants while cleanup waits on
+          // prerequisites like pending patch artifacts. Keep removal blocked until that cleanup
+          // finishes so descendants do not lose the archived ancestor that makes them eligible.
+          return Err(
+            "This workspace still has completed sub-agent workspaces pending cleanup. Wait for cleanup to finish, or force-remove the workspace."
+          );
+        }
+      }
+
       // Stop any active stream before deleting metadata/config to avoid tool calls racing with removal.
       //
       // IMPORTANT: AIService forwards "stream-abort" asynchronously after partial cleanup. If we roll up
@@ -2844,6 +2865,8 @@ export class WorkspaceService extends EventEmitter {
         const metadata = metadataResult.data;
         const configSnapshot = this.config.loadConfigOrDefault();
 
+        const persistedWorkspacePath = persistedWorkspace?.workspacePath;
+
         if (isMultiProject(metadata)) {
           const projects = getProjects(metadata);
           const deleteErrors: string[] = [];
@@ -2858,6 +2881,20 @@ export class WorkspaceService extends EventEmitter {
               const runtime = createRuntime(metadata.runtimeConfig, {
                 projectPath: project.projectPath,
                 workspaceName: metadata.name,
+                workspacePath: persistedWorkspacePath
+                  ? getWorkspacePathHintForProject(
+                      {
+                        workspaceId,
+                        workspaceName: metadata.name,
+                        workspacePath: persistedWorkspacePath,
+                        runtimeConfig: metadata.runtimeConfig,
+                        projectPath: metadata.projectPath,
+                        projectName: metadata.projectName,
+                        projects: metadata.projects,
+                      },
+                      project.projectPath
+                    )
+                  : undefined,
               });
               const trusted =
                 configSnapshot.projects.get(stripTrailingSlashes(project.projectPath))?.trusted ??
@@ -2978,6 +3015,7 @@ export class WorkspaceService extends EventEmitter {
           const runtime = createRuntime(metadata.runtimeConfig, {
             projectPath,
             workspaceName: metadata.name,
+            workspacePath: persistedWorkspacePath,
           });
 
           // Delete workspace from runtime first - if this fails with force=false, we abort
@@ -3286,16 +3324,13 @@ export class WorkspaceService extends EventEmitter {
     }
 
     const message = sanitizeHeartbeatMessage(workspaceEntry.heartbeat.message);
-    return message == null
-      ? {
-          enabled: workspaceEntry.heartbeat.enabled,
-          intervalMs: workspaceEntry.heartbeat.intervalMs,
-        }
-      : {
-          enabled: workspaceEntry.heartbeat.enabled,
-          intervalMs: workspaceEntry.heartbeat.intervalMs,
-          message,
-        };
+    const contextMode = sanitizeHeartbeatContextMode(workspaceEntry.heartbeat.contextMode);
+    return {
+      enabled: workspaceEntry.heartbeat.enabled,
+      intervalMs: workspaceEntry.heartbeat.intervalMs,
+      contextMode,
+      ...(message != null ? { message } : {}),
+    };
   }
 
   async setHeartbeatSettings(
@@ -3320,6 +3355,13 @@ export class WorkspaceService extends EventEmitter {
         !hasMessageUpdate || settings.message == null || typeof settings.message === "string",
         "Heartbeat message must be a string when provided"
       );
+      const hasContextModeUpdate = Object.prototype.hasOwnProperty.call(settings, "contextMode");
+      assert(
+        !hasContextModeUpdate ||
+          settings.contextMode == null ||
+          isHeartbeatContextMode(settings.contextMode),
+        "Heartbeat context mode must be a supported value when provided"
+      );
 
       const found = this.config.findWorkspace(normalizedWorkspaceId);
       if (!found) {
@@ -3341,26 +3383,24 @@ export class WorkspaceService extends EventEmitter {
       }
 
       const nextMessage = hasMessageUpdate
-        ? normalizeHeartbeatMessageInput(settings.message)
+        ? sanitizeHeartbeatMessage(settings.message)
         : sanitizeHeartbeatMessage(workspaceEntry.heartbeat?.message);
-      const nextSettings: WorkspaceHeartbeatSettings =
-        nextMessage == null
-          ? {
-              enabled: settings.enabled,
-              // Keep the interval on disk even when disabled so re-enabling restores the user's choice.
-              intervalMs: settings.intervalMs,
-            }
-          : {
-              enabled: settings.enabled,
-              // Keep the interval on disk even when disabled so re-enabling restores the user's choice.
-              intervalMs: settings.intervalMs,
-              message: nextMessage,
-            };
+      const nextContextMode = hasContextModeUpdate
+        ? sanitizeHeartbeatContextMode(settings.contextMode)
+        : sanitizeHeartbeatContextMode(workspaceEntry.heartbeat?.contextMode);
+      // Keep the interval on disk even when disabled so re-enabling restores the user's choice.
+      const nextSettings: WorkspaceHeartbeatSettings = {
+        enabled: settings.enabled,
+        intervalMs: settings.intervalMs,
+        contextMode: nextContextMode,
+        ...(nextMessage != null ? { message: nextMessage } : {}),
+      };
 
       const changed =
         workspaceEntry.heartbeat?.enabled !== nextSettings.enabled ||
         workspaceEntry.heartbeat?.intervalMs !== nextSettings.intervalMs ||
-        workspaceEntry.heartbeat?.message !== nextSettings.message;
+        workspaceEntry.heartbeat?.message !== nextSettings.message ||
+        sanitizeHeartbeatContextMode(workspaceEntry.heartbeat?.contextMode) !== nextContextMode;
       if (!changed) {
         return Ok(undefined);
       }
@@ -3459,6 +3499,7 @@ export class WorkspaceService extends EventEmitter {
               const rollbackRuntime = createRuntime(oldMetadata.runtimeConfig, {
                 projectPath: renamedProject.projectPath,
                 workspaceName: newName,
+                workspacePath: renamedProject.newWorkspacePath,
               });
               const rollbackTrusted =
                 configSnapshot.projects.get(stripTrailingSlashes(renamedProject.projectPath))
@@ -3492,6 +3533,18 @@ export class WorkspaceService extends EventEmitter {
           const runtime = createRuntime(oldMetadata.runtimeConfig, {
             projectPath: project.projectPath,
             workspaceName: oldName,
+            workspacePath: getWorkspacePathHintForProject(
+              {
+                workspaceId,
+                workspaceName: oldName,
+                workspacePath: workspace.workspacePath,
+                runtimeConfig: oldMetadata.runtimeConfig,
+                projectPath: oldMetadata.projectPath,
+                projectName: oldMetadata.projectName,
+                projects: oldMetadata.projects,
+              },
+              project.projectPath
+            ),
           });
 
           const trusted =
@@ -3614,6 +3667,7 @@ export class WorkspaceService extends EventEmitter {
         const runtime = createRuntime(oldMetadata.runtimeConfig, {
           projectPath: configProjectPath,
           workspaceName: oldName,
+          workspacePath: workspace.workspacePath,
         });
 
         const trusted =
@@ -3911,11 +3965,6 @@ export class WorkspaceService extends EventEmitter {
    * whether to show a destructive confirmation dialog.
    */
   async preflightArchive(workspaceId: string): Promise<Result<ArchivePreflightResult>> {
-    if (workspaceId === MUX_HELP_CHAT_WORKSPACE_ID) {
-      // No special preflight needed for the help chat — archive will reject it later.
-      return Ok({ kind: "ready" as const });
-    }
-
     try {
       const workspace = this.config.findWorkspace(workspaceId);
       if (!workspace) {
@@ -3968,10 +4017,6 @@ export class WorkspaceService extends EventEmitter {
     workspaceId: string,
     acknowledgedUntrackedPaths?: string[]
   ): Promise<Result<ArchiveWorkspaceResult>> {
-    if (workspaceId === MUX_HELP_CHAT_WORKSPACE_ID) {
-      return Err("Cannot archive the Chat with Mux system workspace");
-    }
-
     this.archivingWorkspaces.add(workspaceId);
 
     try {
@@ -4180,6 +4225,13 @@ export class WorkspaceService extends EventEmitter {
         }
       }
 
+      // Best-effort cleanup of preserved completed descendants after archive persistence succeeds.
+      try {
+        await this.taskService?.cleanupReportedDescendantsAfterArchive?.(workspaceId);
+      } catch (error) {
+        log.error("Failed to cleanup reported descendants after archive", { workspaceId, error });
+      }
+
       return Ok({ kind: "archived" as const });
     } catch (error) {
       const message = getErrorMessage(error);
@@ -4193,10 +4245,6 @@ export class WorkspaceService extends EventEmitter {
    * Unarchive a workspace. Restores it to the main sidebar view.
    */
   async unarchive(workspaceId: string): Promise<Result<void>> {
-    if (workspaceId === MUX_HELP_CHAT_WORKSPACE_ID) {
-      return Err("Cannot unarchive the Chat with Mux system workspace");
-    }
-
     try {
       const workspace = this.config.findWorkspace(workspaceId);
       if (!workspace) {
@@ -4601,9 +4649,6 @@ export class WorkspaceService extends EventEmitter {
       const allMetadata = await this.config.getAllWorkspaceMetadata();
 
       const candidates = allMetadata.filter((metadata) => {
-        if (metadata.id === MUX_HELP_CHAT_WORKSPACE_ID) {
-          return false;
-        }
         if (metadata.projectPath !== targetProjectPath) {
           return false;
         }
@@ -4930,10 +4975,6 @@ export class WorkspaceService extends EventEmitter {
     pendingAutoTitle?: boolean
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; projectPath: string }>> {
     try {
-      if (sourceWorkspaceId === MUX_HELP_CHAT_WORKSPACE_ID) {
-        return Err("Cannot fork the Chat with Mux system workspace");
-      }
-
       if (this.aiService.isStreaming(sourceWorkspaceId)) {
         await this.historyService.commitPartial(sourceWorkspaceId);
       }
@@ -5029,9 +5070,11 @@ export class WorkspaceService extends EventEmitter {
         return Err(resolvedNameValidation.error ?? "Invalid workspace name");
       }
 
+      const sourceWorkspace = this.config.findWorkspace(sourceWorkspaceId);
       const sourceRuntime = createRuntime(sourceRuntimeConfig, {
         projectPath: foundProjectPath,
         workspaceName: sourceMetadata.name,
+        workspacePath: sourceWorkspace?.workspacePath,
       });
 
       const newWorkspaceId = this.config.generateStableId();
@@ -5190,6 +5233,7 @@ export class WorkspaceService extends EventEmitter {
       const freshSourceRuntime = createRuntime(sourceRuntimeConfig, {
         projectPath: foundProjectPath,
         workspaceName: sourceMetadata.name,
+        workspacePath: sourceWorkspace?.workspacePath,
       });
       await copyPlanFileAcrossRuntimes(
         freshSourceRuntime,
@@ -6220,7 +6264,7 @@ export class WorkspaceService extends EventEmitter {
           "append-compaction-boundary replace mode must compute a positive compaction epoch"
         );
 
-        const compactedMarker = hasDurableCompactedMarker(summaryMessage.metadata?.compacted)
+        const compactedMarker = isDurableCompactedMarker(summaryMessage.metadata?.compacted)
           ? summaryMessage.metadata.compacted
           : "user";
 
@@ -6235,7 +6279,7 @@ export class WorkspaceService extends EventEmitter {
         };
 
         assert(
-          hasDurableCompactedMarker(messageToAppend.metadata?.compacted),
+          isDurableCompactedMarker(messageToAppend.metadata?.compacted),
           "append-compaction-boundary replace mode requires a durable compacted marker"
         );
         assert(
@@ -6466,11 +6510,11 @@ export class WorkspaceService extends EventEmitter {
   }
 
   private async listWorkspacePathsForFileCompletions(
-    metadata: FrontendWorkspaceMetadata
+    metadata: FrontendWorkspaceMetadata,
+    workspacePath?: string
   ): Promise<string[] | null> {
     if (!isMultiProject(metadata)) {
-      const runtime = createRuntimeForWorkspace(metadata);
-      const workspacePath = resolveWorkspaceExecutionPath(metadata, runtime);
+      const { runtime, workspacePath } = createRuntimeContextForWorkspace(metadata);
       return this.listGitPathsForFileCompletions(runtime, workspacePath);
     }
 
@@ -6484,6 +6528,21 @@ export class WorkspaceService extends EventEmitter {
         const projectRuntime = createRuntime(metadata.runtimeConfig, {
           projectPath: project.projectPath,
           workspaceName: metadata.name,
+          workspacePath:
+            isSSHRuntime(metadata.runtimeConfig) && workspacePath != null
+              ? getWorkspacePathHintForProject(
+                  {
+                    workspaceId: metadata.id,
+                    workspaceName: metadata.name,
+                    workspacePath,
+                    runtimeConfig: metadata.runtimeConfig,
+                    projectPath: metadata.projectPath,
+                    projectName: metadata.projectName,
+                    projects: metadata.projects,
+                  },
+                  project.projectPath
+                )
+              : undefined,
         });
         const projectWorkspacePath = projectRuntime.getWorkspacePath(
           project.projectPath,
@@ -6546,7 +6605,11 @@ export class WorkspaceService extends EventEmitter {
         const previousIndex = cacheEntry.index;
 
         try {
-          const files = await this.listWorkspacePathsForFileCompletions(metadata);
+          const workspace = this.config.findWorkspace(workspaceId);
+          const files = await this.listWorkspacePathsForFileCompletions(
+            metadata,
+            workspace?.workspacePath
+          );
           cacheEntry.index = files === null ? previousIndex : buildFileCompletionsIndex(files);
           cacheEntry.fetchedAt = Date.now();
         } catch (error) {
@@ -6636,6 +6699,20 @@ export class WorkspaceService extends EventEmitter {
             runtime: createRuntime(metadata.runtimeConfig, {
               projectPath: project.projectPath,
               workspaceName: metadata.name,
+              workspacePath: isSSHRuntime(metadata.runtimeConfig)
+                ? getWorkspacePathHintForProject(
+                    {
+                      workspaceId,
+                      workspaceName: metadata.name,
+                      workspacePath: workspace.workspacePath,
+                      runtimeConfig: metadata.runtimeConfig,
+                      projectPath: metadata.projectPath,
+                      projectName: metadata.projectName,
+                      projects: metadata.projects,
+                    },
+                    project.projectPath
+                  )
+                : undefined,
             }),
           }))
         : undefined;
@@ -7064,7 +7141,63 @@ export class WorkspaceService extends EventEmitter {
   async executeHeartbeat(workspaceId: string): Promise<void> {
     assert(workspaceId.trim().length > 0, "executeHeartbeat requires a non-empty workspaceId");
 
-    const { sendOptions, heartbeatMessage } = await this.buildHeartbeatSendOptions(workspaceId);
+    const heartbeatRequest = await this.buildHeartbeatRequest(workspaceId);
+    const session = this.getOrCreateSession(workspaceId);
+    if (session.isBusy()) {
+      throw new Error(
+        "Failed to execute heartbeat: Workspace is busy; idle-only send was skipped."
+      );
+    }
+    if (session.hasQueuedMessages()) {
+      throw new Error(
+        "Failed to execute heartbeat: Workspace has queued user input; idle-only send was skipped."
+      );
+    }
+
+    log.info("Executing heartbeat", {
+      workspaceId,
+      contextMode: heartbeatRequest.contextMode,
+      model: heartbeatRequest.sendOptions.model,
+      agentId: heartbeatRequest.sendOptions.agentId,
+    });
+
+    switch (heartbeatRequest.contextMode) {
+      case "normal":
+        await this.dispatchHeartbeatMessage(workspaceId, heartbeatRequest);
+        return;
+      case "compact":
+        await this.dispatchHeartbeatCompactionRequest(workspaceId, heartbeatRequest);
+        return;
+      case "reset": {
+        const appendResult = await session.appendHeartbeatContextResetBoundary({
+          boundaryText: HEARTBEAT_RESET_BOUNDARY_MESSAGE,
+          pendingFollowUp: heartbeatRequest.followUp,
+        });
+        if (!appendResult.success) {
+          throw new Error(`Failed to execute heartbeat: ${appendResult.error}`);
+        }
+
+        const dispatched = await session.dispatchPendingCompactionFollowUpIfNeeded(
+          appendResult.data.summaryMessageId
+        );
+        if (!dispatched) {
+          log.info("Skipped heartbeat follow-up after reset boundary", {
+            workspaceId,
+            contextMode: heartbeatRequest.contextMode,
+          });
+        }
+        return;
+      }
+      default: {
+        const exhaustiveContextMode: never = heartbeatRequest.contextMode;
+        throw new Error(`Unhandled heartbeat context mode: ${String(exhaustiveContextMode)}`);
+      }
+    }
+  }
+
+  private async buildHeartbeatRequest(workspaceId: string): Promise<HeartbeatExecutionRequest> {
+    const { sendOptions, heartbeatMessage, contextMode } =
+      await this.buildHeartbeatSendOptions(workspaceId);
 
     const activity = await this.extensionMetadata.getSnapshot(workspaceId);
     const idleMs =
@@ -7076,25 +7209,44 @@ export class WorkspaceService extends EventEmitter {
     const heartbeatBody = heartbeatMessage ?? HEARTBEAT_DEFAULT_MESSAGE_BODY;
     const heartbeatPrompt = `${heartbeatLead} ${heartbeatBody}`;
 
-    const muxMetadata = {
-      type: "heartbeat-request" as const,
-      source: "heartbeat" as const,
+    assert(
+      typeof sendOptions.agentId === "string" && sendOptions.agentId.trim().length > 0,
+      "Heartbeat requests require a resolved agentId"
+    );
+
+    const muxMetadata: Extract<MuxMessageMetadata, { type: "heartbeat-request" }> = {
+      type: "heartbeat-request",
+      source: "heartbeat",
+      requestedModel: sendOptions.model,
       displayStatus: { emoji: "💓", message: "Heartbeat check..." },
     };
 
-    const session = this.getOrCreateSession(workspaceId);
-    if (session.isBusy()) {
-      throw new Error(
-        "Failed to execute heartbeat: Workspace is busy; idle-only send was skipped."
-      );
-    }
+    return {
+      contextMode,
+      sendOptions,
+      heartbeatPrompt,
+      muxMetadata,
+      followUp: {
+        text: heartbeatPrompt,
+        model: sendOptions.model,
+        agentId: sendOptions.agentId,
+        ...pickPreservedSendOptions(sendOptions),
+        muxMetadata,
+        dispatchOptions: { requireIdle: true },
+      },
+    };
+  }
 
+  private async dispatchHeartbeatMessage(
+    workspaceId: string,
+    heartbeatRequest: HeartbeatExecutionRequest
+  ): Promise<void> {
     const sendResult = await this.sendMessage(
       workspaceId,
-      heartbeatPrompt,
+      heartbeatRequest.heartbeatPrompt,
       {
-        ...sendOptions,
-        muxMetadata,
+        ...heartbeatRequest.sendOptions,
+        muxMetadata: heartbeatRequest.muxMetadata,
       },
       {
         // Heartbeats run in background; avoid mutating auto-resume counters.
@@ -7108,24 +7260,67 @@ export class WorkspaceService extends EventEmitter {
     );
 
     if (!sendResult.success) {
-      const rawError = sendResult.error;
-      const formattedError =
-        typeof rawError === "object" && rawError !== null
-          ? "raw" in rawError && typeof rawError.raw === "string"
-            ? rawError.raw
-            : "message" in rawError && typeof rawError.message === "string"
-              ? rawError.message
-              : "type" in rawError && typeof rawError.type === "string"
-                ? rawError.type
-                : JSON.stringify(rawError)
-          : String(rawError);
-      throw new Error(`Failed to execute heartbeat: ${formattedError}`);
+      throw new Error(
+        `Failed to execute heartbeat: ${this.formatSendMessageError(sendResult.error)}`
+      );
     }
+  }
+
+  private async dispatchHeartbeatCompactionRequest(
+    workspaceId: string,
+    heartbeatRequest: HeartbeatExecutionRequest
+  ): Promise<void> {
+    const compactionSendOptions = await this.buildIdleCompactionSendOptions(workspaceId);
+    const compactionMuxMetadata: MuxMessageMetadata = {
+      type: "compaction-request",
+      rawCommand: "/compact",
+      commandPrefix: "/compact",
+      parsed: {
+        model: compactionSendOptions.model,
+        followUpContent: heartbeatRequest.followUp,
+      },
+      requestedModel: compactionSendOptions.model,
+      source: "idle-compaction",
+      displayStatus: { emoji: "💓", message: "Compacting before heartbeat..." },
+    };
+
+    const sendResult = await this.sendMessage(
+      workspaceId,
+      buildCompactionMessageText({ followUpContent: heartbeatRequest.followUp }),
+      {
+        ...compactionSendOptions,
+        muxMetadata: compactionMuxMetadata,
+      },
+      {
+        skipAutoResumeReset: true,
+        synthetic: true,
+        requireIdle: true,
+      }
+    );
+
+    if (!sendResult.success) {
+      throw new Error(
+        `Failed to execute heartbeat: ${this.formatSendMessageError(sendResult.error)}`
+      );
+    }
+  }
+
+  private formatSendMessageError(error: SendMessageError): string {
+    return typeof error === "object" && error !== null
+      ? "raw" in error && typeof error.raw === "string"
+        ? error.raw
+        : "message" in error && typeof error.message === "string"
+          ? error.message
+          : "type" in error && typeof error.type === "string"
+            ? error.type
+            : JSON.stringify(error)
+      : String(error);
   }
 
   private async buildHeartbeatSendOptions(workspaceId: string): Promise<{
     sendOptions: SendMessageOptions;
     heartbeatMessage: string | undefined;
+    contextMode: HeartbeatContextMode;
   }> {
     const config = this.config.loadConfigOrDefault();
     const workspaceMatch = this.config.findWorkspace(workspaceId);
@@ -7218,7 +7413,10 @@ export class WorkspaceService extends EventEmitter {
         // Heartbeats should not mutate persisted workspace AI defaults.
         skipAiSettingsPersistence: true,
       },
-      heartbeatMessage: sanitizeHeartbeatMessage(workspaceEntry?.heartbeat?.message),
+      heartbeatMessage:
+        sanitizeHeartbeatMessage(workspaceEntry?.heartbeat?.message) ??
+        sanitizeHeartbeatMessage(config.heartbeatDefaultPrompt),
+      contextMode: sanitizeHeartbeatContextMode(workspaceEntry?.heartbeat?.contextMode),
     };
   }
 

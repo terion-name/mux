@@ -4,17 +4,20 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import type { WorkspaceContext } from "./WorkspaceContext";
 import { WorkspaceProvider, useWorkspaceContext } from "./WorkspaceContext";
-import { ProjectProvider } from "@/browser/contexts/ProjectContext";
+import { ProjectProvider, useProjectContext } from "@/browser/contexts/ProjectContext";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { useWorkspaceStoreRaw as getWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import {
+  LAST_VISITED_ROUTE_KEY,
   LAUNCH_BEHAVIOR_KEY,
   SELECTED_WORKSPACE_KEY,
+  getAgentIdKey,
   getModelKey,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
   getThinkingLevelKey,
 } from "@/common/constants/storage";
+import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { RecursivePartial } from "@/browser/testUtils";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
@@ -45,6 +48,8 @@ const createWorkspaceMetadata = (
   runtimeConfig: { type: "local", srcBaseDir: "/home/user/.mux/src" },
   ...overrides,
 });
+
+type NavigationType = "navigate" | "reload" | "back_forward" | "prerender";
 
 describe("WorkspaceContext", () => {
   afterEach(() => {
@@ -484,6 +489,80 @@ describe("WorkspaceContext", () => {
       "xhigh"
     );
   });
+  test("stale metadata does not override a main workspace agent selection", async () => {
+    const workspaceId = "ws-agent-main";
+    let emitMetadata:
+      | ((event: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }) => void)
+      | null = null;
+
+    createMockAPI({
+      workspace: {
+        list: () => Promise.resolve([createWorkspaceMetadata({ id: workspaceId })]),
+        onMetadata: () =>
+          Promise.resolve(
+            (async function* () {
+              const event = await new Promise<{
+                workspaceId: string;
+                metadata: FrontendWorkspaceMetadata | null;
+              }>((resolve) => {
+                emitMetadata = resolve;
+              });
+              yield event;
+            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+          ),
+      },
+      localStorage: {
+        [getAgentIdKey(workspaceId)]: JSON.stringify("exec"),
+      },
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
+    await waitFor(() => expect(emitMetadata).toBeTruthy());
+    expect(ctx().workspaceMetadata.get(workspaceId)?.agentId).toBeUndefined();
+
+    act(() => {
+      emitMetadata?.({
+        workspaceId,
+        metadata: createWorkspaceMetadata({ id: workspaceId, agentId: "plan" }),
+      });
+    });
+
+    await waitFor(() => expect(ctx().workspaceMetadata.get(workspaceId)?.agentId).toBe("plan"));
+    expect(readPersistedState<string | undefined>(getAgentIdKey(workspaceId), undefined)).toBe(
+      "exec"
+    );
+  });
+
+  test("child workspace metadata still seeds the locked backend agent", async () => {
+    const workspaceId = "ws-agent-child";
+
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createWorkspaceMetadata({
+              id: workspaceId,
+              parentWorkspaceId: "ws-parent",
+              agentType: "plan",
+            }),
+          ]),
+      },
+      localStorage: {
+        [getAgentIdKey(workspaceId)]: JSON.stringify("exec"),
+      },
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
+
+    expect(readPersistedState<string | undefined>(getAgentIdKey(workspaceId), undefined)).toBe(
+      "plan"
+    );
+  });
+
   test("loads workspace metadata on mount", async () => {
     const initialWorkspaces: FrontendWorkspaceMetadata[] = [
       createWorkspaceMetadata({
@@ -928,7 +1007,7 @@ describe("WorkspaceContext", () => {
     );
   });
 
-  test("selectedWorkspace starts null on landing page (no localStorage restore)", async () => {
+  test("root startup opens the recent project page instead of restoring selectedWorkspace localStorage", async () => {
     createMockAPI({
       workspace: {
         list: () =>
@@ -942,7 +1021,11 @@ describe("WorkspaceContext", () => {
             }),
           ]),
       },
-      // Seed localStorage — should be ignored since app starts at landing page
+      projects: {
+        list: () => Promise.resolve([["/restore", { workspaces: [] }]]),
+      },
+      // Seed localStorage — WorkspaceContext should resolve the compatibility root
+      // route to the project page instead of reviving the removed landing page.
       localStorage: {
         selectedWorkspace: JSON.stringify({
           workspaceId: "ws-restore",
@@ -956,12 +1039,44 @@ describe("WorkspaceContext", () => {
     const ctx = await setup();
 
     await waitFor(() => expect(ctx().loading).toBe(false));
-    // With the new landing page default, localStorage is not used to restore selection
+    await waitFor(() => {
+      expect(ctx().pendingNewWorkspaceProject).toBe("/restore");
+    });
     expect(ctx().selectedWorkspace).toBeNull();
   });
 
+  test("browser reload restores the open workspace instead of reopening project creation", async () => {
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createWorkspaceMetadata({
+              id: "ws-open-chat",
+              projectPath: "/existing",
+              projectName: "existing",
+              name: "main",
+              namedWorkspacePath: "/existing-main",
+            }),
+          ]),
+      },
+      localStorage: {
+        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
+      },
+      locationPath: "/workspace/ws-open-chat",
+      navigationType: "reload",
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().loading).toBe(false));
+    await waitFor(() => {
+      expect(ctx().selectedWorkspace?.workspaceId).toBe("ws-open-chat");
+    });
+    expect(ctx().pendingNewWorkspaceProject).toBeNull();
+  });
+
   test("resolves system project route IDs for pending workspace creation", async () => {
-    const systemProjectPath = "/system/chat-with-mux";
+    const systemProjectPath = "/system/internal-project";
     const systemProjectId = getProjectRouteId(systemProjectPath);
 
     createMockAPI({
@@ -1029,23 +1144,60 @@ describe("WorkspaceContext", () => {
     expect(ctx().selectedWorkspace).toBeNull();
   });
 
+  test("desktop: launch-project overrides a restored desktop route", async () => {
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createWorkspaceMetadata({
+              id: "ws-existing",
+              projectPath: "/existing-project",
+              projectName: "existing-project",
+              name: "main",
+              namedWorkspacePath: "/existing-project-main",
+            }),
+          ]),
+      },
+      projects: {
+        list: () => Promise.resolve([]),
+      },
+      server: {
+        getLaunchProject: () => Promise.resolve("/launch-project"),
+      },
+      localStorage: {
+        [LAST_VISITED_ROUTE_KEY]: JSON.stringify("/workspace/ws-existing"),
+      },
+      desktopMode: true,
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().loading).toBe(false));
+    await waitFor(() => {
+      expect(ctx().pendingNewWorkspaceProject).toBe("/launch-project");
+    });
+    expect(ctx().selectedWorkspace).toBeNull();
+  });
+
   test("launch-project ignores seeded system projects and workspaces on true first launch", async () => {
     createMockAPI({
       workspace: {
         list: () =>
           Promise.resolve([
             createWorkspaceMetadata({
-              id: "mux-chat",
-              projectPath: "/system/chat-with-mux",
-              projectName: "chat-with-mux",
+              id: "system-workspace",
+              projectPath: "/system/internal-project",
+              projectName: "internal-project",
               name: "main",
-              namedWorkspacePath: "/system/chat-with-mux-main",
+              namedWorkspacePath: "/system/internal-project-main",
             }),
           ]),
       },
       projects: {
         list: () =>
-          Promise.resolve([["/system/chat-with-mux", { workspaces: [], projectKind: "system" }]]),
+          Promise.resolve([
+            ["/system/internal-project", { workspaces: [], projectKind: "system" }],
+          ]),
       },
       server: {
         getLaunchProject: () => Promise.resolve("/launch-project"),
@@ -1113,7 +1265,7 @@ describe("WorkspaceContext", () => {
           ]),
       },
       projects: {
-        list: () => Promise.resolve([]),
+        list: () => Promise.resolve([["/existing-project", { workspaces: [] }]]),
       },
       server: {
         getLaunchProject: () => Promise.resolve(null),
@@ -1129,6 +1281,167 @@ describe("WorkspaceContext", () => {
     await waitFor(() => expect(ctx().loading).toBe(false));
     await waitFor(() => {
       expect(ctx().pendingNewWorkspaceProject).toBe("/existing-project");
+    });
+    expect(ctx().selectedWorkspace).toBeNull();
+  });
+
+  test("desktop: new-chat mode fails closed when project metadata is unavailable", async () => {
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createWorkspaceMetadata({
+              id: "ws-existing",
+              projectPath: "/existing-project",
+              projectName: "existing-project",
+              name: "main",
+              namedWorkspacePath: "/existing-project-main",
+            }),
+          ]),
+      },
+      projects: {
+        list: () => Promise.resolve([]),
+      },
+      server: {
+        getLaunchProject: () => Promise.resolve(null),
+      },
+      localStorage: {
+        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
+      },
+      desktopMode: true,
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().loading).toBe(false));
+    await waitFor(() => {
+      expect(ctx().pendingNewWorkspaceProject).toBeNull();
+    });
+    expect(ctx().selectedWorkspace).toBeNull();
+  });
+
+  test("desktop: new-chat mode retries startup fallback after project metadata loads", async () => {
+    const { projects: projectsApi } = createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createWorkspaceMetadata({
+              id: "ws-existing",
+              projectPath: "/existing-project",
+              projectName: "existing-project",
+              name: "main",
+              namedWorkspacePath: "/existing-project-main",
+            }),
+          ]),
+      },
+      projects: {
+        list: () => Promise.resolve([]),
+      },
+      server: {
+        getLaunchProject: () => Promise.resolve(null),
+      },
+      localStorage: {
+        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
+      },
+      desktopMode: true,
+    });
+
+    const contexts = await setupWithProjectContext();
+
+    await waitFor(() => expect(contexts.workspace().loading).toBe(false));
+    expect(contexts.workspace().pendingNewWorkspaceProject).toBeNull();
+
+    projectsApi.list.mockImplementation(() =>
+      Promise.resolve([["/existing-project", { workspaces: [] }]])
+    );
+    await act(async () => {
+      await contexts.project().refreshProjects();
+    });
+
+    await waitFor(() => {
+      expect(contexts.workspace().pendingNewWorkspaceProject).toBe("/existing-project");
+    });
+    expect(contexts.workspace().selectedWorkspace).toBeNull();
+  });
+
+  test("desktop: new-chat mode skips legacy system workspaces when choosing a recent project", async () => {
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createWorkspaceMetadata({
+              id: "ws-system",
+              projectPath: "/system/internal-project",
+              projectName: "internal-project",
+              name: "main",
+              namedWorkspacePath: "/system/internal-project-main",
+            }),
+            createWorkspaceMetadata({
+              id: "ws-user",
+              projectPath: "/existing-project",
+              projectName: "existing-project",
+              name: "main",
+              namedWorkspacePath: "/existing-project-main",
+            }),
+          ]),
+      },
+      projects: {
+        list: () =>
+          Promise.resolve([
+            ["/system/internal-project", { workspaces: [], projectKind: "system" }],
+            ["/existing-project", { workspaces: [] }],
+          ]),
+      },
+      server: {
+        getLaunchProject: () => Promise.resolve(null),
+      },
+      localStorage: {
+        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
+      },
+      desktopMode: true,
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().loading).toBe(false));
+    await waitFor(() => {
+      expect(ctx().pendingNewWorkspaceProject).toBe("/existing-project");
+    });
+    expect(ctx().selectedWorkspace).toBeNull();
+  });
+
+  test("desktop: new-chat mode keeps visible multi-project workspaces eligible as recents", async () => {
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createWorkspaceMetadata({
+              id: "ws-multi",
+              projectPath: MULTI_PROJECT_CONFIG_KEY,
+              projectName: "_multi",
+              name: "main",
+              namedWorkspacePath: "/tmp/multi-container/main",
+            }),
+          ]),
+      },
+      projects: {
+        list: () =>
+          Promise.resolve([[MULTI_PROJECT_CONFIG_KEY, { workspaces: [], projectKind: "system" }]]),
+      },
+      server: {
+        getLaunchProject: () => Promise.resolve(null),
+      },
+      localStorage: {
+        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
+      },
+      desktopMode: true,
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().loading).toBe(false));
+    await waitFor(() => {
+      expect(ctx().pendingNewWorkspaceProject).toBe(MULTI_PROJECT_CONFIG_KEY);
     });
     expect(ctx().selectedWorkspace).toBeNull();
   });
@@ -1278,8 +1591,8 @@ describe("WorkspaceContext", () => {
     const metadata = ctx().workspaceMetadata.get("ws-1");
     expect(metadata?.createdAt).toBe("2025-01-01T00:00:00.000Z");
   });
-  test("unscoped new_chat deep link resolves to system project when no user projects exist", async () => {
-    const systemPath = "/system/chat-with-mux";
+  test("unscoped new_chat deep link does nothing when no user projects exist", async () => {
+    const systemPath = "/system/internal-project";
     createMockAPI({
       projects: {
         list: () => Promise.resolve([[systemPath, { workspaces: [], projectKind: "system" }]]),
@@ -1291,7 +1604,7 @@ describe("WorkspaceContext", () => {
 
     await waitFor(() => {
       const state = ctx();
-      expect(state.pendingNewWorkspaceProject).toBe(systemPath);
+      expect(state.pendingNewWorkspaceProject).toBeNull();
     });
   });
 });
@@ -1321,6 +1634,37 @@ async function setup() {
   return () => contextRef.current!;
 }
 
+async function setupWithProjectContext() {
+  const workspaceRef = { current: null as WorkspaceContext | null };
+  const projectRef = { current: null as ReturnType<typeof useProjectContext> | null };
+
+  function ContextCapture() {
+    workspaceRef.current = useWorkspaceContext();
+    projectRef.current = useProjectContext();
+    return null;
+  }
+
+  render(
+    <RouterProvider>
+      <ProjectProvider>
+        <WorkspaceProvider>
+          <ContextCapture />
+        </WorkspaceProvider>
+      </ProjectProvider>
+    </RouterProvider>
+  );
+
+  getWorkspaceStoreRaw().setClient(currentClientMock as APIClient);
+
+  await waitFor(() => expect(workspaceRef.current).toBeTruthy());
+  await waitFor(() => expect(projectRef.current).toBeTruthy());
+
+  return {
+    workspace: () => workspaceRef.current!,
+    project: () => projectRef.current!,
+  };
+}
+
 interface MockAPIOptions {
   workspace?: RecursivePartial<APIClient["workspace"]>;
   projects?: RecursivePartial<APIClient["projects"]>;
@@ -1329,6 +1673,7 @@ interface MockAPIOptions {
   locationHash?: string;
   locationPath?: string;
   desktopMode?: boolean;
+  navigationType?: NavigationType;
   pendingDeepLinks?: Array<{ type: string; [key: string]: unknown }>;
 }
 
@@ -1358,6 +1703,15 @@ function createMockAPI(options: MockAPIOptions = {}) {
   if (options.locationHash) {
     happyWindow.location.hash = options.locationHash;
   }
+
+  const navigationEntries = [
+    { type: options.navigationType ?? "navigate" } as unknown as PerformanceNavigationTiming,
+  ];
+  Object.defineProperty(happyWindow.performance, "getEntriesByType", {
+    configurable: true,
+    value: (entryType: string) =>
+      entryType === "navigation" ? (navigationEntries as unknown as PerformanceEntryList) : [],
+  });
 
   // Set up deep link API on the window object for pending deep-link tests
   (happyWindow as unknown as { api?: Record<string, unknown> }).api = {

@@ -3,7 +3,6 @@ import { useRouter } from "./contexts/RouterContext";
 import { useLocation, useNavigate } from "react-router-dom";
 import "./styles/globals.css";
 import { useWorkspaceContext, toWorkspaceSelection } from "./contexts/WorkspaceContext";
-import { MUX_HELP_CHAT_WORKSPACE_ID } from "@/common/constants/muxChat";
 import { useProjectContext } from "./contexts/ProjectContext";
 import type { WorkspaceSelection } from "./components/ProjectSidebar/ProjectSidebar";
 import { LeftSidebar } from "./components/LeftSidebar/LeftSidebar";
@@ -36,6 +35,11 @@ import { useOpenTerminal } from "./hooks/useOpenTerminal";
 import type { CommandAction } from "./contexts/CommandRegistryContext";
 import { useTheme, type ThemePreference } from "./contexts/ThemeContext";
 import { CommandPalette } from "./components/CommandPalette/CommandPalette";
+import {
+  LEFT_SIDEBAR_DEFAULT_WIDTH_PX,
+  LEFT_SIDEBAR_MAX_WIDTH_PX,
+  LEFT_SIDEBAR_MIN_WIDTH_PX,
+} from "@/constants/layout";
 import { buildCoreSources, type BuildSourcesParams } from "./utils/commands/sources";
 
 import { THINKING_LEVELS, type ThinkingLevel } from "@/common/types/thinking";
@@ -95,8 +99,35 @@ import assert from "@/common/utils/assert";
 import { createProjectRefs } from "@/common/utils/multiProject";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { LandingPage } from "@/browser/features/LandingPage/LandingPage";
+import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { LoadingScreen } from "@/browser/components/LoadingScreen/LoadingScreen";
+
+function RootRouteShell(props: {
+  leftSidebarCollapsed: boolean;
+  onToggleLeftSidebarCollapsed: () => void;
+}) {
+  return (
+    <div className="bg-surface-primary flex flex-1 flex-col overflow-hidden">
+      {props.leftSidebarCollapsed ? (
+        <div
+          className={`bg-sidebar border-border-light flex shrink-0 items-center border-b px-4 py-2 ${isDesktopMode() ? "titlebar-drag" : ""}`}
+        >
+          <button
+            type="button"
+            onClick={props.onToggleLeftSidebarCollapsed}
+            className={`border-border-medium bg-background-secondary text-foreground hover:bg-hover rounded-md border px-3 py-1.5 text-sm transition-colors ${isDesktopMode() ? "titlebar-no-drag" : ""}`}
+            aria-label="Open sidebar menu"
+          >
+            Open sidebar
+          </button>
+        </div>
+      ) : null}
+      <div className="flex flex-1 items-center justify-center px-6">
+        <p className="text-muted text-sm">Select or add a project to get started.</p>
+      </div>
+    </div>
+  );
+}
 
 function AppInner() {
   // Get workspace state from context
@@ -106,7 +137,6 @@ function AppInner() {
     setWorkspaceMetadata,
     removeWorkspace,
     updateWorkspaceTitle,
-    refreshWorkspaceMetadata,
     selectedWorkspace,
     setSelectedWorkspace,
     pendingNewWorkspaceProject,
@@ -160,9 +190,9 @@ function AppInner() {
   // collapse remains a separate toggle and the drag handle is hidden in mobile-touch overlay mode.
   const leftSidebar = useResizableSidebar({
     enabled: true,
-    defaultWidth: 288,
-    minWidth: 200,
-    maxWidth: 600,
+    defaultWidth: LEFT_SIDEBAR_DEFAULT_WIDTH_PX,
+    minWidth: LEFT_SIDEBAR_MIN_WIDTH_PX,
+    maxWidth: LEFT_SIDEBAR_MAX_WIDTH_PX,
     // Keep enough room for the main content so you can't drag-resize the left sidebar
     // to a point where the chat pane becomes unusably narrow.
     getMaxWidthPx: () => {
@@ -183,7 +213,8 @@ function AppInner() {
     storageKey: LEFT_SIDEBAR_WIDTH_KEY,
     side: "left",
   });
-  // Sync sidebar collapse state to root element for CSS-based titlebar insets
+  // Sync sidebar collapse state to the root element for non-React consumers like
+  // Storybook play helpers that need to know whether the sidebar is currently collapsed.
   useEffect(() => {
     document.documentElement.dataset.leftSidebarCollapsed = String(sidebarCollapsed);
   }, [sidebarCollapsed]);
@@ -238,27 +269,6 @@ function AppInner() {
     workspaceMetadataRef.current = workspaceMetadata;
   }, [workspaceMetadata]);
 
-  const handleOpenMuxChat = useCallback(() => {
-    // User requested an F1 shortcut to jump straight into Chat with Mux.
-    const metadata = workspaceMetadataRef.current.get(MUX_HELP_CHAT_WORKSPACE_ID);
-    setSelectedWorkspace(
-      metadata
-        ? toWorkspaceSelection(metadata)
-        : {
-            workspaceId: MUX_HELP_CHAT_WORKSPACE_ID,
-            projectPath: "",
-            projectName: "Mux",
-            namedWorkspacePath: "",
-          }
-    );
-
-    if (!metadata) {
-      refreshWorkspaceMetadata().catch((error) => {
-        console.error("Failed to refresh workspace metadata", error);
-      });
-    }
-  }, [refreshWorkspaceMetadata, setSelectedWorkspace]);
-
   // Update window title based on selected workspace
   // URL syncing is now handled by RouterContext
   useEffect(() => {
@@ -286,7 +296,8 @@ function AppInner() {
       const metadata = workspaceMetadata.get(selectedWorkspace.workspaceId);
 
       if (!metadata) {
-        // Workspace was deleted - navigate home (clears selection)
+        // Workspace metadata disappeared while this route was active. Clear the stale
+        // selection so the router can self-heal to the compatibility root route.
         console.warn(
           `Workspace ${selectedWorkspace.workspaceId} no longer exists, clearing selection`
         );
@@ -796,9 +807,6 @@ function AppInner() {
             : undefined;
           openCommandPalette(initialQuery);
         }
-      } else if (matchesKeybind(e, KEYBINDS.OPEN_MUX_CHAT)) {
-        e.preventDefault();
-        handleOpenMuxChat();
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_SIDEBAR)) {
         e.preventDefault();
         setSidebarCollapsed((prev) => !prev);
@@ -825,7 +833,6 @@ function AppInner() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [
     handleNavigateWorkspace,
-    handleOpenMuxChat,
     setSidebarCollapsed,
     isCommandPaletteOpen,
     closeCommandPalette,
@@ -1119,9 +1126,15 @@ function AppInner() {
               })()
             ) : currentWorkspaceId ? (
               loading ? (
+                // Keep a lightweight loading shell while WorkspaceContext validates or
+                // self-heals stale `/workspace/:id` routes. Restoring a path alone is not
+                // enough; we only render AIView once metadata hydration confirms it exists.
                 <LoadingScreen statusText="Opening workspace..." />
               ) : (
-                <LandingPage
+                // If metadata never hydrated for the routed workspace, avoid trapping the user
+                // on a permanent spinner. Show the same non-blocking root shell while the route
+                // waits for a later retry or manual navigation.
+                <RootRouteShell
                   leftSidebarCollapsed={sidebarCollapsed}
                   onToggleLeftSidebarCollapsed={handleToggleSidebar}
                 />
@@ -1150,15 +1163,28 @@ function AppInner() {
                       setWorkspaceMetadata((prev) => new Map(prev).set(metadata.id, metadata));
 
                       if (options?.autoNavigate !== false) {
-                        // Only switch to new workspace if user hasn't selected another one
-                        // during the creation process (selectedWorkspace was null when creation started)
+                        let createdSelection: WorkspaceSelection | null = null;
                         setSelectedWorkspace((current) => {
                           if (current !== null) {
-                            // User has already selected another workspace - don't override
+                            // If the user picked another workspace before create/send resolved,
+                            // keep their explicit selection and skip the optimistic starting barrier.
                             return current;
                           }
-                          return toWorkspaceSelection(metadata);
+
+                          createdSelection = toWorkspaceSelection(metadata);
+                          return createdSelection;
                         });
+
+                        // WorkspaceContext resolves functional selection updates synchronously
+                        // against its latest ref, so by the time setSelectedWorkspace() returns we
+                        // know whether this creation actually won and can safely mark the
+                        // optimistic starting barrier outside the updater callback.
+                        if (createdSelection) {
+                          workspaceStore.markPendingInitialSend(
+                            metadata.id,
+                            options?.pendingStreamModel ?? null
+                          );
+                        }
                       }
 
                       // Track telemetry
@@ -1175,7 +1201,10 @@ function AppInner() {
                 );
               })()
             ) : (
-              <LandingPage
+              // The dedicated Mux home page was removed. Keep `/` as a minimal shell so
+              // WorkspaceContext can redirect it to a concrete project route when possible,
+              // without reintroducing a sticky dashboard screen.
+              <RootRouteShell
                 leftSidebarCollapsed={sidebarCollapsed}
                 onToggleLeftSidebarCollapsed={handleToggleSidebar}
               />

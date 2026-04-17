@@ -3,11 +3,22 @@ import { describe, it, expect } from "@jest/globals";
 import {
   shouldShowInterruptedBarrier,
   mergeConsecutiveStreamErrors,
-  computeBashOutputGroupInfo,
   computeBashOutputGroupInfos,
   shouldBypassDeferredMessages,
+  type BashOutputGroupInfo,
 } from "./messageUtils";
 import type { DisplayedMessage } from "@/common/types/message";
+
+/** Test-only convenience wrapper: compute group info for a single index. */
+function computeBashOutputGroupInfo(
+  messages: DisplayedMessage[],
+  index: number
+): BashOutputGroupInfo | undefined {
+  if (index < 0 || index >= messages.length) {
+    return undefined;
+  }
+  return computeBashOutputGroupInfos(messages)[index];
+}
 
 describe("shouldShowInterruptedBarrier", () => {
   it("returns false for executing ask_user_question", () => {
@@ -113,6 +124,25 @@ describe("shouldBypassDeferredMessages", () => {
     result: { success: true, output: "hi", exitCode: 0, wall_duration_ms: 5 },
   };
 
+  const runningInit: DisplayedMessage = {
+    type: "workspace-init",
+    id: "workspace-init",
+    historySequence: -1,
+    status: "running",
+    hookPath: "/tmp/project/.mux/init",
+    lines: [{ line: "Installing dependencies...", isError: false }],
+    exitCode: null,
+    timestamp: 1,
+    durationMs: null,
+  };
+
+  const completedInit: DisplayedMessage = {
+    ...runningInit,
+    status: "success",
+    exitCode: 0,
+    durationMs: 2_000,
+  };
+
   it("returns true when immediate snapshot has active rows", () => {
     expect(shouldBypassDeferredMessages([executingBash], [executingBash])).toBe(true);
   });
@@ -139,6 +169,25 @@ describe("shouldBypassDeferredMessages", () => {
     expect(shouldBypassDeferredMessages([completedBash, userRow], [userRow, completedBash])).toBe(
       true
     );
+  });
+
+  it("returns true when the deferred snapshot still belongs to the previous workspace", () => {
+    expect(
+      shouldBypassDeferredMessages([completedBash], [completedBash], {
+        immediateWorkspaceId: "workspace-b",
+        deferredWorkspaceId: "workspace-a",
+      })
+    ).toBe(true);
+  });
+
+  it("returns true when init output is still running", () => {
+    expect(shouldBypassDeferredMessages([runningInit], [runningInit])).toBe(true);
+  });
+
+  it("returns true when the deferred snapshot still shows a running init hook", () => {
+    // Regression scenario: reconnect replay completed the init hook, but the deferred
+    // snapshot is still holding on to the older running row from before catch-up.
+    expect(shouldBypassDeferredMessages([completedInit], [runningInit])).toBe(true);
   });
 
   it("returns false when both snapshots are settled and in sync", () => {
