@@ -232,8 +232,7 @@ export class LspManager {
     this.acquireLease(options.workspaceId);
 
     try {
-      const directoryWorkspaceSymbolsResult =
-        await this.queryWorkspaceSymbolsForDirectory(options);
+      const directoryWorkspaceSymbolsResult = await this.queryWorkspaceSymbolsForDirectory(options);
       if (directoryWorkspaceSymbolsResult) {
         return directoryWorkspaceSymbolsResult;
       }
@@ -843,6 +842,12 @@ export class LspManager {
           rootUri: string;
         }
       | undefined;
+    let firstSymbolRoot:
+      | {
+          serverId: string;
+          rootUri: string;
+        }
+      | undefined;
 
     for (const match of queryRootDiscovery.matches) {
       const rootUri = pathMapper.toUri(match.rootPath);
@@ -856,6 +861,14 @@ export class LspManager {
           rootUri,
           options.policyContext
         );
+        await this.primeWorkspaceSymbolsQueryRoot({
+          client: clientResult.client,
+          descriptor: match.descriptor,
+          runtime: options.runtime,
+          pathMapper,
+          directoryPath: runtimeFilePath,
+          rootPath: match.rootPath,
+        });
         const rawResult = await clientResult.client.query({
           operation: options.operation,
           query: options.query,
@@ -870,6 +883,12 @@ export class LspManager {
           serverId: match.descriptor.id,
           rootUri,
         };
+        if (symbols.length > 0) {
+          firstSymbolRoot ??= {
+            serverId: match.descriptor.id,
+            rootUri,
+          };
+        }
         for (const symbol of symbols) {
           mergedSymbols.set(getWorkspaceSymbolIdentity(symbol), symbol);
         }
@@ -885,9 +904,7 @@ export class LspManager {
       throw new Error(
         buildWorkspaceSymbolsDirectorySearchError(
           options.filePath,
-          queryFailures.map((failure) =>
-            describeWorkspaceSymbolsQueryFailure(pathMapper, failure)
-          ),
+          summarizeWorkspaceSymbolsQueryFailures(pathMapper, queryFailures),
           queryRootDiscovery.truncated
         )
       );
@@ -900,19 +917,18 @@ export class LspManager {
         ? `Directory root scan was truncated to the first ${LSP_MAX_WORKSPACE_SYMBOL_QUERY_ROOTS} matching LSP roots`
         : undefined,
       queryFailures.length > 0
-        ? `Skipped ${queryFailures.length} failing LSP root${queryFailures.length === 1 ? "" : "s"}: ${queryFailures
-            .map((failure) => describeWorkspaceSymbolsQueryFailure(pathMapper, failure))
-            .join("; ")}`
+        ? `Skipped ${queryFailures.length} failing LSP root${queryFailures.length === 1 ? "" : "s"}: ${summarizeWorkspaceSymbolsQueryFailures(pathMapper, queryFailures)}`
         : undefined,
       dedupedSymbols.length > LSP_MAX_SYMBOLS
         ? `Results truncated to the first ${LSP_MAX_SYMBOLS} symbols`
         : undefined,
     ]);
+    const resultRoot = firstSymbolRoot ?? firstSuccessfulRoot;
 
     return {
       operation: "workspace_symbols",
-      serverId: firstSuccessfulRoot.serverId,
-      rootUri: firstSuccessfulRoot.rootUri,
+      serverId: resultRoot.serverId,
+      rootUri: resultRoot.rootUri,
       symbols: dedupedSymbols.slice(0, LSP_MAX_SYMBOLS),
       ...(warning ? { warning } : {}),
     };
@@ -966,10 +982,8 @@ export class LspManager {
     const matches: ResolvedDirectoryDescriptorMatch[] = [];
 
     for (const descriptor of this.registry) {
-      const specificRootMarkers = descriptor.rootMarkers.filter(
-        (marker) => !isGenericLspRootMarker(marker)
-      );
-      if (specificRootMarkers.length === 0) {
+      const descendantRootMarkers = getWorkspaceSymbolsDescendantRootMarkers(descriptor);
+      if (descendantRootMarkers.length === 0) {
         continue;
       }
 
@@ -977,7 +991,7 @@ export class LspManager {
         runtime,
         directoryPath,
         workspaceRuntimePath,
-        specificRootMarkers
+        descendantRootMarkers
       );
       for (const markerPath of markerPaths) {
         const pathModule = selectPathModule(markerPath);
@@ -990,6 +1004,116 @@ export class LspManager {
     }
 
     return matches;
+  }
+
+  private async primeWorkspaceSymbolsQueryRoot(options: {
+    client: LspClientInstance;
+    descriptor: LspServerDescriptor;
+    runtime: Runtime;
+    pathMapper: LspPathMapper;
+    directoryPath: string;
+    rootPath: string;
+  }): Promise<void> {
+    if (!isTypeScriptLspDescriptor(options.descriptor)) {
+      return;
+    }
+
+    const representativeFile = await this.findWorkspaceSymbolsRepresentativeFile(options);
+    if (!representativeFile) {
+      return;
+    }
+
+    try {
+      // TypeScript answers workspace/symbol relative to the currently-open project graph,
+      // so directory queries warm one real source file first instead of failing with "No Project".
+      await options.client.ensureFile(representativeFile);
+    } catch (error) {
+      log.debug("Failed to warm workspace_symbols query root", {
+        serverId: options.descriptor.id,
+        rootPath: options.rootPath,
+        readablePath: representativeFile.readablePath,
+        error,
+      });
+    }
+  }
+
+  private async findWorkspaceSymbolsRepresentativeFile(options: {
+    descriptor: LspServerDescriptor;
+    runtime: Runtime;
+    pathMapper: LspPathMapper;
+    directoryPath: string;
+    rootPath: string;
+  }): Promise<LspClientFileHandle | undefined> {
+    for (const searchPath of getWorkspaceSymbolsRepresentativeSearchPaths(
+      options.rootPath,
+      options.directoryPath
+    )) {
+      const representativePath = await this.findWorkspaceSymbolsRepresentativeFilePath(
+        options.runtime,
+        searchPath,
+        options.rootPath,
+        options.descriptor.extensions
+      );
+      if (!representativePath) {
+        continue;
+      }
+
+      return {
+        runtimePath: representativePath,
+        readablePath: options.pathMapper.toReadablePath(representativePath),
+        uri: options.pathMapper.toUri(representativePath),
+        languageId: options.descriptor.languageIdForPath(representativePath),
+      };
+    }
+
+    return undefined;
+  }
+
+  private async findWorkspaceSymbolsRepresentativeFilePath(
+    runtime: Runtime,
+    searchPath: string,
+    workspaceRuntimePath: string,
+    extensions: readonly string[]
+  ): Promise<string | undefined> {
+    if (extensions.length === 0) {
+      return undefined;
+    }
+
+    const ignoredDirectoryExpression = WORKSPACE_SYMBOLS_WARMUP_IGNORED_DIRECTORY_NAMES.map(
+      (directoryName) => `-name ${shellQuote(directoryName)}`
+    ).join(" -o ");
+    const extensionExpression = extensions
+      .map((extension) => `-name ${shellQuote(`*${extension}`)}`)
+      .join(" -o ");
+    const representativeFileResult = await execBuffered(
+      runtime,
+      `find ${shellQuote(searchPath)} '(' ${ignoredDirectoryExpression} ')' -type d -prune -o -type f '(' ${extensionExpression} ')' ! -name ${shellQuote("*.d.ts")} ! -name ${shellQuote("*.d.cts")} ! -name ${shellQuote("*.d.mts")} -print0`,
+      {
+        cwd: workspaceRuntimePath,
+        timeout: 30,
+      }
+    );
+    if (representativeFileResult.exitCode !== 0) {
+      const errorOutput =
+        representativeFileResult.stderr.trim() || representativeFileResult.stdout.trim();
+      throw new Error(
+        errorOutput.length > 0
+          ? errorOutput
+          : `Failed to scan ${searchPath} for representative source files (exit ${representativeFileResult.exitCode})`
+      );
+    }
+
+    const pathModule = selectPathModule(searchPath);
+    const representativePath = representativeFileResult.stdout
+      .split("\u0000")
+      .map((candidatePath) => candidatePath.trim())
+      .filter((candidatePath) => candidatePath.length > 0)
+      .sort((left, right) => {
+        const leftDepth = getRelativePathDepth(pathModule, searchPath, left);
+        const rightDepth = getRelativePathDepth(pathModule, searchPath, right);
+        return leftDepth - rightDepth || left.localeCompare(right);
+      })[0];
+    return representativePath || undefined;
   }
 
   private async findDescendantMarkerPaths(
@@ -1007,9 +1131,7 @@ export class LspManager {
     const ignoredDirectoryExpression = WORKSPACE_SYMBOLS_ROOT_SCAN_IGNORED_DIRECTORY_NAMES.map(
       (directoryName) => `-name ${shellQuote(directoryName)}`
     ).join(" -o ");
-    const markerExpression = markers
-      .map((marker) => `-name ${shellQuote(marker)}`)
-      .join(" -o ");
+    const markerExpression = markers.map((marker) => `-name ${shellQuote(marker)}`).join(" -o ");
     const findResult = await execBuffered(
       runtime,
       `find ${shellQuote(directoryPath)} '(' ${ignoredDirectoryExpression} ')' -type d -prune -o -type f '(' ${markerExpression} ')' -print0`,
@@ -1614,10 +1736,18 @@ export class LspManager {
     const workspaceSymbols = flattenWorkspaceSymbols(rawSymbols);
     return await Promise.all(
       workspaceSymbols.map(async (symbol) =>
-        this.buildSymbolResult(pathMapper, runtime, symbol.uri, symbol.range, symbol.name, symbol.kind, {
-          detail: symbol.detail,
-          containerName: symbol.containerName,
-        })
+        this.buildSymbolResult(
+          pathMapper,
+          runtime,
+          symbol.uri,
+          symbol.range,
+          symbol.name,
+          symbol.kind,
+          {
+            detail: symbol.detail,
+            containerName: symbol.containerName,
+          }
+        )
       )
     );
   }
@@ -1684,16 +1814,27 @@ function buildWorkspaceSymbolsAmbiguityError(
 }
 
 const WORKSPACE_SYMBOLS_ROOT_SCAN_IGNORED_DIRECTORY_NAMES = [".git", "node_modules"] as const;
+const WORKSPACE_SYMBOLS_WARMUP_IGNORED_DIRECTORY_NAMES = [
+  ".git",
+  ".next",
+  "build",
+  "coverage",
+  "dist",
+  "node_modules",
+  "out",
+] as const;
+const TYPESCRIPT_WORKSPACE_SYMBOL_PROJECT_MARKERS = new Set(["tsconfig.json", "jsconfig.json"]);
+const MAX_WORKSPACE_SYMBOL_FAILURE_DETAILS = 3;
 
 function buildWorkspaceSymbolsDirectorySearchError(
   outputPath: string,
-  attemptedRoots: string[],
+  attemptedRoots: string,
   truncatedRootScan: boolean
 ): string {
   const truncationDetail = truncatedRootScan
     ? ` Directory root scan was truncated to the first ${LSP_MAX_WORKSPACE_SYMBOL_QUERY_ROOTS} matching LSP roots.`
     : "";
-  return `workspace_symbols directory search failed for ${outputPath}; attempted roots: ${attemptedRoots.join("; ")}.${truncationDetail} Provide a representative source file path if you need to force a specific language server.`;
+  return `workspace_symbols directory search failed for ${outputPath}; attempted roots: ${attemptedRoots}.${truncationDetail} Provide a representative source file path if you need to force a specific language server.`;
 }
 
 function describeWorkspaceSymbolsQueryFailure(
@@ -1721,7 +1862,8 @@ function addDirectoryDescriptorMatch(
   const existingMatch = matchesByKey.get(key);
   if (
     !existingMatch ||
-    getDirectoryDescriptorMarkerPriority(match) < getDirectoryDescriptorMarkerPriority(existingMatch)
+    getDirectoryDescriptorMarkerPriority(match) <
+      getDirectoryDescriptorMarkerPriority(existingMatch)
   ) {
     matchesByKey.set(key, match);
   }
@@ -1739,6 +1881,38 @@ function getDirectoryDescriptorMarkerPriority(match: ResolvedDirectoryDescriptor
 
   const markerIndex = match.descriptor.rootMarkers.indexOf(matchedMarker);
   return markerIndex >= 0 ? markerIndex : match.descriptor.rootMarkers.length;
+}
+
+function getWorkspaceSymbolsDescendantRootMarkers(
+  descriptor: LspServerDescriptor
+): readonly string[] {
+  const specificRootMarkers = descriptor.rootMarkers.filter(
+    (marker) => !isGenericLspRootMarker(marker)
+  );
+  if (!isTypeScriptLspDescriptor(descriptor)) {
+    return specificRootMarkers;
+  }
+
+  return specificRootMarkers.filter((marker) =>
+    TYPESCRIPT_WORKSPACE_SYMBOL_PROJECT_MARKERS.has(marker)
+  );
+}
+
+function getWorkspaceSymbolsRepresentativeSearchPaths(
+  rootPath: string,
+  directoryPath: string
+): string[] {
+  if (rootPath === directoryPath) {
+    return [rootPath];
+  }
+
+  const pathModule = selectPathModule(rootPath);
+  const relativeDirectoryPath = pathModule.relative(rootPath, directoryPath);
+  if (isRelativeSubpath(pathModule, relativeDirectoryPath)) {
+    return [directoryPath, rootPath];
+  }
+
+  return [rootPath];
 }
 
 function sortWorkspaceSymbolsQueryRoots(
@@ -1774,7 +1948,8 @@ function getWorkspaceSymbolsQueryRootSortKey(
   if (isRelativeSubpath(pathModule, relativeFromDirectory)) {
     return {
       group: 0,
-      distance: relativeFromDirectory.split(pathModule.sep).filter((segment) => segment.length > 0).length,
+      distance: relativeFromDirectory.split(pathModule.sep).filter((segment) => segment.length > 0)
+        .length,
     };
   }
 
@@ -1782,7 +1957,8 @@ function getWorkspaceSymbolsQueryRootSortKey(
   if (isRelativeSubpath(pathModule, relativeFromRoot)) {
     return {
       group: 1,
-      distance: relativeFromRoot.split(pathModule.sep).filter((segment) => segment.length > 0).length,
+      distance: relativeFromRoot.split(pathModule.sep).filter((segment) => segment.length > 0)
+        .length,
     };
   }
 
@@ -1809,6 +1985,21 @@ function getWorkspaceSymbolIdentity(symbol: LspSymbolResult): string {
     symbol.range.end.line,
     symbol.range.end.character,
   ].join(":");
+}
+
+function summarizeWorkspaceSymbolsQueryFailures(
+  pathMapper: LspPathMapper,
+  failures: readonly WorkspaceSymbolsQueryFailure[]
+): string {
+  const failureDetails = failures
+    .slice(0, MAX_WORKSPACE_SYMBOL_FAILURE_DETAILS)
+    .map((failure) => describeWorkspaceSymbolsQueryFailure(pathMapper, failure));
+  const remainingFailureCount = failures.length - failureDetails.length;
+  if (remainingFailureCount <= 0) {
+    return failureDetails.join("; ");
+  }
+
+  return `${failureDetails.join("; ")}; and ${remainingFailureCount} more failing LSP root${remainingFailureCount === 1 ? "" : "s"}`;
 }
 
 function joinWarnings(warnings: Array<string | undefined>): string | undefined {
@@ -1936,8 +2127,15 @@ function getWorkspaceRelativePathDepth(
   candidatePath: string,
   workspaceRuntimePath: string
 ): number {
-  const pathModule = selectPathModule(candidatePath);
-  const relativePath = pathModule.relative(workspaceRuntimePath, candidatePath);
+  return getRelativePathDepth(selectPathModule(candidatePath), workspaceRuntimePath, candidatePath);
+}
+
+function getRelativePathDepth(
+  pathModule: PathModule,
+  basePath: string,
+  candidatePath: string
+): number {
+  const relativePath = pathModule.relative(basePath, candidatePath);
   if (relativePath.length === 0) {
     return 0;
   }
@@ -1947,6 +2145,10 @@ function getWorkspaceRelativePathDepth(
 
 function isGenericLspRootMarker(marker: string | null): boolean {
   return marker === ".git";
+}
+
+function isTypeScriptLspDescriptor(descriptor: LspServerDescriptor): boolean {
+  return descriptor.id === "typescript";
 }
 
 function failForUnsupportedFile(filePath: string): never {

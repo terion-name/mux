@@ -50,7 +50,7 @@ function createRegistry(): readonly LspServerDescriptor[] {
         command: "mux-test-fake-lsp",
         args: ["--stdio"],
       },
-      rootMarkers: ["package.json", ".git"],
+      rootMarkers: ["tsconfig.json", "jsconfig.json", "package.json", ".git"],
       languageIdForPath: () => "typescript",
     },
   ];
@@ -204,8 +204,12 @@ describe("LspManager", () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 
-  test("infers a workspace_symbols server from a directory without opening a file", async () => {
-    const ensureFile = mock(() => Promise.resolve(1));
+  test("warms a representative TypeScript file before directory workspace_symbols queries", async () => {
+    const ensureFileCalls: Array<Parameters<LspClientInstance["ensureFile"]>[0]> = [];
+    const ensureFile = mock((file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+      ensureFileCalls.push(file);
+      return Promise.resolve(1);
+    });
     const queryRequests: Array<Parameters<LspClientInstance["query"]>[0]> = [];
     const clientFactoryOptions: CreateLspClientOptions[] = [];
     const close = mock(() => Promise.resolve(undefined));
@@ -247,12 +251,16 @@ describe("LspManager", () => {
       rootUri: pathToFileURL(workspacePath).href,
       symbols: [],
     });
-    expect(clientFactoryOptions.map((options) => options.rootPath)).toEqual([
-      workspacePath,
-      path.join(workspacePath, "packages", "pkg"),
+    expect(clientFactoryOptions.map((options) => options.rootPath)).toEqual([workspacePath]);
+    expect(ensureFileCalls).toEqual([
+      {
+        runtimePath: path.join(workspacePath, "src", "example.ts"),
+        readablePath: path.join(workspacePath, "src", "example.ts"),
+        uri: pathToFileURL(path.join(workspacePath, "src", "example.ts")).href,
+        languageId: "typescript",
+      },
     ]);
-    expect(ensureFile).toHaveBeenCalledTimes(0);
-    expect(queryRequests).toHaveLength(2);
+    expect(queryRequests).toHaveLength(1);
     for (const request of queryRequests) {
       expect(request).toMatchObject({
         operation: "workspace_symbols",
@@ -262,7 +270,7 @@ describe("LspManager", () => {
     }
 
     await manager.dispose();
-    expect(close).toHaveBeenCalledTimes(2);
+    expect(close).toHaveBeenCalledTimes(1);
   });
 
   test("prefers the deepest matching workspace_symbols root for nested directories", async () => {
@@ -333,73 +341,57 @@ describe("LspManager", () => {
     }
   });
 
-  test("queries mixed-language workspace_symbols roots across the requested directory", async () => {
+  test("returns repo-root TypeScript symbols in mixed-language monorepos", async () => {
     await fs.writeFile(path.join(workspacePath, "go.mod"), "module example.com/mux\n");
     await fs.writeFile(path.join(workspacePath, "Cargo.toml"), "[package]\nname = 'mux'\n");
+    await fs.writeFile(path.join(workspacePath, "packages", "pkg", "tsconfig.json"), "{}\n");
+    await fs.writeFile(
+      path.join(workspacePath, "packages", "pkg", "src", "nested.ts"),
+      "export class ResourceService {}\n"
+    );
     await fs.mkdir(path.join(workspacePath, "services", "api"), { recursive: true });
     await fs.mkdir(path.join(workspacePath, "crates", "core", "src"), { recursive: true });
     await fs.writeFile(path.join(workspacePath, "services", "api", "main.go"), "package api\n");
-    await fs.writeFile(path.join(workspacePath, "crates", "core", "src", "lib.rs"), "pub fn core() {}\n");
+    await fs.writeFile(
+      path.join(workspacePath, "crates", "core", "src", "lib.rs"),
+      "pub fn core() {}\n"
+    );
 
-    const goDescriptor = createManualDescriptor("go", [".go"], "mux-test-go-lsp", ["go.mod", ".git"]);
-    const rustDescriptor = createManualDescriptor("rust", [".rs"], "mux-test-rust-lsp", ["Cargo.toml", ".git"]);
+    const goDescriptor = createManualDescriptor("go", [".go"], "mux-test-go-lsp", [
+      "go.mod",
+      ".git",
+    ]);
+    const rustDescriptor = createManualDescriptor("rust", [".rs"], "mux-test-rust-lsp", [
+      "Cargo.toml",
+      ".git",
+    ]);
     const queryOrder: string[] = [];
+    const warmupPathsByRoot = new Map<string, string[]>();
     const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
       return Promise.resolve({
         isClosed: false,
-        ensureFile: mock(() => Promise.resolve(1)),
+        ensureFile: mock((file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+          const warmedPaths = warmupPathsByRoot.get(options.rootPath) ?? [];
+          warmedPaths.push(file.readablePath);
+          warmupPathsByRoot.set(options.rootPath, warmedPaths);
+          return Promise.resolve(1);
+        }),
         query: mock(() => {
           queryOrder.push(`${options.descriptor.id}:${options.rootPath}`);
-          if (options.descriptor.id === "go") {
+          if (options.rootPath === path.join(workspacePath, "packages", "pkg")) {
             return Promise.resolve({
               operation: "workspace_symbols" as const,
               symbols: [
                 {
-                  name: "HandleGoRequest",
-                  kind: 12,
+                  name: "ResourceService",
+                  kind: 5,
                   location: {
-                    uri: pathToFileURL(path.join(workspacePath, "services", "api", "main.go")).href,
-                    range: {
-                      start: { line: 0, character: 8 },
-                      end: { line: 0, character: 23 },
-                    },
-                  },
-                },
-              ],
-            });
-          }
-
-          if (options.descriptor.id === "rust") {
-            return Promise.resolve({
-              operation: "workspace_symbols" as const,
-              symbols: [
-                {
-                  name: "core",
-                  kind: 12,
-                  location: {
-                    uri: pathToFileURL(path.join(workspacePath, "crates", "core", "src", "lib.rs")).href,
-                    range: {
-                      start: { line: 0, character: 7 },
-                      end: { line: 0, character: 11 },
-                    },
-                  },
-                },
-              ],
-            });
-          }
-
-          if (options.rootPath === workspacePath) {
-            return Promise.resolve({
-              operation: "workspace_symbols" as const,
-              symbols: [
-                {
-                  name: "value",
-                  kind: 14,
-                  location: {
-                    uri: pathToFileURL(path.join(workspacePath, "src", "example.ts")).href,
+                    uri: pathToFileURL(
+                      path.join(workspacePath, "packages", "pkg", "src", "nested.ts")
+                    ).href,
                     range: {
                       start: { line: 0, character: 13 },
-                      end: { line: 0, character: 18 },
+                      end: { line: 0, character: 28 },
                     },
                   },
                 },
@@ -409,19 +401,7 @@ describe("LspManager", () => {
 
           return Promise.resolve({
             operation: "workspace_symbols" as const,
-            symbols: [
-              {
-                name: "nested",
-                kind: 14,
-                location: {
-                  uri: pathToFileURL(path.join(workspacePath, "packages", "pkg", "src", "nested.ts")).href,
-                  range: {
-                    start: { line: 0, character: 13 },
-                    end: { line: 0, character: 19 },
-                  },
-                },
-              },
-            ],
+            symbols: [],
           });
         }),
         close: mock(() => Promise.resolve(undefined)),
@@ -442,19 +422,29 @@ describe("LspManager", () => {
         filePath: ".",
         policyContext: TEST_LSP_POLICY_CONTEXT,
         operation: "workspace_symbols",
-        query: "resource",
+        query: "ResourceService",
       });
 
       expect(result).toMatchObject({
         operation: "workspace_symbols",
         serverId: "typescript",
+        rootUri: pathToFileURL(path.join(workspacePath, "packages", "pkg")).href,
         symbols: [
-          { name: "value", path: path.join(workspacePath, "src", "example.ts") },
-          { name: "HandleGoRequest", path: path.join(workspacePath, "services", "api", "main.go") },
-          { name: "core", path: path.join(workspacePath, "crates", "core", "src", "lib.rs") },
-          { name: "nested", path: path.join(workspacePath, "packages", "pkg", "src", "nested.ts") },
+          {
+            name: "ResourceService",
+            path: path.join(workspacePath, "packages", "pkg", "src", "nested.ts"),
+          },
         ],
       });
+      expect(warmupPathsByRoot).toEqual(
+        new Map([
+          [workspacePath, [path.join(workspacePath, "src", "example.ts")]],
+          [
+            path.join(workspacePath, "packages", "pkg"),
+            [path.join(workspacePath, "packages", "pkg", "src", "nested.ts")],
+          ],
+        ])
+      );
       expect(queryOrder).toEqual([
         `typescript:${workspacePath}`,
         `go:${workspacePath}`,
@@ -467,53 +457,57 @@ describe("LspManager", () => {
     }
   });
 
-  test("returns aggregated workspace_symbols results when some roots fail", async () => {
+  test("ignores package-only TypeScript descendants during workspace_symbols root discovery", async () => {
     await fs.writeFile(path.join(workspacePath, "pyproject.toml"), "[project]\nname = 'mixed'\n");
-    await fs.writeFile(path.join(workspacePath, "go.mod"), "module example.com/mux\n");
+    await fs.mkdir(path.join(workspacePath, "packages", "other", "src"), { recursive: true });
+    await fs.mkdir(path.join(workspacePath, "packages", "project", "src"), { recursive: true });
+    await fs.writeFile(path.join(workspacePath, "packages", "other", "package.json"), "{}\n");
+    await fs.writeFile(
+      path.join(workspacePath, "packages", "other", "src", "other.ts"),
+      "export const other = 1;\n"
+    );
+    await fs.writeFile(path.join(workspacePath, "packages", "project", "package.json"), "{}\n");
+    await fs.writeFile(path.join(workspacePath, "packages", "project", "tsconfig.json"), "{}\n");
+    await fs.writeFile(
+      path.join(workspacePath, "packages", "project", "src", "project.ts"),
+      "export class ProjectResource {}\n"
+    );
     await fs.writeFile(
       path.join(workspacePath, "resource.py"),
       "class ResourceService:\n    pass\n"
     );
 
-    const pythonDescriptor = createManualDescriptor(
-      "python",
-      [".py"],
-      "mux-test-python-lsp",
-      ["pyproject.toml", ".git"]
-    );
-    const goDescriptor = createManualDescriptor("go", [".go"], "mux-test-go-lsp", ["go.mod", ".git"]);
+    const pythonDescriptor = createManualDescriptor("python", [".py"], "mux-test-python-lsp", [
+      "pyproject.toml",
+      ".git",
+    ]);
+    const queryOrder: string[] = [];
     const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
       return Promise.resolve({
         isClosed: false,
         ensureFile: mock(() => Promise.resolve(1)),
         query: mock(() => {
+          queryOrder.push(`${options.descriptor.id}:${options.rootPath}`);
           if (options.descriptor.id === "typescript") {
             throw new Error("No Project");
           }
 
-          if (options.descriptor.id === "python") {
-            return Promise.resolve({
-              operation: "workspace_symbols" as const,
-              symbols: [
-                {
-                  name: "ResourceService",
-                  kind: 5,
-                  containerName: "resource",
-                  location: {
-                    uri: pathToFileURL(path.join(workspacePath, "resource.py")).href,
-                    range: {
-                      start: { line: 0, character: 6 },
-                      end: { line: 0, character: 21 },
-                    },
-                  },
-                },
-              ],
-            });
-          }
-
           return Promise.resolve({
             operation: "workspace_symbols" as const,
-            symbols: [],
+            symbols: [
+              {
+                name: "ResourceService",
+                kind: 5,
+                containerName: "resource",
+                location: {
+                  uri: pathToFileURL(path.join(workspacePath, "resource.py")).href,
+                  range: {
+                    start: { line: 0, character: 6 },
+                    end: { line: 0, character: 21 },
+                  },
+                },
+              },
+            ],
           });
         }),
         close: mock(() => Promise.resolve(undefined)),
@@ -521,7 +515,7 @@ describe("LspManager", () => {
     });
 
     const manager = new LspManager({
-      registry: [...createRegistry(), pythonDescriptor, goDescriptor],
+      registry: [...createRegistry(), pythonDescriptor],
       clientFactory,
     });
     const runtime = new LocalRuntime(workspacePath);
@@ -548,9 +542,99 @@ describe("LspManager", () => {
           },
         ],
       });
+      expect(queryOrder).toEqual([
+        `typescript:${workspacePath}`,
+        `python:${workspacePath}`,
+        `typescript:${path.join(workspacePath, "packages", "project")}`,
+      ]);
       expect(result.warning).toContain("Skipped 2 failing LSP roots");
       expect(result.warning).toContain("typescript (package.json) at .: No Project");
-      expect(result.warning).toContain("typescript (package.json) at packages/pkg: No Project");
+      expect(result.warning).toContain(
+        "typescript (tsconfig.json) at packages/project: No Project"
+      );
+      expect(result.warning).not.toContain("packages/pkg");
+      expect(result.warning).not.toContain("packages/other");
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  test("summarizes workspace_symbols warnings when many descendant roots fail", async () => {
+    await fs.writeFile(path.join(workspacePath, "pyproject.toml"), "[project]\nname = 'mixed'\n");
+    for (const projectName of ["proj-a", "proj-b", "proj-c", "proj-d"]) {
+      await fs.mkdir(path.join(workspacePath, "packages", projectName, "src"), { recursive: true });
+      await fs.writeFile(path.join(workspacePath, "packages", projectName, "package.json"), "{}\n");
+      await fs.writeFile(
+        path.join(workspacePath, "packages", projectName, "tsconfig.json"),
+        "{}\n"
+      );
+      await fs.writeFile(
+        path.join(workspacePath, "packages", projectName, "src", `${projectName}.ts`),
+        `export const ${projectName.replace(/-/g, "_")} = 1;\n`
+      );
+    }
+    await fs.writeFile(
+      path.join(workspacePath, "resource.py"),
+      "class ResourceService:\n    pass\n"
+    );
+
+    const pythonDescriptor = createManualDescriptor("python", [".py"], "mux-test-python-lsp", [
+      "pyproject.toml",
+      ".git",
+    ]);
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile: mock(() => Promise.resolve(1)),
+        query: mock(() => {
+          if (options.descriptor.id === "typescript") {
+            throw new Error("No Project");
+          }
+
+          return Promise.resolve({
+            operation: "workspace_symbols" as const,
+            symbols: [
+              {
+                name: "ResourceService",
+                kind: 5,
+                location: {
+                  uri: pathToFileURL(path.join(workspacePath, "resource.py")).href,
+                  range: {
+                    start: { line: 0, character: 6 },
+                    end: { line: 0, character: 21 },
+                  },
+                },
+              },
+            ],
+          });
+        }),
+        close: mock(() => Promise.resolve(undefined)),
+      });
+    });
+
+    const manager = new LspManager({
+      registry: [...createRegistry(), pythonDescriptor],
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    try {
+      const result = await manager.query({
+        workspaceId: "ws-1",
+        runtime,
+        workspacePath,
+        filePath: ".",
+        policyContext: TEST_LSP_POLICY_CONTEXT,
+        operation: "workspace_symbols",
+        query: "ResourceService",
+      });
+
+      expect(result.warning).toContain("Skipped 5 failing LSP roots");
+      expect(result.warning).toContain("typescript (package.json) at .: No Project");
+      expect(result.warning).toContain("typescript (tsconfig.json) at packages/proj-a: No Project");
+      expect(result.warning).toContain("typescript (tsconfig.json) at packages/proj-b: No Project");
+      expect(result.warning).toContain("and 2 more failing LSP roots");
+      expect(result.warning).not.toContain("packages/proj-d");
     } finally {
       await manager.dispose();
     }
@@ -559,12 +643,10 @@ describe("LspManager", () => {
   test("returns an empty workspace_symbols result when every queried root succeeds without symbols", async () => {
     await fs.writeFile(path.join(workspacePath, "pyproject.toml"), "[project]\nname = 'mixed'\n");
 
-    const pythonDescriptor = createManualDescriptor(
-      "python",
-      [".py"],
-      "mux-test-python-lsp",
-      ["pyproject.toml", ".git"]
-    );
+    const pythonDescriptor = createManualDescriptor("python", [".py"], "mux-test-python-lsp", [
+      "pyproject.toml",
+      ".git",
+    ]);
     const clientFactory = mock((_options: CreateLspClientOptions): Promise<LspClientInstance> => {
       return Promise.resolve({
         isClosed: false,
@@ -602,7 +684,7 @@ describe("LspManager", () => {
         rootUri: pathToFileURL(workspacePath).href,
         symbols: [],
       });
-      expect(clientFactory).toHaveBeenCalledTimes(3);
+      expect(clientFactory).toHaveBeenCalledTimes(2);
     } finally {
       await manager.dispose();
     }
@@ -611,12 +693,10 @@ describe("LspManager", () => {
   test("fails workspace_symbols directory inference when every queried root errors", async () => {
     await fs.writeFile(path.join(workspacePath, "pyproject.toml"), "[project]\nname = 'mixed'\n");
 
-    const pythonDescriptor = createManualDescriptor(
-      "python",
-      [".py"],
-      "mux-test-python-lsp",
-      ["pyproject.toml", ".git"]
-    );
+    const pythonDescriptor = createManualDescriptor("python", [".py"], "mux-test-python-lsp", [
+      "pyproject.toml",
+      ".git",
+    ]);
     const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
       return Promise.resolve({
         isClosed: false,
@@ -651,9 +731,9 @@ describe("LspManager", () => {
           query: "ResourceService",
         })
       ).rejects.toThrow(
-        "workspace_symbols directory search failed for .; attempted roots: typescript (package.json) at .: tsserver unavailable; python (pyproject.toml) at .: No Project; typescript (package.json) at packages/pkg: tsserver unavailable. Provide a representative source file path if you need to force a specific language server."
+        "workspace_symbols directory search failed for .; attempted roots: typescript (package.json) at .: tsserver unavailable; python (pyproject.toml) at .: No Project. Provide a representative source file path if you need to force a specific language server."
       );
-      expect(clientFactory).toHaveBeenCalledTimes(3);
+      expect(clientFactory).toHaveBeenCalledTimes(2);
     } finally {
       await manager.dispose();
     }
