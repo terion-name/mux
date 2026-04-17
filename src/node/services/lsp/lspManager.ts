@@ -1124,14 +1124,25 @@ export class LspManager {
     // otherwise tsserver can warm an unrelated shallow file and never load the target project graph.
     const pathModule = selectPathModule(searchPath);
     const queryTokens = getWorkspaceSymbolsQueryTokens(query);
-    const representativePath = representativeFileResult.stdout
+    const candidatePaths = representativeFileResult.stdout
       .split("\u0000")
       .map((candidatePath) => candidatePath.trim())
       .filter((candidatePath) => candidatePath.length > 0)
       .sort((left, right) =>
         compareWorkspaceSymbolsRepresentativePaths(pathModule, searchPath, left, right, queryTokens)
-      )[0];
-    return representativePath || undefined;
+      );
+    const exactQueryIdentifier = getExactWorkspaceSymbolsQueryIdentifier(query);
+    if (exactQueryIdentifier) {
+      for (const candidatePath of candidatePaths) {
+        if (
+          await fileContainsExactWorkspaceSymbolsQuery(runtime, candidatePath, exactQueryIdentifier)
+        ) {
+          return candidatePath;
+        }
+      }
+    }
+
+    return candidatePaths[0] || undefined;
   }
 
   private async findDescendantMarkerPaths(
@@ -2066,6 +2077,8 @@ function compareWorkspaceSymbolsRepresentativePaths(
     queryTokens
   );
   return (
+    rightSortKey.exactBasenameMatches - leftSortKey.exactBasenameMatches ||
+    rightSortKey.exactPathMatches - leftSortKey.exactPathMatches ||
     rightSortKey.basenameMatches - leftSortKey.basenameMatches ||
     rightSortKey.pathMatches - leftSortKey.pathMatches ||
     leftSortKey.depth - rightSortKey.depth ||
@@ -2079,13 +2092,19 @@ function getWorkspaceSymbolsRepresentativePathSortKey(
   candidatePath: string,
   queryTokens: readonly string[]
 ): {
+  exactBasenameMatches: number;
+  exactPathMatches: number;
   basenameMatches: number;
   pathMatches: number;
   depth: number;
 } {
   const relativePath = pathModule.relative(searchPath, candidatePath).toLowerCase();
   const basename = pathModule.basename(candidatePath).toLowerCase();
+  const basenameTokens = getWorkspaceSymbolsCandidateTokens(basename);
+  const pathTokens = getWorkspaceSymbolsCandidateTokens(relativePath);
   return {
+    exactBasenameMatches: countWorkspaceSymbolsExactTokenMatches(queryTokens, basenameTokens),
+    exactPathMatches: countWorkspaceSymbolsExactTokenMatches(queryTokens, pathTokens),
     basenameMatches: queryTokens.filter((token) => basename.includes(token)).length,
     pathMatches: queryTokens.filter((token) => relativePath.includes(token)).length,
     depth: getRelativePathDepth(pathModule, searchPath, candidatePath),
@@ -2117,6 +2136,56 @@ function getWorkspaceSymbolsQueryTokens(query: string | undefined): string[] {
 
 function splitWorkspaceSymbolsQuerySegment(segment: string): string[] {
   return segment.match(/[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+/g) ?? [];
+}
+
+function getWorkspaceSymbolsCandidateTokens(value: string): string[] {
+  const tokens = new Set<string>();
+  for (const segment of value.split(/[^A-Za-z0-9]+/)) {
+    for (const token of splitWorkspaceSymbolsQuerySegment(segment)) {
+      const normalizedToken = token.toLowerCase();
+      if (normalizedToken.length > 1) {
+        tokens.add(normalizedToken);
+      }
+    }
+  }
+
+  return [...tokens];
+}
+
+function countWorkspaceSymbolsExactTokenMatches(
+  queryTokens: readonly string[],
+  candidateTokens: readonly string[]
+): number {
+  const candidateTokenSet = new Set(candidateTokens);
+  return queryTokens.filter((token) => candidateTokenSet.has(token)).length;
+}
+
+function getExactWorkspaceSymbolsQueryIdentifier(query: string | undefined): string | undefined {
+  const normalizedQuery = normalizeWorkspaceSymbolsIdentifier(query);
+  return normalizedQuery.length > 1 ? normalizedQuery : undefined;
+}
+
+async function fileContainsExactWorkspaceSymbolsQuery(
+  runtime: Runtime,
+  filePath: string,
+  exactQueryIdentifier: string
+): Promise<boolean> {
+  try {
+    const contents = await readFileString(runtime, filePath);
+    return (
+      contents
+        .match(/[A-Za-z_][A-Za-z0-9_]*/g)
+        ?.some(
+          (identifier) => normalizeWorkspaceSymbolsIdentifier(identifier) === exactQueryIdentifier
+        ) ?? false
+    );
+  } catch {
+    return false;
+  }
+}
+
+function normalizeWorkspaceSymbolsIdentifier(value: string | undefined): string {
+  return value?.toLowerCase().replace(/[^a-z0-9]+/g, "") ?? "";
 }
 
 function getWorkspaceSymbolIdentity(symbol: LspSymbolResult): string {

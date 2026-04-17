@@ -499,6 +499,124 @@ describe("LspManager", () => {
     }
   });
 
+  test("prefers repo-root TypeScript files whose contents exactly match the queried symbol", async () => {
+    await fs.rm(path.join(workspacePath, "src"), { recursive: true, force: true });
+
+    const rootResourcePath = path.join(
+      workspacePath,
+      "web",
+      "packages",
+      "teleport",
+      "src",
+      "services",
+      "resources",
+      "resource.ts"
+    );
+    const misleadingPluralPath = path.join(
+      workspacePath,
+      "web",
+      "packages",
+      "teleterm",
+      "src",
+      "services",
+      "resources",
+      "resources-service.test.ts"
+    );
+    await fs.mkdir(path.dirname(rootResourcePath), { recursive: true });
+    await fs.mkdir(path.dirname(misleadingPluralPath), { recursive: true });
+    await fs.writeFile(
+      path.join(workspacePath, "tsconfig.json"),
+      JSON.stringify({ include: ["web/**/*.ts"] }, null, 2) + "\n"
+    );
+    await fs.writeFile(rootResourcePath, "export class ResourceService {}\n");
+    await fs.writeFile(misleadingPluralPath, "export class ResourcesService {}\n");
+
+    const warmupPathsByRoot = new Map<string, string[]>();
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile: mock((file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+          const warmedPaths = warmupPathsByRoot.get(options.rootPath) ?? [];
+          warmedPaths.push(file.readablePath);
+          warmupPathsByRoot.set(options.rootPath, warmedPaths);
+          return Promise.resolve(1);
+        }),
+        query: mock(() => {
+          const warmedPath = warmupPathsByRoot.get(options.rootPath)?.at(-1);
+          if (warmedPath === rootResourcePath) {
+            return Promise.resolve({
+              operation: "workspace_symbols" as const,
+              symbols: [
+                {
+                  name: "ResourceService",
+                  kind: 5,
+                  location: {
+                    uri: pathToFileURL(rootResourcePath).href,
+                    range: {
+                      start: { line: 0, character: 13 },
+                      end: { line: 0, character: 28 },
+                    },
+                  },
+                },
+              ],
+            });
+          }
+
+          return Promise.resolve({
+            operation: "workspace_symbols" as const,
+            symbols: [
+              {
+                name: "ResourcesService",
+                kind: 5,
+                location: {
+                  uri: pathToFileURL(misleadingPluralPath).href,
+                  range: {
+                    start: { line: 0, character: 13 },
+                    end: { line: 0, character: 29 },
+                  },
+                },
+              },
+            ],
+          });
+        }),
+        close: mock(() => Promise.resolve(undefined)),
+      });
+    });
+
+    const manager = new LspManager({
+      registry: createRegistry(),
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    try {
+      const result = await manager.query({
+        workspaceId: "ws-1",
+        runtime,
+        workspacePath,
+        filePath: ".",
+        policyContext: TEST_LSP_POLICY_CONTEXT,
+        operation: "workspace_symbols",
+        query: "ResourceService",
+      });
+
+      expect(result).toMatchObject({
+        operation: "workspace_symbols",
+        serverId: "typescript",
+        rootUri: pathToFileURL(workspacePath).href,
+        symbols: [
+          {
+            name: "ResourceService",
+            path: rootResourcePath,
+          },
+        ],
+      });
+      expect(warmupPathsByRoot).toEqual(new Map([[workspacePath, [rootResourcePath]]]));
+    } finally {
+      await manager.dispose();
+    }
+  });
+
   test("prefers the deepest matching workspace_symbols root for nested directories", async () => {
     const pythonWorkspacePath = path.join(workspacePath, "services", "python");
     await fs.mkdir(pythonWorkspacePath, { recursive: true });
