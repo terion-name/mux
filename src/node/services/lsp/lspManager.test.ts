@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { WorkspaceLspDiagnosticsSnapshot } from "@/common/orpc/types";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
@@ -53,6 +54,25 @@ function createRegistry(): readonly LspServerDescriptor[] {
       languageIdForPath: () => "typescript",
     },
   ];
+}
+
+function createManualDescriptor(
+  id: string,
+  extensions: readonly string[],
+  command: string,
+  rootMarkers: readonly string[]
+): LspServerDescriptor {
+  return {
+    id,
+    extensions,
+    launch: {
+      type: "manual",
+      command,
+      args: ["--stdio"],
+    },
+    rootMarkers,
+    languageIdForPath: () => id,
+  };
 }
 
 class CountingLocalRuntime extends LocalRuntime {
@@ -186,16 +206,16 @@ describe("LspManager", () => {
 
   test("infers a workspace_symbols server from a directory without opening a file", async () => {
     const ensureFile = mock(() => Promise.resolve(1));
-    let lastQueryRequest: Parameters<LspClientInstance["query"]>[0] | undefined;
-    let clientFactoryOptions: CreateLspClientOptions | undefined;
+    const queryRequests: Array<Parameters<LspClientInstance["query"]>[0]> = [];
+    const clientFactoryOptions: CreateLspClientOptions[] = [];
     const close = mock(() => Promise.resolve(undefined));
     const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
-      clientFactoryOptions = options;
+      clientFactoryOptions.push(options);
       return Promise.resolve({
         isClosed: false,
         ensureFile,
         query: mock((request: Parameters<LspClientInstance["query"]>[0]) => {
-          lastQueryRequest = request;
+          queryRequests.push(request);
           return Promise.resolve({
             operation: "workspace_symbols" as const,
             symbols: [],
@@ -221,26 +241,28 @@ describe("LspManager", () => {
       query: "ResourceService",
     });
 
-    expect(clientFactoryOptions).toBeDefined();
-    if (!clientFactoryOptions) {
-      throw new Error("Expected the LSP client factory to receive a call");
-    }
     expect(result).toEqual({
       operation: "workspace_symbols",
       serverId: "typescript",
-      rootUri: clientFactoryOptions.rootUri,
+      rootUri: pathToFileURL(workspacePath).href,
       symbols: [],
     });
-    expect(clientFactoryOptions.rootPath).toBe(workspacePath);
+    expect(clientFactoryOptions.map((options) => options.rootPath)).toEqual([
+      workspacePath,
+      path.join(workspacePath, "packages", "pkg"),
+    ]);
     expect(ensureFile).toHaveBeenCalledTimes(0);
-    expect(lastQueryRequest).toMatchObject({
-      operation: "workspace_symbols",
-      query: "ResourceService",
-    });
-    expect(lastQueryRequest?.file).toBeUndefined();
+    expect(queryRequests).toHaveLength(2);
+    for (const request of queryRequests) {
+      expect(request).toMatchObject({
+        operation: "workspace_symbols",
+        query: "ResourceService",
+      });
+      expect(request.file).toBeUndefined();
+    }
 
     await manager.dispose();
-    expect(close).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledTimes(2);
   });
 
   test("prefers the deepest matching workspace_symbols root for nested directories", async () => {
@@ -311,22 +333,250 @@ describe("LspManager", () => {
     }
   });
 
-  test("fails workspace_symbols directory inference when multiple LSP roots match", async () => {
+  test("queries mixed-language workspace_symbols roots across the requested directory", async () => {
+    await fs.writeFile(path.join(workspacePath, "go.mod"), "module example.com/mux\n");
+    await fs.writeFile(path.join(workspacePath, "Cargo.toml"), "[package]\nname = 'mux'\n");
+    await fs.mkdir(path.join(workspacePath, "services", "api"), { recursive: true });
+    await fs.mkdir(path.join(workspacePath, "crates", "core", "src"), { recursive: true });
+    await fs.writeFile(path.join(workspacePath, "services", "api", "main.go"), "package api\n");
+    await fs.writeFile(path.join(workspacePath, "crates", "core", "src", "lib.rs"), "pub fn core() {}\n");
+
+    const goDescriptor = createManualDescriptor("go", [".go"], "mux-test-go-lsp", ["go.mod", ".git"]);
+    const rustDescriptor = createManualDescriptor("rust", [".rs"], "mux-test-rust-lsp", ["Cargo.toml", ".git"]);
+    const queryOrder: string[] = [];
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile: mock(() => Promise.resolve(1)),
+        query: mock(() => {
+          queryOrder.push(`${options.descriptor.id}:${options.rootPath}`);
+          if (options.descriptor.id === "go") {
+            return Promise.resolve({
+              operation: "workspace_symbols" as const,
+              symbols: [
+                {
+                  name: "HandleGoRequest",
+                  kind: 12,
+                  location: {
+                    uri: pathToFileURL(path.join(workspacePath, "services", "api", "main.go")).href,
+                    range: {
+                      start: { line: 0, character: 8 },
+                      end: { line: 0, character: 23 },
+                    },
+                  },
+                },
+              ],
+            });
+          }
+
+          if (options.descriptor.id === "rust") {
+            return Promise.resolve({
+              operation: "workspace_symbols" as const,
+              symbols: [
+                {
+                  name: "core",
+                  kind: 12,
+                  location: {
+                    uri: pathToFileURL(path.join(workspacePath, "crates", "core", "src", "lib.rs")).href,
+                    range: {
+                      start: { line: 0, character: 7 },
+                      end: { line: 0, character: 11 },
+                    },
+                  },
+                },
+              ],
+            });
+          }
+
+          if (options.rootPath === workspacePath) {
+            return Promise.resolve({
+              operation: "workspace_symbols" as const,
+              symbols: [
+                {
+                  name: "value",
+                  kind: 14,
+                  location: {
+                    uri: pathToFileURL(path.join(workspacePath, "src", "example.ts")).href,
+                    range: {
+                      start: { line: 0, character: 13 },
+                      end: { line: 0, character: 18 },
+                    },
+                  },
+                },
+              ],
+            });
+          }
+
+          return Promise.resolve({
+            operation: "workspace_symbols" as const,
+            symbols: [
+              {
+                name: "nested",
+                kind: 14,
+                location: {
+                  uri: pathToFileURL(path.join(workspacePath, "packages", "pkg", "src", "nested.ts")).href,
+                  range: {
+                    start: { line: 0, character: 13 },
+                    end: { line: 0, character: 19 },
+                  },
+                },
+              },
+            ],
+          });
+        }),
+        close: mock(() => Promise.resolve(undefined)),
+      });
+    });
+
+    const manager = new LspManager({
+      registry: [...createRegistry(), goDescriptor, rustDescriptor],
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    try {
+      const result = await manager.query({
+        workspaceId: "ws-1",
+        runtime,
+        workspacePath,
+        filePath: ".",
+        policyContext: TEST_LSP_POLICY_CONTEXT,
+        operation: "workspace_symbols",
+        query: "resource",
+      });
+
+      expect(result).toMatchObject({
+        operation: "workspace_symbols",
+        serverId: "typescript",
+        symbols: [
+          { name: "value", path: path.join(workspacePath, "src", "example.ts") },
+          { name: "HandleGoRequest", path: path.join(workspacePath, "services", "api", "main.go") },
+          { name: "core", path: path.join(workspacePath, "crates", "core", "src", "lib.rs") },
+          { name: "nested", path: path.join(workspacePath, "packages", "pkg", "src", "nested.ts") },
+        ],
+      });
+      expect(queryOrder).toEqual([
+        `typescript:${workspacePath}`,
+        `go:${workspacePath}`,
+        `rust:${workspacePath}`,
+        `typescript:${path.join(workspacePath, "packages", "pkg")}`,
+      ]);
+      expect(clientFactory).toHaveBeenCalledTimes(4);
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  test("returns aggregated workspace_symbols results when some roots fail", async () => {
+    await fs.writeFile(path.join(workspacePath, "pyproject.toml"), "[project]\nname = 'mixed'\n");
+    await fs.writeFile(path.join(workspacePath, "go.mod"), "module example.com/mux\n");
+    await fs.writeFile(
+      path.join(workspacePath, "resource.py"),
+      "class ResourceService:\n    pass\n"
+    );
+
+    const pythonDescriptor = createManualDescriptor(
+      "python",
+      [".py"],
+      "mux-test-python-lsp",
+      ["pyproject.toml", ".git"]
+    );
+    const goDescriptor = createManualDescriptor("go", [".go"], "mux-test-go-lsp", ["go.mod", ".git"]);
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile: mock(() => Promise.resolve(1)),
+        query: mock(() => {
+          if (options.descriptor.id === "typescript") {
+            throw new Error("No Project");
+          }
+
+          if (options.descriptor.id === "python") {
+            return Promise.resolve({
+              operation: "workspace_symbols" as const,
+              symbols: [
+                {
+                  name: "ResourceService",
+                  kind: 5,
+                  containerName: "resource",
+                  location: {
+                    uri: pathToFileURL(path.join(workspacePath, "resource.py")).href,
+                    range: {
+                      start: { line: 0, character: 6 },
+                      end: { line: 0, character: 21 },
+                    },
+                  },
+                },
+              ],
+            });
+          }
+
+          return Promise.resolve({
+            operation: "workspace_symbols" as const,
+            symbols: [],
+          });
+        }),
+        close: mock(() => Promise.resolve(undefined)),
+      });
+    });
+
+    const manager = new LspManager({
+      registry: [...createRegistry(), pythonDescriptor, goDescriptor],
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    try {
+      const result = await manager.query({
+        workspaceId: "ws-1",
+        runtime,
+        workspacePath,
+        filePath: ".",
+        policyContext: TEST_LSP_POLICY_CONTEXT,
+        operation: "workspace_symbols",
+        query: "ResourceService",
+      });
+
+      expect(result).toMatchObject({
+        operation: "workspace_symbols",
+        serverId: "python",
+        symbols: [
+          {
+            name: "ResourceService",
+            path: path.join(workspacePath, "resource.py"),
+            containerName: "resource",
+          },
+        ],
+      });
+      expect(result.warning).toContain("Skipped 2 failing LSP roots");
+      expect(result.warning).toContain("typescript (package.json) at .: No Project");
+      expect(result.warning).toContain("typescript (package.json) at packages/pkg: No Project");
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  test("returns an empty workspace_symbols result when every queried root succeeds without symbols", async () => {
     await fs.writeFile(path.join(workspacePath, "pyproject.toml"), "[project]\nname = 'mixed'\n");
 
-    const pythonDescriptor: LspServerDescriptor = {
-      id: "python",
-      extensions: [".py"],
-      launch: {
-        type: "manual",
-        command: "mux-test-python-lsp",
-        args: ["--stdio"],
-      },
-      rootMarkers: ["pyproject.toml", ".git"],
-      languageIdForPath: () => "python",
-    };
+    const pythonDescriptor = createManualDescriptor(
+      "python",
+      [".py"],
+      "mux-test-python-lsp",
+      ["pyproject.toml", ".git"]
+    );
     const clientFactory = mock((_options: CreateLspClientOptions): Promise<LspClientInstance> => {
-      throw new Error("workspace_symbols should fail before starting a client");
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile: mock(() => Promise.resolve(1)),
+        query: mock(() =>
+          Promise.resolve({
+            operation: "workspace_symbols" as const,
+            symbols: [],
+          })
+        ),
+        close: mock(() => Promise.resolve(undefined)),
+      });
     });
 
     const manager = new LspManager({
@@ -336,27 +586,74 @@ describe("LspManager", () => {
     const runtime = new LocalRuntime(workspacePath);
 
     try {
-      try {
-        await manager.query({
+      const result = await manager.query({
+        workspaceId: "ws-1",
+        runtime,
+        workspacePath,
+        filePath: ".",
+        policyContext: TEST_LSP_POLICY_CONTEXT,
+        operation: "workspace_symbols",
+        query: "ResourceService",
+      });
+
+      expect(result).toEqual({
+        operation: "workspace_symbols",
+        serverId: "typescript",
+        rootUri: pathToFileURL(workspacePath).href,
+        symbols: [],
+      });
+      expect(clientFactory).toHaveBeenCalledTimes(3);
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  test("fails workspace_symbols directory inference when every queried root errors", async () => {
+    await fs.writeFile(path.join(workspacePath, "pyproject.toml"), "[project]\nname = 'mixed'\n");
+
+    const pythonDescriptor = createManualDescriptor(
+      "python",
+      [".py"],
+      "mux-test-python-lsp",
+      ["pyproject.toml", ".git"]
+    );
+    const clientFactory = mock((options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      return Promise.resolve({
+        isClosed: false,
+        ensureFile: mock(() => Promise.resolve(1)),
+        query: mock(() => {
+          if (options.descriptor.id === "typescript") {
+            throw new Error("tsserver unavailable");
+          }
+
+          throw new Error("No Project");
+        }),
+        close: mock(() => Promise.resolve(undefined)),
+      });
+    });
+
+    const manager = new LspManager({
+      registry: [...createRegistry(), pythonDescriptor],
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    try {
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
+      await expect(
+        manager.query({
           workspaceId: "ws-1",
           runtime,
           workspacePath,
-          filePath: "./",
+          filePath: ".",
           policyContext: TEST_LSP_POLICY_CONTEXT,
           operation: "workspace_symbols",
           query: "ResourceService",
-        });
-        throw new Error("Expected workspace_symbols directory inference to fail");
-      } catch (error) {
-        expect(error).toBeInstanceOf(Error);
-        if (!(error instanceof Error)) {
-          throw error;
-        }
-        expect(error.message).toBe(
-          "Directory ./ is ambiguous for workspace_symbols; matching LSP servers: typescript (package.json), python (pyproject.toml). Provide a representative source file path to select the intended language server."
-        );
-      }
-      expect(clientFactory).toHaveBeenCalledTimes(0);
+        })
+      ).rejects.toThrow(
+        "workspace_symbols directory search failed for .; attempted roots: typescript (package.json) at .: tsserver unavailable; python (pyproject.toml) at .: No Project; typescript (package.json) at packages/pkg: tsserver unavailable. Provide a representative source file path if you need to force a specific language server."
+      );
+      expect(clientFactory).toHaveBeenCalledTimes(3);
     } finally {
       await manager.dispose();
     }

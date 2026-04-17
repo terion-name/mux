@@ -59,6 +59,51 @@ describe("lsp_query tool", () => {
     }
   });
 
+  test("resolves path . to the workspace directory for workspace_symbols queries", async () => {
+    const lspManager = new LspManager({ registry: [] });
+    const query = mock(() =>
+      Promise.resolve({
+        operation: "workspace_symbols" as const,
+        serverId: "typescript",
+        rootUri: `file://${process.cwd()}`,
+        symbols: [],
+      })
+    );
+    lspManager.query = query;
+    const config = createTestToolConfig(process.cwd());
+    config.lspManager = lspManager;
+    config.lspPolicyContext = TEST_LSP_POLICY_CONTEXT;
+    const tool = createLspQueryTool(config);
+
+    try {
+      const result = (await tool.execute!(
+        {
+          operation: "workspace_symbols",
+          path: ".",
+          query: "ResourceService",
+        },
+        mockToolCallOptions
+      )) as LspQueryToolResult;
+
+      expect(result).toEqual({
+        success: true,
+        operation: "workspace_symbols",
+        serverId: "typescript",
+        rootUri: `file://${process.cwd()}`,
+        symbols: [],
+      });
+      expect(query).toHaveBeenCalledWith(
+        expect.objectContaining({
+          filePath: process.cwd(),
+          operation: "workspace_symbols",
+          query: "ResourceService",
+        })
+      );
+    } finally {
+      await lspManager.dispose();
+    }
+  });
+
   test("validates required position arguments for hover-like operations", async () => {
     const config = createTestToolConfig(process.cwd());
     const lspManager = new LspManager({ registry: [] });

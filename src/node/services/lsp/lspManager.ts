@@ -1,15 +1,17 @@
 import * as path from "node:path";
-import { readFileString } from "@/node/utils/runtime/helpers";
+import { execBuffered, readFileString } from "@/node/utils/runtime/helpers";
 import {
   LSP_DIAGNOSTICS_POLL_INTERVAL_MS,
   LSP_IDLE_CHECK_INTERVAL_MS,
   LSP_IDLE_TIMEOUT_MS,
   LSP_MAX_LOCATIONS,
   LSP_MAX_SYMBOLS,
+  LSP_MAX_WORKSPACE_SYMBOL_QUERY_ROOTS,
   LSP_POST_MUTATION_DIAGNOSTICS_TIMEOUT_MS,
   LSP_PREVIEW_CONTEXT_LINES,
 } from "@/constants/lsp";
 import type { Runtime } from "@/node/runtime/Runtime";
+import { shellQuote } from "@/common/utils/shell";
 import type { WorkspaceLspDiagnosticsSnapshot } from "@/common/orpc/types";
 import { log } from "@/node/services/log";
 import { LspClient } from "./lspClient";
@@ -31,6 +33,7 @@ import type {
   LspRange,
   LspServerDescriptor,
   LspSymbolInformation,
+  LspSymbolResult,
   ResolvedLspLaunchPlan,
 } from "./types";
 
@@ -55,6 +58,27 @@ interface ResolvedRootMatch {
   rootPath: string;
   matchedMarker: string | null;
 }
+
+interface ResolvedDirectoryDescriptorMatch {
+  descriptor: LspServerDescriptor;
+  rootPath: string;
+  matchedMarker: string | null;
+}
+
+interface WorkspaceSymbolsQueryRootDiscovery {
+  matches: ResolvedDirectoryDescriptorMatch[];
+  truncated: boolean;
+}
+
+interface WorkspaceSymbolsQueryFailure {
+  match: ResolvedDirectoryDescriptorMatch;
+  reason: string;
+}
+
+type ResolvedDirectoryDescriptorSelection =
+  | { kind: "none" }
+  | { kind: "selected"; match: ResolvedDirectoryDescriptorMatch }
+  | { kind: "ambiguous"; matches: ResolvedDirectoryDescriptorMatch[] };
 
 interface LspTrackedFileRefreshEntry {
   filePath: string;
@@ -208,6 +232,12 @@ export class LspManager {
     this.acquireLease(options.workspaceId);
 
     try {
+      const directoryWorkspaceSymbolsResult =
+        await this.queryWorkspaceSymbolsForDirectory(options);
+      if (directoryWorkspaceSymbolsResult) {
+        return directoryWorkspaceSymbolsResult;
+      }
+
       const context = await this.resolveClientContext(options);
       if (context.fileHandle && shouldTrackQueryFile(options.operation)) {
         await context.client.ensureFile(context.fileHandle);
@@ -772,12 +802,239 @@ export class LspManager {
     };
   }
 
-  private async inferDescriptorForDirectory(
+  private async queryWorkspaceSymbolsForDirectory(
+    options: LspManagerQueryOptions
+  ): Promise<LspManagerQueryResult | undefined> {
+    if (options.operation !== "workspace_symbols") {
+      return undefined;
+    }
+
+    const pathMapper = new LspPathMapper({
+      runtime: options.runtime,
+      workspacePath: options.workspacePath,
+    });
+    const runtimeFilePath = pathMapper.toRuntimePath(options.filePath ?? "");
+    if (!pathMapper.isWithinWorkspace(runtimeFilePath)) {
+      throw new Error(`LSP paths must stay inside the workspace (got ${options.filePath})`);
+    }
+
+    const runtimePathStat = await statOrNull(options.runtime, runtimeFilePath);
+    if (runtimePathStat?.isDirectory !== true) {
+      return undefined;
+    }
+
+    const workspaceRuntimePath = pathMapper.getWorkspaceRuntimePath();
+    const queryRootDiscovery = await this.discoverWorkspaceSymbolsQueryRoots(
+      options.runtime,
+      runtimeFilePath,
+      workspaceRuntimePath
+    );
+    if (queryRootDiscovery.matches.length === 0) {
+      throw new Error(
+        `Could not infer a built-in LSP server for directory ${options.filePath}. Provide a representative source file path or use a directory with a language-specific project marker.`
+      );
+    }
+
+    const mergedSymbols = new Map<string, LspSymbolResult>();
+    const queryFailures: WorkspaceSymbolsQueryFailure[] = [];
+    let firstSuccessfulRoot:
+      | {
+          serverId: string;
+          rootUri: string;
+        }
+      | undefined;
+
+    for (const match of queryRootDiscovery.matches) {
+      const rootUri = pathMapper.toUri(match.rootPath);
+      try {
+        const clientResult = await this.getOrCreateClient(
+          options.workspaceId,
+          match.descriptor,
+          options.runtime,
+          pathMapper,
+          match.rootPath,
+          rootUri,
+          options.policyContext
+        );
+        const rawResult = await clientResult.client.query({
+          operation: options.operation,
+          query: options.query,
+          includeDeclaration: options.includeDeclaration,
+        });
+        const symbols = await this.buildWorkspaceSymbolResults(
+          pathMapper,
+          options.runtime,
+          rawResult.symbols ?? []
+        );
+        firstSuccessfulRoot ??= {
+          serverId: match.descriptor.id,
+          rootUri,
+        };
+        for (const symbol of symbols) {
+          mergedSymbols.set(getWorkspaceSymbolIdentity(symbol), symbol);
+        }
+      } catch (error) {
+        queryFailures.push({
+          match,
+          reason: getErrorMessage(error),
+        });
+      }
+    }
+
+    if (!firstSuccessfulRoot) {
+      throw new Error(
+        buildWorkspaceSymbolsDirectorySearchError(
+          options.filePath,
+          queryFailures.map((failure) =>
+            describeWorkspaceSymbolsQueryFailure(pathMapper, failure)
+          ),
+          queryRootDiscovery.truncated
+        )
+      );
+    }
+
+    this.markActivity(options.workspaceId);
+    const dedupedSymbols = [...mergedSymbols.values()];
+    const warning = joinWarnings([
+      queryRootDiscovery.truncated
+        ? `Directory root scan was truncated to the first ${LSP_MAX_WORKSPACE_SYMBOL_QUERY_ROOTS} matching LSP roots`
+        : undefined,
+      queryFailures.length > 0
+        ? `Skipped ${queryFailures.length} failing LSP root${queryFailures.length === 1 ? "" : "s"}: ${queryFailures
+            .map((failure) => describeWorkspaceSymbolsQueryFailure(pathMapper, failure))
+            .join("; ")}`
+        : undefined,
+      dedupedSymbols.length > LSP_MAX_SYMBOLS
+        ? `Results truncated to the first ${LSP_MAX_SYMBOLS} symbols`
+        : undefined,
+    ]);
+
+    return {
+      operation: "workspace_symbols",
+      serverId: firstSuccessfulRoot.serverId,
+      rootUri: firstSuccessfulRoot.rootUri,
+      symbols: dedupedSymbols.slice(0, LSP_MAX_SYMBOLS),
+      ...(warning ? { warning } : {}),
+    };
+  }
+
+  private async discoverWorkspaceSymbolsQueryRoots(
+    runtime: Runtime,
+    directoryPath: string,
+    workspaceRuntimePath: string
+  ): Promise<WorkspaceSymbolsQueryRootDiscovery> {
+    const queryRootsByKey = new Map<string, ResolvedDirectoryDescriptorMatch>();
+    const descriptorSelection = await this.resolveDirectoryDescriptorSelection(
+      runtime,
+      directoryPath,
+      workspaceRuntimePath
+    );
+    if (descriptorSelection.kind === "selected") {
+      addDirectoryDescriptorMatch(queryRootsByKey, descriptorSelection.match);
+    } else if (descriptorSelection.kind === "ambiguous") {
+      for (const match of descriptorSelection.matches) {
+        addDirectoryDescriptorMatch(queryRootsByKey, match);
+      }
+    }
+
+    const descendantMatches = await this.findDescendantDirectoryDescriptorMatches(
+      runtime,
+      directoryPath,
+      workspaceRuntimePath
+    );
+    for (const match of descendantMatches) {
+      addDirectoryDescriptorMatch(queryRootsByKey, match);
+    }
+
+    const sortedMatches = sortWorkspaceSymbolsQueryRoots(
+      [...queryRootsByKey.values()],
+      directoryPath,
+      this.registry
+    );
+
+    return {
+      matches: sortedMatches.slice(0, LSP_MAX_WORKSPACE_SYMBOL_QUERY_ROOTS),
+      truncated: sortedMatches.length > LSP_MAX_WORKSPACE_SYMBOL_QUERY_ROOTS,
+    };
+  }
+
+  private async findDescendantDirectoryDescriptorMatches(
+    runtime: Runtime,
+    directoryPath: string,
+    workspaceRuntimePath: string
+  ): Promise<ResolvedDirectoryDescriptorMatch[]> {
+    const matches: ResolvedDirectoryDescriptorMatch[] = [];
+
+    for (const descriptor of this.registry) {
+      const specificRootMarkers = descriptor.rootMarkers.filter(
+        (marker) => !isGenericLspRootMarker(marker)
+      );
+      if (specificRootMarkers.length === 0) {
+        continue;
+      }
+
+      const markerPaths = await this.findDescendantMarkerPaths(
+        runtime,
+        directoryPath,
+        workspaceRuntimePath,
+        specificRootMarkers
+      );
+      for (const markerPath of markerPaths) {
+        const pathModule = selectPathModule(markerPath);
+        matches.push({
+          descriptor,
+          rootPath: pathModule.dirname(markerPath),
+          matchedMarker: pathModule.basename(markerPath),
+        });
+      }
+    }
+
+    return matches;
+  }
+
+  private async findDescendantMarkerPaths(
     runtime: Runtime,
     directoryPath: string,
     workspaceRuntimePath: string,
-    outputPath: string
-  ): Promise<{ descriptor: LspServerDescriptor; rootPath: string }> {
+    markers: readonly string[]
+  ): Promise<string[]> {
+    if (markers.length === 0) {
+      return [];
+    }
+
+    // Keep the directory walk LSP-local by using the existing runtime exec surface instead of
+    // widening Runtime with another file-system traversal primitive just for workspace_symbols.
+    const ignoredDirectoryExpression = WORKSPACE_SYMBOLS_ROOT_SCAN_IGNORED_DIRECTORY_NAMES.map(
+      (directoryName) => `-name ${shellQuote(directoryName)}`
+    ).join(" -o ");
+    const markerExpression = markers
+      .map((marker) => `-name ${shellQuote(marker)}`)
+      .join(" -o ");
+    const findResult = await execBuffered(
+      runtime,
+      `find ${shellQuote(directoryPath)} '(' ${ignoredDirectoryExpression} ')' -type d -prune -o -type f '(' ${markerExpression} ')' -print0`,
+      {
+        cwd: workspaceRuntimePath,
+        timeout: 30,
+      }
+    );
+    if (findResult.exitCode !== 0) {
+      const errorOutput = findResult.stderr.trim() || findResult.stdout.trim();
+      throw new Error(
+        errorOutput.length > 0
+          ? errorOutput
+          : `Failed to scan ${directoryPath} for nested LSP roots (exit ${findResult.exitCode})`
+      );
+    }
+
+    return findResult.stdout.split(" ").filter((markerPath) => markerPath.length > 0);
+  }
+
+  private async resolveDirectoryDescriptorSelection(
+    runtime: Runtime,
+    directoryPath: string,
+    workspaceRuntimePath: string
+  ): Promise<ResolvedDirectoryDescriptorSelection> {
     const matches = (
       await Promise.all(
         this.registry.map(async (descriptor) => ({
@@ -799,9 +1056,7 @@ export class LspManager {
     const candidateMatches = specificMatches.length > 0 ? specificMatches : matches;
     const selectedMatch = pickDeepestRootMatch(candidateMatches, workspaceRuntimePath);
     if (!selectedMatch) {
-      throw new Error(
-        `Could not infer a built-in LSP server for directory ${outputPath}. Provide a representative source file path or use a directory with a language-specific project marker.`
-      );
+      return { kind: "none" };
     }
 
     const bestDepth = getWorkspaceRelativePathDepth(selectedMatch.rootPath, workspaceRuntimePath);
@@ -810,20 +1065,42 @@ export class LspManager {
         getWorkspaceRelativePathDepth(candidate.rootPath, workspaceRuntimePath) === bestDepth
     );
     if (ambiguousMatches.length > 1) {
-      const matchingServers = ambiguousMatches
-        .map((candidate) => {
-          const matchedMarker = candidate.matchedMarker ?? "workspace root";
-          return `${candidate.descriptor.id} (${matchedMarker})`;
-        })
-        .join(", ");
-      throw new Error(
-        `Directory ${outputPath} is ambiguous for workspace_symbols; matching LSP servers: ${matchingServers}. Provide a representative source file path to select the intended language server.`
-      );
+      return {
+        kind: "ambiguous",
+        matches: ambiguousMatches,
+      };
     }
 
     return {
-      descriptor: selectedMatch.descriptor,
-      rootPath: selectedMatch.rootPath,
+      kind: "selected",
+      match: selectedMatch,
+    };
+  }
+
+  private async inferDescriptorForDirectory(
+    runtime: Runtime,
+    directoryPath: string,
+    workspaceRuntimePath: string,
+    outputPath: string
+  ): Promise<{ descriptor: LspServerDescriptor; rootPath: string }> {
+    const descriptorSelection = await this.resolveDirectoryDescriptorSelection(
+      runtime,
+      directoryPath,
+      workspaceRuntimePath
+    );
+    if (descriptorSelection.kind === "none") {
+      throw new Error(
+        `Could not infer a built-in LSP server for directory ${outputPath}. Provide a representative source file path or use a directory with a language-specific project marker.`
+      );
+    }
+
+    if (descriptorSelection.kind === "ambiguous") {
+      throw new Error(buildWorkspaceSymbolsAmbiguityError(outputPath, descriptorSelection.matches));
+    }
+
+    return {
+      descriptor: descriptorSelection.match.descriptor,
+      rootPath: descriptorSelection.match.rootPath,
     };
   }
 
@@ -1309,36 +1586,40 @@ export class LspManager {
         };
       }
       case "workspace_symbols": {
-        const workspaceSymbols = flattenWorkspaceSymbols(rawResult.symbols ?? []);
+        const symbols = await this.buildWorkspaceSymbolResults(
+          pathMapper,
+          runtime,
+          rawResult.symbols ?? []
+        );
         const warning =
-          workspaceSymbols.length > LSP_MAX_SYMBOLS
+          symbols.length > LSP_MAX_SYMBOLS
             ? `Results truncated to the first ${LSP_MAX_SYMBOLS} symbols`
             : undefined;
-        const symbols = await Promise.all(
-          workspaceSymbols.slice(0, LSP_MAX_SYMBOLS).map(async (symbol) =>
-            this.buildSymbolResult(
-              pathMapper,
-              runtime,
-              symbol.uri,
-              symbol.range,
-              symbol.name,
-              symbol.kind,
-              {
-                detail: symbol.detail,
-                containerName: symbol.containerName,
-              }
-            )
-          )
-        );
         return {
           operation: rawResult.operation,
           serverId,
           rootUri,
-          symbols,
+          symbols: symbols.slice(0, LSP_MAX_SYMBOLS),
           ...(warning ? { warning } : {}),
         };
       }
     }
+  }
+
+  private async buildWorkspaceSymbolResults(
+    pathMapper: LspPathMapper,
+    runtime: Runtime,
+    rawSymbols: Array<LspDocumentSymbol | LspSymbolInformation>
+  ): Promise<LspSymbolResult[]> {
+    const workspaceSymbols = flattenWorkspaceSymbols(rawSymbols);
+    return await Promise.all(
+      workspaceSymbols.map(async (symbol) =>
+        this.buildSymbolResult(pathMapper, runtime, symbol.uri, symbol.range, symbol.name, symbol.kind, {
+          detail: symbol.detail,
+          containerName: symbol.containerName,
+        })
+      )
+    );
   }
 
   private async buildLocationResult(
@@ -1386,6 +1667,164 @@ function selectPathModule(filePath: string): PathModule {
     return path.win32;
   }
   return path.posix;
+}
+
+function formatDirectoryDescriptorMatch(match: ResolvedDirectoryDescriptorMatch): string {
+  const matchedMarker = match.matchedMarker ?? "workspace root";
+  return `${match.descriptor.id} (${matchedMarker})`;
+}
+
+function buildWorkspaceSymbolsAmbiguityError(
+  outputPath: string,
+  matches: ResolvedDirectoryDescriptorMatch[],
+  detail?: string
+): string {
+  const matchingServers = matches.map((match) => formatDirectoryDescriptorMatch(match)).join(", ");
+  return `Directory ${outputPath} is ambiguous for workspace_symbols; matching LSP servers: ${matchingServers}.${detail ?? ""} Provide a representative source file path to select the intended language server.`;
+}
+
+const WORKSPACE_SYMBOLS_ROOT_SCAN_IGNORED_DIRECTORY_NAMES = [".git", "node_modules"] as const;
+
+function buildWorkspaceSymbolsDirectorySearchError(
+  outputPath: string,
+  attemptedRoots: string[],
+  truncatedRootScan: boolean
+): string {
+  const truncationDetail = truncatedRootScan
+    ? ` Directory root scan was truncated to the first ${LSP_MAX_WORKSPACE_SYMBOL_QUERY_ROOTS} matching LSP roots.`
+    : "";
+  return `workspace_symbols directory search failed for ${outputPath}; attempted roots: ${attemptedRoots.join("; ")}.${truncationDetail} Provide a representative source file path if you need to force a specific language server.`;
+}
+
+function describeWorkspaceSymbolsQueryFailure(
+  pathMapper: LspPathMapper,
+  failure: WorkspaceSymbolsQueryFailure
+): string {
+  return `${formatDirectoryDescriptorMatch(failure.match)} at ${formatWorkspaceSymbolsRootPath(
+    pathMapper,
+    failure.match.rootPath
+  )}: ${failure.reason}`;
+}
+
+function formatWorkspaceSymbolsRootPath(pathMapper: LspPathMapper, rootPath: string): string {
+  const workspaceRuntimePath = pathMapper.getWorkspaceRuntimePath();
+  const pathModule = selectPathModule(rootPath);
+  const relativePath = pathModule.relative(workspaceRuntimePath, rootPath);
+  return relativePath.length === 0 ? "." : relativePath;
+}
+
+function addDirectoryDescriptorMatch(
+  matchesByKey: Map<string, ResolvedDirectoryDescriptorMatch>,
+  match: ResolvedDirectoryDescriptorMatch
+): void {
+  const key = `${match.descriptor.id}:${match.rootPath}`;
+  const existingMatch = matchesByKey.get(key);
+  if (
+    !existingMatch ||
+    getDirectoryDescriptorMarkerPriority(match) < getDirectoryDescriptorMarkerPriority(existingMatch)
+  ) {
+    matchesByKey.set(key, match);
+  }
+}
+
+function getDirectoryDescriptorMarkerPriority(match: ResolvedDirectoryDescriptorMatch): number {
+  const matchedMarker = match.matchedMarker;
+  if (matchedMarker == null) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+
+  if (isGenericLspRootMarker(matchedMarker)) {
+    return match.descriptor.rootMarkers.length + 1;
+  }
+
+  const markerIndex = match.descriptor.rootMarkers.indexOf(matchedMarker);
+  return markerIndex >= 0 ? markerIndex : match.descriptor.rootMarkers.length;
+}
+
+function sortWorkspaceSymbolsQueryRoots(
+  matches: readonly ResolvedDirectoryDescriptorMatch[],
+  directoryPath: string,
+  registry: readonly LspServerDescriptor[]
+): ResolvedDirectoryDescriptorMatch[] {
+  const descriptorOrder = new Map(registry.map((descriptor, index) => [descriptor.id, index]));
+  return [...matches].sort((left, right) => {
+    const leftSortKey = getWorkspaceSymbolsQueryRootSortKey(left.rootPath, directoryPath);
+    const rightSortKey = getWorkspaceSymbolsQueryRootSortKey(right.rootPath, directoryPath);
+    return (
+      leftSortKey.group - rightSortKey.group ||
+      leftSortKey.distance - rightSortKey.distance ||
+      (descriptorOrder.get(left.descriptor.id) ?? Number.MAX_SAFE_INTEGER) -
+        (descriptorOrder.get(right.descriptor.id) ?? Number.MAX_SAFE_INTEGER) ||
+      left.rootPath.localeCompare(right.rootPath) ||
+      getDirectoryDescriptorMarkerPriority(left) - getDirectoryDescriptorMarkerPriority(right)
+    );
+  });
+}
+
+function getWorkspaceSymbolsQueryRootSortKey(
+  rootPath: string,
+  directoryPath: string
+): { group: number; distance: number } {
+  const pathModule = selectPathModule(directoryPath);
+  const relativeFromDirectory = pathModule.relative(directoryPath, rootPath);
+  if (relativeFromDirectory.length === 0) {
+    return { group: 0, distance: 0 };
+  }
+
+  if (isRelativeSubpath(pathModule, relativeFromDirectory)) {
+    return {
+      group: 0,
+      distance: relativeFromDirectory.split(pathModule.sep).filter((segment) => segment.length > 0).length,
+    };
+  }
+
+  const relativeFromRoot = pathModule.relative(rootPath, directoryPath);
+  if (isRelativeSubpath(pathModule, relativeFromRoot)) {
+    return {
+      group: 1,
+      distance: relativeFromRoot.split(pathModule.sep).filter((segment) => segment.length > 0).length,
+    };
+  }
+
+  return { group: 2, distance: Number.MAX_SAFE_INTEGER };
+}
+
+function isRelativeSubpath(pathModule: PathModule, relativePath: string): boolean {
+  return (
+    relativePath.length > 0 &&
+    !relativePath.startsWith(`..${pathModule.sep}`) &&
+    relativePath !== ".." &&
+    !pathModule.isAbsolute(relativePath)
+  );
+}
+
+function getWorkspaceSymbolIdentity(symbol: LspSymbolResult): string {
+  return [
+    symbol.name,
+    symbol.kind,
+    symbol.path,
+    symbol.containerName ?? "",
+    symbol.range.start.line,
+    symbol.range.start.character,
+    symbol.range.end.line,
+    symbol.range.end.character,
+  ].join(":");
+}
+
+function joinWarnings(warnings: Array<string | undefined>): string | undefined {
+  const definedWarnings = warnings.filter((warning): warning is string => warning != null);
+  if (definedWarnings.length === 0) {
+    return undefined;
+  }
+
+  return definedWarnings.join(" ");
+}
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
 }
 
 function compareFileDiagnostics(left: LspFileDiagnostics, right: LspFileDiagnostics): number {
