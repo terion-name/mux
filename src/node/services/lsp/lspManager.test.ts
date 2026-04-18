@@ -122,6 +122,30 @@ function requireSingleRootQueryResult(result: Awaited<ReturnType<LspManager["que
   return result;
 }
 
+const GO_EXACT_MATCH_WORKSPACE_SYMBOLS_ENV = "EXPERIMENT_LSP_GO_EXACT_MATCH_SYMBOLS";
+
+async function withGoExactMatchWorkspaceSymbolsEnv<T>(
+  value: string | undefined,
+  run: () => Promise<T>
+): Promise<T> {
+  const previousValue = process.env[GO_EXACT_MATCH_WORKSPACE_SYMBOLS_ENV];
+  if (value == null) {
+    delete process.env[GO_EXACT_MATCH_WORKSPACE_SYMBOLS_ENV];
+  } else {
+    process.env[GO_EXACT_MATCH_WORKSPACE_SYMBOLS_ENV] = value;
+  }
+
+  try {
+    return await run();
+  } finally {
+    if (previousValue == null) {
+      delete process.env[GO_EXACT_MATCH_WORKSPACE_SYMBOLS_ENV];
+    } else {
+      process.env[GO_EXACT_MATCH_WORKSPACE_SYMBOLS_ENV] = previousValue;
+    }
+  }
+}
+
 describe("LspManager", () => {
   let workspacePath: string;
 
@@ -142,6 +166,97 @@ describe("LspManager", () => {
   afterEach(async () => {
     await fs.rm(workspacePath, { recursive: true, force: true });
   });
+
+  async function queryGoWorkspaceSymbols(options: {
+    filePath: string;
+    envValue?: string;
+  }): Promise<Awaited<ReturnType<LspManager["query"]>>> {
+    const goFilePath = path.join(workspacePath, "main.go");
+    await fs.writeFile(path.join(workspacePath, "go.mod"), "module example.com/mux-test\n");
+    await fs.writeFile(
+      goFilePath,
+      "package main\n\nfunc useAttemptHelper() {}\nfunc useAttempt() {}\nfunc attemptUse() {}\n"
+    );
+
+    const goDescriptor = createManualDescriptor("go", [".go"], "mux-test-go-lsp", [
+      "go.mod",
+      ".git",
+    ]);
+    const clientFactory = mock(
+      (clientOptions: CreateLspClientOptions): Promise<LspClientInstance> => {
+        expect(clientOptions.descriptor.id).toBe("go");
+        return Promise.resolve({
+          isClosed: false,
+          ensureFile: mock(() => Promise.resolve(1)),
+          query: mock(() =>
+            Promise.resolve({
+              operation: "workspace_symbols" as const,
+              symbols: [
+                {
+                  name: "useAttemptHelper",
+                  kind: 12,
+                  location: {
+                    uri: pathToFileURL(goFilePath).href,
+                    range: {
+                      start: { line: 2, character: 5 },
+                      end: { line: 2, character: 21 },
+                    },
+                  },
+                },
+                {
+                  name: "useAttempt",
+                  kind: 12,
+                  location: {
+                    uri: pathToFileURL(goFilePath).href,
+                    range: {
+                      start: { line: 3, character: 5 },
+                      end: { line: 3, character: 15 },
+                    },
+                  },
+                },
+                {
+                  name: "attemptUse",
+                  kind: 12,
+                  location: {
+                    uri: pathToFileURL(goFilePath).href,
+                    range: {
+                      start: { line: 4, character: 5 },
+                      end: { line: 4, character: 15 },
+                    },
+                  },
+                },
+              ],
+            })
+          ),
+          close: mock(() => Promise.resolve(undefined)),
+        });
+      }
+    );
+
+    const manager = new LspManager({
+      registry: [goDescriptor],
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    try {
+      return await withGoExactMatchWorkspaceSymbolsEnv(
+        options.envValue,
+        async () =>
+          await manager.query({
+            workspaceId: "ws-go",
+            runtime,
+            workspacePath,
+            filePath: options.filePath,
+            policyContext: TEST_LSP_POLICY_CONTEXT,
+            operation: "workspace_symbols",
+            query: "useAttempt",
+          })
+      );
+    } finally {
+      await manager.dispose();
+    }
+  }
 
   test("reuses clients for the same workspace root and forwards normalized positions", async () => {
     const ensureFile = mock(() => Promise.resolve(1));
@@ -645,6 +760,55 @@ describe("LspManager", () => {
     } finally {
       await manager.dispose();
     }
+  });
+
+  test("filters Go workspace_symbols to exact matches by default for single-root queries", async () => {
+    const result = await queryGoWorkspaceSymbols({
+      filePath: "main.go",
+    });
+
+    expect(requireSingleRootQueryResult(result)).toMatchObject({
+      operation: "workspace_symbols",
+      serverId: "go",
+      rootUri: pathToFileURL(workspacePath).href,
+      symbols: [
+        {
+          name: "useAttempt",
+          path: path.join(workspacePath, "main.go"),
+        },
+      ],
+    });
+  });
+
+  test("filters Go workspace_symbols for directory queries unless the env var disables it", async () => {
+    const defaultResults = requireDirectoryWorkspaceSymbolsResults(
+      await queryGoWorkspaceSymbols({
+        filePath: ".",
+      })
+    );
+    expect(defaultResults).toHaveLength(1);
+    expect(defaultResults[0]).toMatchObject({
+      serverId: "go",
+      rootUri: pathToFileURL(workspacePath).href,
+      symbols: [
+        {
+          name: "useAttempt",
+        },
+      ],
+    });
+
+    const disabledResults = requireDirectoryWorkspaceSymbolsResults(
+      await queryGoWorkspaceSymbols({
+        filePath: ".",
+        envValue: "false",
+      })
+    );
+    expect(disabledResults).toHaveLength(1);
+    expect(disabledResults[0]).toMatchObject({
+      serverId: "go",
+      rootUri: pathToFileURL(workspacePath).href,
+      symbols: [{ name: "useAttemptHelper" }, { name: "useAttempt" }, { name: "attemptUse" }],
+    });
   });
 
   test("prefers the deepest matching workspace_symbols root for nested directories", async () => {

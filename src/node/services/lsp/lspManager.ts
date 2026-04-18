@@ -263,7 +263,8 @@ export class LspManager {
         context.fileHandle,
         context.descriptor.id,
         context.rootUri,
-        rawResult
+        rawResult,
+        options.query
       );
     } finally {
       this.releaseLease(options.workspaceId);
@@ -875,7 +876,9 @@ export class LspManager {
         const symbols = await this.buildWorkspaceSymbolResults(
           pathMapper,
           options.runtime,
-          rawResult.symbols ?? []
+          match.descriptor.id,
+          rawResult.symbols ?? [],
+          options.query
         );
         usableRootCount += 1;
         const warning =
@@ -1687,7 +1690,8 @@ export class LspManager {
     fileHandle: LspClientFileHandle | undefined,
     serverId: string,
     rootUri: string,
-    rawResult: LspClientQueryResult
+    rawResult: LspClientQueryResult,
+    workspaceSymbolsQuery?: string
   ): Promise<LspManagerQueryResult> {
     switch (rawResult.operation) {
       case "hover":
@@ -1755,7 +1759,9 @@ export class LspManager {
         const symbols = await this.buildWorkspaceSymbolResults(
           pathMapper,
           runtime,
-          rawResult.symbols ?? []
+          serverId,
+          rawResult.symbols ?? [],
+          workspaceSymbolsQuery
         );
         const warning =
           symbols.length > LSP_MAX_SYMBOLS
@@ -1775,9 +1781,15 @@ export class LspManager {
   private async buildWorkspaceSymbolResults(
     pathMapper: LspPathMapper,
     runtime: Runtime,
-    rawSymbols: Array<LspDocumentSymbol | LspSymbolInformation>
+    serverId: string,
+    rawSymbols: Array<LspDocumentSymbol | LspSymbolInformation>,
+    query?: string
   ): Promise<LspSymbolResult[]> {
-    const workspaceSymbols = flattenWorkspaceSymbols(rawSymbols);
+    const workspaceSymbols = postprocessWorkspaceSymbols(
+      serverId,
+      flattenWorkspaceSymbols(rawSymbols),
+      query
+    );
     return await Promise.all(
       workspaceSymbols.map(async (symbol) =>
         this.buildSymbolResult(
@@ -2329,6 +2341,35 @@ async function fileContainsExactWorkspaceSymbolsQuery(
 
 function normalizeWorkspaceSymbolsIdentifier(value: string | undefined): string {
   return value?.toLowerCase().replace(/[^a-z0-9]+/g, "") ?? "";
+}
+
+type FlattenedWorkspaceSymbol = ReturnType<typeof flattenWorkspaceSymbols>[number];
+
+function postprocessWorkspaceSymbols(
+  serverId: string,
+  symbols: readonly FlattenedWorkspaceSymbol[],
+  query: string | undefined
+): FlattenedWorkspaceSymbol[] {
+  if (!shouldPreferGoExactMatchWorkspaceSymbols(serverId)) {
+    return [...symbols];
+  }
+
+  const exactQuery = query?.trim();
+  if (!exactQuery) {
+    return [...symbols];
+  }
+
+  // gopls workspace/symbol is fuzzy enough to drown out the exact Go symbol users asked for,
+  // so keep the exact-name hits when the experiment is enabled and at least one exists.
+  const exactMatches = symbols.filter((symbol) => symbol.name === exactQuery);
+  return exactMatches.length > 0 ? exactMatches : [...symbols];
+}
+
+function shouldPreferGoExactMatchWorkspaceSymbols(serverId: string): boolean {
+  return (
+    serverId === "go" &&
+    process.env.EXPERIMENT_LSP_GO_EXACT_MATCH_SYMBOLS?.trim().toLowerCase() !== "false"
+  );
 }
 
 function summarizeWorkspaceSymbolsQueryFailures(
