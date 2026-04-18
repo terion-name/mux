@@ -1041,18 +1041,17 @@ describe("LspManager", () => {
       });
 
       expect(result.warning).toBeUndefined();
-      expect(requireDirectoryWorkspaceSymbolsResults(result)).toEqual([
-        {
-          serverId: "python",
-          rootUri: pathToFileURL(workspacePath).href,
-          symbols: [
-            expect.objectContaining({
-              name: "ResourceService",
-              path: path.join(workspacePath, "resource.py"),
-            }),
-          ],
-        },
-      ]);
+      const workspaceSymbolsResults = requireDirectoryWorkspaceSymbolsResults(result);
+      expect(workspaceSymbolsResults).toHaveLength(1);
+      expect(workspaceSymbolsResults[0]).toMatchObject({
+        serverId: "python",
+        rootUri: pathToFileURL(workspacePath).href,
+      });
+      expect(workspaceSymbolsResults[0]?.symbols).toHaveLength(1);
+      expect(workspaceSymbolsResults[0]?.symbols[0]).toMatchObject({
+        name: "ResourceService",
+        path: path.join(workspacePath, "resource.py"),
+      });
     } finally {
       await manager.dispose();
     }
