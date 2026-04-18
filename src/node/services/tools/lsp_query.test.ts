@@ -74,11 +74,16 @@ describe("lsp_query tool", () => {
     const query = mock(() =>
       Promise.resolve({
         operation: "workspace_symbols" as const,
-        results: [
+        results: [],
+        skippedRoots: [
           {
-            serverId: "typescript",
+            serverId: "rust",
             rootUri: `file://${process.cwd()}`,
-            symbols: [],
+            reasonCode: "unsupported_provisioning" as const,
+            reason:
+              "rust-analyzer is not available on PATH and automatic installation is not supported yet",
+            installGuidance:
+              "Install rust-analyzer and ensure it is available on PATH, or query a representative source file for a supported language.",
           },
         ],
       })
@@ -102,15 +107,20 @@ describe("lsp_query tool", () => {
       expect(result).toEqual({
         success: true,
         operation: "workspace_symbols",
-        results: [
+        results: [],
+        skippedRoots: [
           {
-            serverId: "typescript",
+            serverId: "rust",
             rootUri: `file://${process.cwd()}`,
-            symbols: [],
+            reasonCode: "unsupported_provisioning",
+            reason:
+              "rust-analyzer is not available on PATH and automatic installation is not supported yet",
+            installGuidance:
+              "Install rust-analyzer and ensure it is available on PATH, or query a representative source file for a supported language.",
           },
         ],
       });
-      expect(requireDirectoryWorkspaceSymbolsResult(result)).toHaveLength(1);
+      expect(requireDirectoryWorkspaceSymbolsResult(result)).toHaveLength(0);
       expect(query).toHaveBeenCalledWith(
         expect.objectContaining({
           filePath: process.cwd(),

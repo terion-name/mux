@@ -90,14 +90,23 @@ export interface LspSymbolInformation {
   containerName?: string;
 }
 
+export interface LspSymbolExportInfo {
+  isExported: boolean;
+  confidence: "heuristic";
+  evidence?: string;
+}
+
 export interface LspSymbolResult {
   name: string;
   kind: number;
+  kindLabel: string;
   detail?: string;
   containerName?: string;
   path: string;
+  uri: string;
   range: LspRange;
   preview?: string;
+  exportInfo?: LspSymbolExportInfo;
 }
 
 export interface LspLocationResult {
@@ -117,6 +126,19 @@ export interface LspManagerSingleQueryResult {
   warning?: string;
 }
 
+export type LspWorkspaceSymbolsSkipReasonCode =
+  | "missing_binary"
+  | "unsupported_provisioning"
+  | "query_failed";
+
+export interface LspWorkspaceSymbolsSkippedRoot {
+  serverId: string;
+  rootUri: string;
+  reasonCode: LspWorkspaceSymbolsSkipReasonCode;
+  reason: string;
+  installGuidance?: string;
+}
+
 export interface LspManagerWorkspaceSymbolsResult {
   serverId: string;
   rootUri: string;
@@ -127,6 +149,8 @@ export interface LspManagerWorkspaceSymbolsResult {
 export interface LspManagerDirectoryWorkspaceSymbolsQueryResult {
   operation: "workspace_symbols";
   results: LspManagerWorkspaceSymbolsResult[];
+  skippedRoots?: LspWorkspaceSymbolsSkippedRoot[];
+  disambiguationHint?: string;
   warning?: string;
 }
 

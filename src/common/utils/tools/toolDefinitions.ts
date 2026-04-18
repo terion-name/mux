@@ -987,7 +987,7 @@ export const TOOL_DEFINITIONS = {
       "Query the built-in language server for code intelligence. " +
       "Use this for hover, definitions, references, implementations, and symbol lookup. " +
       "Provide line and column using 1-based positions for hover/definition/reference/implementation. " +
-      "For workspace_symbols, provide a non-empty query plus either a representative source file path or a directory/relative path; directory queries return one result item per usable LSP root.",
+      "For workspace_symbols, provide a non-empty query plus either a representative source file path or a directory/relative path; directory queries return non-empty result items per usable LSP root and may include skippedRoots guidance for unavailable roots.",
     schema: z.preprocess(
       normalizeFilePath,
       z
@@ -1955,15 +1955,36 @@ const LspQueryLocationSchema = z
   })
   .strict();
 
+const LspQuerySymbolExportInfoSchema = z
+  .object({
+    isExported: z.boolean(),
+    confidence: z.literal("heuristic"),
+    evidence: z.string().optional(),
+  })
+  .strict();
+
 const LspQuerySymbolSchema = z
   .object({
     name: z.string(),
     kind: z.number().int(),
+    kindLabel: z.string(),
     detail: z.string().optional(),
     containerName: z.string().optional(),
     path: z.string(),
+    uri: z.string(),
     range: LspQueryResultRangeSchema,
     preview: z.string().optional(),
+    exportInfo: LspQuerySymbolExportInfoSchema.optional(),
+  })
+  .strict();
+
+const LspQueryWorkspaceSymbolsSkippedRootSchema = z
+  .object({
+    serverId: z.string(),
+    rootUri: z.string(),
+    reasonCode: z.enum(["missing_binary", "unsupported_provisioning", "query_failed"]),
+    reason: z.string(),
+    installGuidance: z.string().optional(),
   })
   .strict();
 
@@ -2001,6 +2022,8 @@ export const LspQueryToolResultSchema = z.union([
       success: z.literal(true),
       operation: z.literal("workspace_symbols"),
       results: z.array(LspQueryWorkspaceSymbolsRootSchema),
+      skippedRoots: z.array(LspQueryWorkspaceSymbolsSkippedRootSchema).optional(),
+      disambiguationHint: z.string().optional(),
       warning: z.string().optional(),
     })
     .strict(),

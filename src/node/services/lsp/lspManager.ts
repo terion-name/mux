@@ -35,6 +35,8 @@ import type {
   LspServerDescriptor,
   LspSymbolInformation,
   LspSymbolResult,
+  LspWorkspaceSymbolsSkipReasonCode,
+  LspWorkspaceSymbolsSkippedRoot,
   ResolvedLspLaunchPlan,
 } from "./types";
 
@@ -73,7 +75,9 @@ interface WorkspaceSymbolsQueryRootDiscovery {
 
 interface WorkspaceSymbolsQueryFailure {
   match: ResolvedDirectoryDescriptorMatch;
+  reasonCode: LspWorkspaceSymbolsSkipReasonCode;
   reason: string;
+  installGuidance?: string;
 }
 
 type ResolvedDirectoryDescriptorSelection =
@@ -836,6 +840,7 @@ export class LspManager {
 
     const results: LspManagerWorkspaceSymbolsResult[] = [];
     const queryFailures: WorkspaceSymbolsQueryFailure[] = [];
+    let usableRootCount = 0;
 
     for (const match of queryRootDiscovery.matches) {
       const rootUri = pathMapper.toUri(match.rootPath);
@@ -872,25 +877,26 @@ export class LspManager {
           options.runtime,
           rawResult.symbols ?? []
         );
+        usableRootCount += 1;
         const warning =
           symbols.length > LSP_MAX_SYMBOLS
             ? `Results truncated to the first ${LSP_MAX_SYMBOLS} symbols`
             : undefined;
-        results.push({
-          serverId: match.descriptor.id,
-          rootUri,
-          symbols: symbols.slice(0, LSP_MAX_SYMBOLS),
-          ...(warning ? { warning } : {}),
-        });
+        const limitedSymbols = symbols.slice(0, LSP_MAX_SYMBOLS);
+        if (limitedSymbols.length > 0) {
+          results.push({
+            serverId: match.descriptor.id,
+            rootUri,
+            symbols: limitedSymbols,
+            ...(warning ? { warning } : {}),
+          });
+        }
       } catch (error) {
-        queryFailures.push({
-          match,
-          reason: getErrorMessage(error),
-        });
+        queryFailures.push(buildWorkspaceSymbolsQueryFailure(match, getErrorMessage(error)));
       }
     }
 
-    if (results.length === 0) {
+    if (usableRootCount === 0) {
       throw new Error(
         buildWorkspaceSymbolsNoUsableRootsError(
           options.filePath,
@@ -905,10 +911,16 @@ export class LspManager {
     const warning = queryRootDiscovery.truncated
       ? `Directory root scan was truncated to the first ${LSP_MAX_WORKSPACE_SYMBOL_QUERY_ROOTS} matching LSP roots`
       : undefined;
+    const skippedRoots = queryFailures.map((failure) =>
+      toWorkspaceSymbolsSkippedRoot(pathMapper, failure)
+    );
+    const disambiguationHint = buildWorkspaceSymbolsDisambiguationHint(results);
 
     return {
       operation: "workspace_symbols",
       results,
+      ...(skippedRoots.length > 0 ? { skippedRoots } : {}),
+      ...(disambiguationHint ? { disambiguationHint } : {}),
       ...(warning ? { warning } : {}),
     };
   }
@@ -1809,17 +1821,172 @@ export class LspManager {
     extra?: { detail?: string; containerName?: string }
   ) {
     const runtimePath = pathMapper.fromUri(uri);
+    const readablePath = pathMapper.toReadablePath(runtimePath);
     const outputPath = pathMapper.toOutputPath(runtimePath);
+    const preview = await buildPreview(runtime, readablePath, range);
+    // workspace/symbol responses do not include export visibility, so this stays best-effort.
+    const exportInfo = detectHeuristicSymbolExportInfo(readablePath, name, preview);
     return {
       name,
       kind,
+      kindLabel: getLspSymbolKindLabel(kind),
       path: outputPath,
+      uri,
       range: toOneBasedRange(range),
-      preview: await buildPreview(runtime, pathMapper.toReadablePath(runtimePath), range),
+      ...(preview ? { preview } : {}),
       ...(extra?.detail ? { detail: extra.detail } : {}),
       ...(extra?.containerName ? { containerName: extra.containerName } : {}),
+      ...(exportInfo ? { exportInfo } : {}),
     };
   }
+}
+
+function buildWorkspaceSymbolsQueryFailure(
+  match: ResolvedDirectoryDescriptorMatch,
+  reason: string
+): WorkspaceSymbolsQueryFailure {
+  const reasonCode = getWorkspaceSymbolsFailureReasonCode(reason);
+  const installGuidance = getWorkspaceSymbolsFailureInstallGuidance(reason, reasonCode);
+  return {
+    match,
+    reasonCode,
+    reason,
+    ...(installGuidance ? { installGuidance } : {}),
+  };
+}
+
+function toWorkspaceSymbolsSkippedRoot(
+  pathMapper: LspPathMapper,
+  failure: WorkspaceSymbolsQueryFailure
+): LspWorkspaceSymbolsSkippedRoot {
+  return {
+    serverId: failure.match.descriptor.id,
+    rootUri: pathMapper.toUri(failure.match.rootPath),
+    reasonCode: failure.reasonCode,
+    reason: failure.reason,
+    ...(failure.installGuidance ? { installGuidance: failure.installGuidance } : {}),
+  };
+}
+
+function buildWorkspaceSymbolsDisambiguationHint(
+  results: readonly LspManagerWorkspaceSymbolsResult[]
+): string | undefined {
+  if (results.length <= 1) {
+    return undefined;
+  }
+
+  const rootsBySymbolName = new Map<string, Set<string>>();
+  for (const result of results) {
+    for (const symbol of result.symbols) {
+      const roots = rootsBySymbolName.get(symbol.name) ?? new Set<string>();
+      roots.add(`${result.serverId}:${result.rootUri}`);
+      rootsBySymbolName.set(symbol.name, roots);
+    }
+  }
+
+  const duplicateNames = [...rootsBySymbolName.entries()]
+    .filter(([, roots]) => roots.size > 1)
+    .map(([name]) => name)
+    .sort((left, right) => left.localeCompare(right));
+  const duplicateDetail =
+    duplicateNames.length > 0
+      ? ` Duplicate symbol names across roots: ${duplicateNames.slice(0, 3).join(", ")}.`
+      : "";
+
+  return `Multiple LSP roots returned workspace symbol matches.${duplicateDetail} Compare serverId, rootUri, uri, and kindLabel before choosing.`;
+}
+
+const LSP_SYMBOL_KIND_LABELS: Record<number, string> = {
+  1: "File",
+  2: "Module",
+  3: "Namespace",
+  4: "Package",
+  5: "Class",
+  6: "Method",
+  7: "Property",
+  8: "Field",
+  9: "Constructor",
+  10: "Enum",
+  11: "Interface",
+  12: "Function",
+  13: "Variable",
+  14: "Constant",
+  15: "String",
+  16: "Number",
+  17: "Boolean",
+  18: "Array",
+  19: "Object",
+  20: "Key",
+  21: "Null",
+  22: "EnumMember",
+  23: "Struct",
+  24: "Event",
+  25: "Operator",
+  26: "TypeParameter",
+};
+
+function getLspSymbolKindLabel(kind: number): string {
+  return LSP_SYMBOL_KIND_LABELS[kind] ?? "Unknown";
+}
+
+function detectHeuristicSymbolExportInfo(
+  filePath: string,
+  symbolName: string,
+  preview: string | undefined
+): LspSymbolResult["exportInfo"] | undefined {
+  const extension = path.extname(filePath).toLowerCase();
+  if (extension === ".go" && /^[A-Z]/.test(symbolName)) {
+    return {
+      isExported: true,
+      confidence: "heuristic",
+      evidence: "Go exported identifiers start with an uppercase letter",
+    };
+  }
+
+  if (!preview) {
+    return undefined;
+  }
+
+  const previewSource = extractPreviewSourceLines(preview).join("\n");
+  if (previewSource.length === 0) {
+    return undefined;
+  }
+
+  const escapedSymbolName = escapeRegExp(symbolName);
+  if (
+    [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"].includes(extension) &&
+    new RegExp(`\\bexport\\b[^\\n]*\\b${escapedSymbolName}\\b`).test(previewSource)
+  ) {
+    return {
+      isExported: true,
+      confidence: "heuristic",
+      evidence: "Found an export keyword near the declaration",
+    };
+  }
+
+  if (
+    extension === ".rs" &&
+    new RegExp(`\\bpub(?:\\([^)]*\\))?\\b[^\\n]*\\b${escapedSymbolName}\\b`).test(previewSource)
+  ) {
+    return {
+      isExported: true,
+      confidence: "heuristic",
+      evidence: "Found pub visibility near the declaration",
+    };
+  }
+
+  return undefined;
+}
+
+function extractPreviewSourceLines(preview: string): string[] {
+  return preview
+    .split("\n")
+    .map((line) => line.replace(/^\d+\t/, "").trim())
+    .filter((line) => line.length > 0);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 type PathModule = typeof path.posix;
@@ -2179,17 +2346,46 @@ function summarizeWorkspaceSymbolsQueryFailures(
   return `${failureDetails.join("; ")}; and ${remainingFailureCount} more failing LSP root${remainingFailureCount === 1 ? "" : "s"}`;
 }
 
+function getWorkspaceSymbolsFailureReasonCode(reason: string): LspWorkspaceSymbolsSkipReasonCode {
+  if (reason.includes("automatic installation is not supported yet")) {
+    return "unsupported_provisioning";
+  }
+
+  if (extractMissingPathCommand(reason)) {
+    return "missing_binary";
+  }
+
+  return "query_failed";
+}
+
+function extractMissingPathCommand(reason: string): string | undefined {
+  return /(?<command>[A-Za-z0-9._-]+) is not available on PATH/.exec(reason)?.groups?.command;
+}
+
+function getWorkspaceSymbolsFailureInstallGuidance(
+  reason: string,
+  reasonCode: LspWorkspaceSymbolsSkipReasonCode
+): string | undefined {
+  const missingPathCommand = extractMissingPathCommand(reason);
+  if (missingPathCommand) {
+    return `Install ${missingPathCommand} and ensure it is available on PATH, or query a representative source file for a supported language.`;
+  }
+
+  if (reasonCode === "query_failed") {
+    return undefined;
+  }
+
+  return "Install the missing language server or query a representative source file for a supported language.";
+}
+
 function getWorkspaceSymbolsFailureGuidance(
   failures: readonly WorkspaceSymbolsQueryFailure[]
 ): string {
-  const missingPathCommand = failures
-    .map(
-      (failure) =>
-        /(?<command>[A-Za-z0-9._-]+) is not available on PATH/.exec(failure.reason)?.groups?.command
-    )
-    .find((command): command is string => command != null && command.length > 0);
-  if (missingPathCommand) {
-    return `Install ${missingPathCommand} and ensure it is available on PATH, or query a representative source file for a supported language.`;
+  const installGuidance = failures
+    .map((failure) => failure.installGuidance)
+    .find((guidance): guidance is string => guidance != null && guidance.length > 0);
+  if (installGuidance) {
+    return installGuidance;
   }
 
   return "Install the missing language server or query a representative source file for a supported language.";
