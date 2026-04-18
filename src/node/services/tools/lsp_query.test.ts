@@ -15,6 +15,15 @@ const mockToolCallOptions: ToolExecutionOptions = {
   messages: [],
 };
 
+function requireDirectoryWorkspaceSymbolsResult(result: LspQueryToolResult) {
+  expect(result.success).toBe(true);
+  if (!result.success || !("results" in result)) {
+    throw new Error("Expected a directory workspace_symbols tool result");
+  }
+
+  return result.results;
+}
+
 describe("lsp_query tool", () => {
   test("returns formatted LSP data from the manager", async () => {
     const lspManager = new LspManager({ registry: [] });
@@ -44,10 +53,11 @@ describe("lsp_query tool", () => {
       )) as LspQueryToolResult;
 
       expect(result.success).toBe(true);
-      if (result.success) {
-        expect(result.serverId).toBe("typescript");
-        expect(result.hover).toBe("const value: 1");
+      if (!result.success || !("serverId" in result)) {
+        throw new Error("Expected a single-root LSP result");
       }
+      expect(result.serverId).toBe("typescript");
+      expect(result.hover).toBe("const value: 1");
       expect(query).toHaveBeenCalledTimes(1);
       expect(query).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -64,9 +74,13 @@ describe("lsp_query tool", () => {
     const query = mock(() =>
       Promise.resolve({
         operation: "workspace_symbols" as const,
-        serverId: "typescript",
-        rootUri: `file://${process.cwd()}`,
-        symbols: [],
+        results: [
+          {
+            serverId: "typescript",
+            rootUri: `file://${process.cwd()}`,
+            symbols: [],
+          },
+        ],
       })
     );
     lspManager.query = query;
@@ -88,10 +102,15 @@ describe("lsp_query tool", () => {
       expect(result).toEqual({
         success: true,
         operation: "workspace_symbols",
-        serverId: "typescript",
-        rootUri: `file://${process.cwd()}`,
-        symbols: [],
+        results: [
+          {
+            serverId: "typescript",
+            rootUri: `file://${process.cwd()}`,
+            symbols: [],
+          },
+        ],
       });
+      expect(requireDirectoryWorkspaceSymbolsResult(result)).toHaveLength(1);
       expect(query).toHaveBeenCalledWith(
         expect.objectContaining({
           filePath: process.cwd(),

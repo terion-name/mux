@@ -987,7 +987,7 @@ export const TOOL_DEFINITIONS = {
       "Query the built-in language server for code intelligence. " +
       "Use this for hover, definitions, references, implementations, and symbol lookup. " +
       "Provide line and column using 1-based positions for hover/definition/reference/implementation. " +
-      "For workspace_symbols, provide a representative file path to select the correct language server plus a non-empty query.",
+      "For workspace_symbols, provide a non-empty query plus either a representative source file path or a directory/relative path; directory queries return one result item per usable LSP root.",
     schema: z.preprocess(
       normalizeFilePath,
       z
@@ -1967,6 +1967,15 @@ const LspQuerySymbolSchema = z
   })
   .strict();
 
+const LspQueryWorkspaceSymbolsRootSchema = z
+  .object({
+    serverId: z.string(),
+    rootUri: z.string(),
+    symbols: z.array(LspQuerySymbolSchema),
+    warning: z.string().optional(),
+  })
+  .strict();
+
 export const LspQueryToolResultSchema = z.union([
   z
     .object({
@@ -1984,6 +1993,14 @@ export const LspQueryToolResultSchema = z.union([
       hover: z.string().optional(),
       locations: z.array(LspQueryLocationSchema).optional(),
       symbols: z.array(LspQuerySymbolSchema).optional(),
+      warning: z.string().optional(),
+    })
+    .strict(),
+  z
+    .object({
+      success: z.literal(true),
+      operation: z.literal("workspace_symbols"),
+      results: z.array(LspQueryWorkspaceSymbolsRootSchema),
       warning: z.string().optional(),
     })
     .strict(),

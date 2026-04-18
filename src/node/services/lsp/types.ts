@@ -107,7 +107,7 @@ export interface LspLocationResult {
   preview?: string;
 }
 
-export interface LspManagerQueryResult {
+export interface LspManagerSingleQueryResult {
   operation: LspQueryOperation;
   serverId: string;
   rootUri: string;
@@ -116,6 +116,23 @@ export interface LspManagerQueryResult {
   symbols?: LspSymbolResult[];
   warning?: string;
 }
+
+export interface LspManagerWorkspaceSymbolsResult {
+  serverId: string;
+  rootUri: string;
+  symbols: LspSymbolResult[];
+  warning?: string;
+}
+
+export interface LspManagerDirectoryWorkspaceSymbolsQueryResult {
+  operation: "workspace_symbols";
+  results: LspManagerWorkspaceSymbolsResult[];
+  warning?: string;
+}
+
+export type LspManagerQueryResult =
+  | LspManagerSingleQueryResult
+  | LspManagerDirectoryWorkspaceSymbolsQueryResult;
 
 export interface LspPolicyContext {
   provisioningMode: LspProvisioningMode;

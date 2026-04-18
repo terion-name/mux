@@ -27,6 +27,7 @@ import type {
   LspFileDiagnostics,
   LspLocation,
   LspManagerQueryResult,
+  LspManagerWorkspaceSymbolsResult,
   LspPolicyContext,
   LspPublishDiagnosticsParams,
   LspQueryOperation,
@@ -830,25 +831,11 @@ export class LspManager {
       workspaceRuntimePath
     );
     if (queryRootDiscovery.matches.length === 0) {
-      throw new Error(
-        `Could not infer a built-in LSP server for directory ${options.filePath}. Provide a representative source file path or use a directory with a language-specific project marker.`
-      );
+      throw new Error(buildWorkspaceSymbolsDirectoryInferenceError(options.filePath));
     }
 
-    const mergedSymbols = new Map<string, LspSymbolResult>();
+    const results: LspManagerWorkspaceSymbolsResult[] = [];
     const queryFailures: WorkspaceSymbolsQueryFailure[] = [];
-    let firstSuccessfulRoot:
-      | {
-          serverId: string;
-          rootUri: string;
-        }
-      | undefined;
-    let firstSymbolRoot:
-      | {
-          serverId: string;
-          rootUri: string;
-        }
-      | undefined;
 
     for (const match of queryRootDiscovery.matches) {
       const rootUri = pathMapper.toUri(match.rootPath);
@@ -885,19 +872,16 @@ export class LspManager {
           options.runtime,
           rawResult.symbols ?? []
         );
-        firstSuccessfulRoot ??= {
+        const warning =
+          symbols.length > LSP_MAX_SYMBOLS
+            ? `Results truncated to the first ${LSP_MAX_SYMBOLS} symbols`
+            : undefined;
+        results.push({
           serverId: match.descriptor.id,
           rootUri,
-        };
-        if (symbols.length > 0) {
-          firstSymbolRoot ??= {
-            serverId: match.descriptor.id,
-            rootUri,
-          };
-        }
-        for (const symbol of symbols) {
-          mergedSymbols.set(getWorkspaceSymbolIdentity(symbol), symbol);
-        }
+          symbols: symbols.slice(0, LSP_MAX_SYMBOLS),
+          ...(warning ? { warning } : {}),
+        });
       } catch (error) {
         queryFailures.push({
           match,
@@ -906,36 +890,25 @@ export class LspManager {
       }
     }
 
-    if (!firstSuccessfulRoot) {
+    if (results.length === 0) {
       throw new Error(
-        buildWorkspaceSymbolsDirectorySearchError(
+        buildWorkspaceSymbolsNoUsableRootsError(
           options.filePath,
-          summarizeWorkspaceSymbolsQueryFailures(pathMapper, queryFailures),
+          pathMapper,
+          queryFailures,
           queryRootDiscovery.truncated
         )
       );
     }
 
     this.markActivity(options.workspaceId);
-    const dedupedSymbols = [...mergedSymbols.values()];
-    const warning = joinWarnings([
-      queryRootDiscovery.truncated
-        ? `Directory root scan was truncated to the first ${LSP_MAX_WORKSPACE_SYMBOL_QUERY_ROOTS} matching LSP roots`
-        : undefined,
-      queryFailures.length > 0
-        ? `Skipped ${queryFailures.length} failing LSP root${queryFailures.length === 1 ? "" : "s"}: ${summarizeWorkspaceSymbolsQueryFailures(pathMapper, queryFailures)}`
-        : undefined,
-      dedupedSymbols.length > LSP_MAX_SYMBOLS
-        ? `Results truncated to the first ${LSP_MAX_SYMBOLS} symbols`
-        : undefined,
-    ]);
-    const resultRoot = firstSymbolRoot ?? firstSuccessfulRoot;
+    const warning = queryRootDiscovery.truncated
+      ? `Directory root scan was truncated to the first ${LSP_MAX_WORKSPACE_SYMBOL_QUERY_ROOTS} matching LSP roots`
+      : undefined;
 
     return {
       operation: "workspace_symbols",
-      serverId: resultRoot.serverId,
-      rootUri: resultRoot.rootUri,
-      symbols: dedupedSymbols.slice(0, LSP_MAX_SYMBOLS),
+      results,
       ...(warning ? { warning } : {}),
     };
   }
@@ -1240,9 +1213,7 @@ export class LspManager {
       workspaceRuntimePath
     );
     if (descriptorSelection.kind === "none") {
-      throw new Error(
-        `Could not infer a built-in LSP server for directory ${outputPath}. Provide a representative source file path or use a directory with a language-specific project marker.`
-      );
+      throw new Error(buildWorkspaceSymbolsDirectoryInferenceError(outputPath));
     }
 
     if (descriptorSelection.kind === "ambiguous") {
@@ -1885,17 +1856,22 @@ const WORKSPACE_SYMBOLS_WARMUP_IGNORED_DIRECTORY_NAMES = [
   "out",
 ] as const;
 const TYPESCRIPT_WORKSPACE_SYMBOL_PROJECT_MARKERS = new Set(["tsconfig.json", "jsconfig.json"]);
-const MAX_WORKSPACE_SYMBOL_FAILURE_DETAILS = 3;
+const MAX_WORKSPACE_SYMBOL_FAILURE_DETAILS = 2;
 
-function buildWorkspaceSymbolsDirectorySearchError(
+function buildWorkspaceSymbolsDirectoryInferenceError(outputPath: string): string {
+  return `No built-in LSP roots were inferred for directory ${outputPath}. Query a representative source file or use a directory with supported project markers.`;
+}
+
+function buildWorkspaceSymbolsNoUsableRootsError(
   outputPath: string,
-  attemptedRoots: string,
+  pathMapper: LspPathMapper,
+  failures: readonly WorkspaceSymbolsQueryFailure[],
   truncatedRootScan: boolean
 ): string {
   const truncationDetail = truncatedRootScan
     ? ` Directory root scan was truncated to the first ${LSP_MAX_WORKSPACE_SYMBOL_QUERY_ROOTS} matching LSP roots.`
     : "";
-  return `workspace_symbols directory search failed for ${outputPath}; attempted roots: ${attemptedRoots}.${truncationDetail} Provide a representative source file path if you need to force a specific language server.`;
+  return `No usable LSP roots are available for directory ${outputPath}; ${summarizeWorkspaceSymbolsQueryFailures(pathMapper, failures)}.${truncationDetail} ${getWorkspaceSymbolsFailureGuidance(failures)}`;
 }
 
 function describeWorkspaceSymbolsQueryFailure(
@@ -2188,19 +2164,6 @@ function normalizeWorkspaceSymbolsIdentifier(value: string | undefined): string 
   return value?.toLowerCase().replace(/[^a-z0-9]+/g, "") ?? "";
 }
 
-function getWorkspaceSymbolIdentity(symbol: LspSymbolResult): string {
-  return [
-    symbol.name,
-    symbol.kind,
-    symbol.path,
-    symbol.containerName ?? "",
-    symbol.range.start.line,
-    symbol.range.start.character,
-    symbol.range.end.line,
-    symbol.range.end.character,
-  ].join(":");
-}
-
 function summarizeWorkspaceSymbolsQueryFailures(
   pathMapper: LspPathMapper,
   failures: readonly WorkspaceSymbolsQueryFailure[]
@@ -2216,13 +2179,20 @@ function summarizeWorkspaceSymbolsQueryFailures(
   return `${failureDetails.join("; ")}; and ${remainingFailureCount} more failing LSP root${remainingFailureCount === 1 ? "" : "s"}`;
 }
 
-function joinWarnings(warnings: Array<string | undefined>): string | undefined {
-  const definedWarnings = warnings.filter((warning): warning is string => warning != null);
-  if (definedWarnings.length === 0) {
-    return undefined;
+function getWorkspaceSymbolsFailureGuidance(
+  failures: readonly WorkspaceSymbolsQueryFailure[]
+): string {
+  const missingPathCommand = failures
+    .map(
+      (failure) =>
+        /(?<command>[A-Za-z0-9._-]+) is not available on PATH/.exec(failure.reason)?.groups?.command
+    )
+    .find((command): command is string => command != null && command.length > 0);
+  if (missingPathCommand) {
+    return `Install ${missingPathCommand} and ensure it is available on PATH, or query a representative source file for a supported language.`;
   }
 
-  return definedWarnings.join(" ");
+  return "Install the missing language server or query a representative source file for a supported language.";
 }
 
 function getErrorMessage(error: unknown): string {

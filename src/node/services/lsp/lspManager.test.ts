@@ -105,6 +105,23 @@ function prependToPath(entry: string): string {
     .join(path.delimiter);
 }
 
+function requireDirectoryWorkspaceSymbolsResults(result: Awaited<ReturnType<LspManager["query"]>>) {
+  expect(result.operation).toBe("workspace_symbols");
+  if (!("results" in result)) {
+    throw new Error("Expected a directory workspace_symbols result");
+  }
+
+  return result.results;
+}
+
+function requireSingleRootQueryResult(result: Awaited<ReturnType<LspManager["query"]>>) {
+  if ("results" in result) {
+    throw new Error("Expected a single-root LSP result");
+  }
+
+  return result;
+}
+
 describe("LspManager", () => {
   let workspacePath: string;
 
@@ -176,8 +193,8 @@ describe("LspManager", () => {
       column: 3,
     });
 
-    expect(firstResult.hover).toBe("const value: 1");
-    expect(secondResult.hover).toBe("const value: 1");
+    expect(requireSingleRootQueryResult(firstResult).hover).toBe("const value: 1");
+    expect(requireSingleRootQueryResult(secondResult).hover).toBe("const value: 1");
     expect(clientFactory).toHaveBeenCalledTimes(1);
     expect(ensureFile).toHaveBeenCalledTimes(2);
     expect(clientFactoryOptions).toBeDefined();
@@ -346,9 +363,13 @@ describe("LspManager", () => {
 
     expect(result).toEqual({
       operation: "workspace_symbols",
-      serverId: "typescript",
-      rootUri: pathToFileURL(workspacePath).href,
-      symbols: [],
+      results: [
+        {
+          serverId: "typescript",
+          rootUri: pathToFileURL(workspacePath).href,
+          symbols: [],
+        },
+      ],
     });
     expect(clientFactoryOptions.map((options) => options.rootPath)).toEqual([workspacePath]);
     expect(ensureFileCalls).toEqual([
@@ -478,12 +499,31 @@ describe("LspManager", () => {
 
       expect(result).toMatchObject({
         operation: "workspace_symbols",
-        serverId: "typescript",
-        rootUri: pathToFileURL(workspacePath).href,
-        symbols: [
+        results: [
           {
-            name: "ResourceService",
-            path: rootResourcePath,
+            serverId: "typescript",
+            rootUri: pathToFileURL(workspacePath).href,
+            symbols: [
+              {
+                name: "ResourceService",
+                path: rootResourcePath,
+              },
+            ],
+          },
+          {
+            serverId: "go",
+            rootUri: pathToFileURL(workspacePath).href,
+            symbols: [],
+          },
+          {
+            serverId: "typescript",
+            rootUri: pathToFileURL(path.join(workspacePath, "e2e")).href,
+            symbols: [],
+          },
+          {
+            serverId: "typescript",
+            rootUri: pathToFileURL(path.join(workspacePath, "web", "packages", "design")).href,
+            symbols: [],
           },
         ],
       });
@@ -602,12 +642,16 @@ describe("LspManager", () => {
 
       expect(result).toMatchObject({
         operation: "workspace_symbols",
-        serverId: "typescript",
-        rootUri: pathToFileURL(workspacePath).href,
-        symbols: [
+        results: [
           {
-            name: "ResourceService",
-            path: rootResourcePath,
+            serverId: "typescript",
+            rootUri: pathToFileURL(workspacePath).href,
+            symbols: [
+              {
+                name: "ResourceService",
+                path: rootResourcePath,
+              },
+            ],
           },
         ],
       });
@@ -671,8 +715,13 @@ describe("LspManager", () => {
 
       expect(result).toMatchObject({
         operation: "workspace_symbols",
-        serverId: "python",
-        symbols: [],
+        results: [
+          {
+            serverId: "python",
+            rootUri: pathToFileURL(pythonWorkspacePath).href,
+            symbols: [],
+          },
+        ],
       });
       expect(clientFactory).toHaveBeenCalledTimes(1);
       expect(clientFactoryOptions).toBeDefined();
@@ -771,12 +820,31 @@ describe("LspManager", () => {
 
       expect(result).toMatchObject({
         operation: "workspace_symbols",
-        serverId: "typescript",
-        rootUri: pathToFileURL(path.join(workspacePath, "packages", "pkg")).href,
-        symbols: [
+        results: [
           {
-            name: "ResourceService",
-            path: path.join(workspacePath, "packages", "pkg", "src", "nested.ts"),
+            serverId: "typescript",
+            rootUri: pathToFileURL(workspacePath).href,
+            symbols: [],
+          },
+          {
+            serverId: "go",
+            rootUri: pathToFileURL(workspacePath).href,
+            symbols: [],
+          },
+          {
+            serverId: "rust",
+            rootUri: pathToFileURL(workspacePath).href,
+            symbols: [],
+          },
+          {
+            serverId: "typescript",
+            rootUri: pathToFileURL(path.join(workspacePath, "packages", "pkg")).href,
+            symbols: [
+              {
+                name: "ResourceService",
+                path: path.join(workspacePath, "packages", "pkg", "src", "nested.ts"),
+              },
+            ],
           },
         ],
       });
@@ -877,12 +945,17 @@ describe("LspManager", () => {
 
       expect(result).toMatchObject({
         operation: "workspace_symbols",
-        serverId: "python",
-        symbols: [
+        results: [
           {
-            name: "ResourceService",
-            path: path.join(workspacePath, "resource.py"),
-            containerName: "resource",
+            serverId: "python",
+            rootUri: pathToFileURL(workspacePath).href,
+            symbols: [
+              {
+                name: "ResourceService",
+                path: path.join(workspacePath, "resource.py"),
+                containerName: "resource",
+              },
+            ],
           },
         ],
       });
@@ -891,13 +964,7 @@ describe("LspManager", () => {
         `python:${workspacePath}`,
         `typescript:${path.join(workspacePath, "packages", "project")}`,
       ]);
-      expect(result.warning).toContain("Skipped 2 failing LSP roots");
-      expect(result.warning).toContain("typescript (package.json) at .: No Project");
-      expect(result.warning).toContain(
-        "typescript (tsconfig.json) at packages/project: No Project"
-      );
-      expect(result.warning).not.toContain("packages/pkg");
-      expect(result.warning).not.toContain("packages/other");
+      expect(result.warning).toBeUndefined();
     } finally {
       await manager.dispose();
     }
@@ -973,12 +1040,19 @@ describe("LspManager", () => {
         query: "ResourceService",
       });
 
-      expect(result.warning).toContain("Skipped 5 failing LSP roots");
-      expect(result.warning).toContain("typescript (package.json) at .: No Project");
-      expect(result.warning).toContain("typescript (tsconfig.json) at packages/proj-a: No Project");
-      expect(result.warning).toContain("typescript (tsconfig.json) at packages/proj-b: No Project");
-      expect(result.warning).toContain("and 2 more failing LSP roots");
-      expect(result.warning).not.toContain("packages/proj-d");
+      expect(result.warning).toBeUndefined();
+      expect(requireDirectoryWorkspaceSymbolsResults(result)).toEqual([
+        {
+          serverId: "python",
+          rootUri: pathToFileURL(workspacePath).href,
+          symbols: [
+            expect.objectContaining({
+              name: "ResourceService",
+              path: path.join(workspacePath, "resource.py"),
+            }),
+          ],
+        },
+      ]);
     } finally {
       await manager.dispose();
     }
@@ -1024,9 +1098,18 @@ describe("LspManager", () => {
 
       expect(result).toEqual({
         operation: "workspace_symbols",
-        serverId: "typescript",
-        rootUri: pathToFileURL(workspacePath).href,
-        symbols: [],
+        results: [
+          {
+            serverId: "typescript",
+            rootUri: pathToFileURL(workspacePath).href,
+            symbols: [],
+          },
+          {
+            serverId: "python",
+            rootUri: pathToFileURL(workspacePath).href,
+            symbols: [],
+          },
+        ],
       });
       expect(clientFactory).toHaveBeenCalledTimes(2);
     } finally {
@@ -1075,9 +1158,77 @@ describe("LspManager", () => {
           query: "ResourceService",
         })
       ).rejects.toThrow(
-        "workspace_symbols directory search failed for .; attempted roots: typescript (package.json) at .: tsserver unavailable; python (pyproject.toml) at .: No Project. Provide a representative source file path if you need to force a specific language server."
+        "No usable LSP roots are available for directory .; typescript (package.json) at .: tsserver unavailable; python (pyproject.toml) at .: No Project. Install the missing language server or query a representative source file for a supported language."
       );
       expect(clientFactory).toHaveBeenCalledTimes(2);
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  test("surfaces unsupported PATH-only directory roots when no usable LSP roots remain", async () => {
+    await fs.writeFile(path.join(workspacePath, "Cargo.toml"), "[package]\nname = 'mux'\n");
+
+    const rustDescriptor: LspServerDescriptor = {
+      id: "rust",
+      extensions: [".rs"],
+      launch: {
+        type: "provisioned",
+        strategies: [
+          {
+            type: "unsupported",
+            message:
+              "rust-analyzer is not available on PATH and automatic installation is not supported yet",
+          },
+        ],
+      },
+      rootMarkers: ["Cargo.toml", ".git"],
+      languageIdForPath: () => "rust",
+    };
+    const clientFactory = mock((_options: CreateLspClientOptions): Promise<LspClientInstance> => {
+      throw new Error("Expected unsupported provisioning to fail before client creation");
+    });
+
+    const manager = new LspManager({
+      registry: [rustDescriptor],
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    try {
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
+      await expect(
+        manager.query({
+          workspaceId: "ws-1",
+          runtime,
+          workspacePath,
+          filePath: ".",
+          policyContext: {
+            provisioningMode: "auto",
+            trustedWorkspaceExecution: true,
+          },
+          operation: "workspace_symbols",
+          query: "ResourceService",
+        })
+      ).rejects.toThrow(
+        "rust-analyzer is not available on PATH and automatic installation is not supported yet"
+      );
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
+      await expect(
+        manager.query({
+          workspaceId: "ws-1",
+          runtime,
+          workspacePath,
+          filePath: ".",
+          policyContext: {
+            provisioningMode: "auto",
+            trustedWorkspaceExecution: true,
+          },
+          operation: "workspace_symbols",
+          query: "ResourceService",
+        })
+      ).rejects.toThrow("Install rust-analyzer and ensure it is available on PATH");
+      expect(clientFactory).toHaveBeenCalledTimes(0);
     } finally {
       await manager.dispose();
     }
@@ -1158,9 +1309,11 @@ describe("LspManager", () => {
       column: 1,
     });
 
-    expect(first.hover).toBe(workspacePath);
-    expect(second.hover).toBe(workspacePath);
-    expect(third.hover).toBe(path.join(workspacePath, "packages", "pkg"));
+    expect(requireSingleRootQueryResult(first).hover).toBe(workspacePath);
+    expect(requireSingleRootQueryResult(second).hover).toBe(workspacePath);
+    expect(requireSingleRootQueryResult(third).hover).toBe(
+      path.join(workspacePath, "packages", "pkg")
+    );
     expect(clientFactory).toHaveBeenCalledTimes(2);
     expect(runtime.pathProbeCommands).toHaveLength(2);
     expect(launchPlans).toEqual([
@@ -1275,8 +1428,8 @@ describe("LspManager", () => {
           column: 1,
         });
 
-        expect(trustedResult.hover).toBe(localExecutable);
-        expect(untrustedResult.hover).toBe(externalPathExecutable);
+        expect(requireSingleRootQueryResult(trustedResult).hover).toBe(localExecutable);
+        expect(requireSingleRootQueryResult(untrustedResult).hover).toBe(externalPathExecutable);
         expect(clientFactory).toHaveBeenCalledTimes(2);
         expect(launchPlans.map((plan) => plan.command)).toEqual([
           localExecutable,
@@ -1395,10 +1548,10 @@ describe("LspManager", () => {
       column: 1,
     });
 
-    expect(first.hover).toBe(firstExecutable);
-    expect(warmReuse.hover).toBe(firstExecutable);
-    expect(recreated.hover).toBe(secondExecutable);
-    expect(recreatedWarmReuse.hover).toBe(secondExecutable);
+    expect(requireSingleRootQueryResult(first).hover).toBe(firstExecutable);
+    expect(requireSingleRootQueryResult(warmReuse).hover).toBe(firstExecutable);
+    expect(requireSingleRootQueryResult(recreated).hover).toBe(secondExecutable);
+    expect(requireSingleRootQueryResult(recreatedWarmReuse).hover).toBe(secondExecutable);
     expect(clientFactory).toHaveBeenCalledTimes(2);
     expect(runtime.pathProbeCommands).toHaveLength(2);
     expect(launchPlans).toEqual([
@@ -1481,8 +1634,8 @@ describe("LspManager", () => {
     clientReady.resolve(client);
     const [firstResult, secondResult] = await Promise.all([firstQuery, secondQuery]);
 
-    expect(firstResult.hover).toBe("const value: 1");
-    expect(secondResult.hover).toBe("const value: 1");
+    expect(requireSingleRootQueryResult(firstResult).hover).toBe("const value: 1");
+    expect(requireSingleRootQueryResult(secondResult).hover).toBe("const value: 1");
     expect(ensureFile).toHaveBeenCalledTimes(2);
 
     await manager.dispose();

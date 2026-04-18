@@ -78,11 +78,14 @@ export const createLspQueryTool: ToolFactory = (config: ToolConfiguration) =>
           query: args.query ?? undefined,
           includeDeclaration: args.includeDeclaration ?? undefined,
         });
+        const warning = [result.warning, pathWarning]
+          .filter((value): value is string => value != null && value.length > 0)
+          .join(" ");
 
         return {
           success: true,
           ...result,
-          ...(pathWarning ? { warning: pathWarning } : {}),
+          ...(warning ? { warning } : {}),
         };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
