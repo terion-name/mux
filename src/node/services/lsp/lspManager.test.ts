@@ -258,6 +258,101 @@ describe("LspManager", () => {
     }
   }
 
+  function createWorkspaceSymbol(name: string, filePath: string, line: number, kind = 12) {
+    return {
+      name,
+      kind,
+      location: {
+        uri: pathToFileURL(filePath).href,
+        range: {
+          start: { line, character: 0 },
+          end: { line, character: name.length },
+        },
+      },
+    };
+  }
+
+  async function queryMixedTypeScriptAndGoWorkspaceSymbols(options: {
+    query: string;
+    goSymbols: string[];
+    envValue?: string;
+  }): Promise<Awaited<ReturnType<LspManager["query"]>>> {
+    const tsRootPath = path.join(workspacePath, "web", "packages", "teleport");
+    const tsFilePath = path.join(tsRootPath, "src", `${options.query}.ts`);
+    const goFilePath = path.join(workspacePath, "main.go");
+    await fs.mkdir(path.dirname(tsFilePath), { recursive: true });
+    await fs.writeFile(path.join(tsRootPath, "tsconfig.json"), "{}\n");
+    await fs.writeFile(tsFilePath, `export const ${options.query} = 1;\n`);
+    await fs.writeFile(path.join(workspacePath, "go.mod"), "module example.com/teleport\n");
+    await fs.writeFile(
+      goFilePath,
+      `package main\n\n${options.goSymbols.map((name) => `func ${name}() {}`).join("\n")}\n`
+    );
+
+    const goDescriptor = createManualDescriptor("go", [".go"], "mux-test-go-lsp", [
+      "go.mod",
+      ".git",
+    ]);
+    const clientFactory = mock(
+      (clientOptions: CreateLspClientOptions): Promise<LspClientInstance> => {
+        return Promise.resolve({
+          isClosed: false,
+          ensureFile: mock(() => Promise.resolve(1)),
+          query: mock(() => {
+            if (clientOptions.descriptor.id === "go") {
+              return Promise.resolve({
+                operation: "workspace_symbols" as const,
+                symbols: options.goSymbols.map((name, index) =>
+                  createWorkspaceSymbol(name, goFilePath, index + 2)
+                ),
+              });
+            }
+
+            if (
+              clientOptions.descriptor.id === "typescript" &&
+              clientOptions.rootPath === tsRootPath
+            ) {
+              return Promise.resolve({
+                operation: "workspace_symbols" as const,
+                symbols: [createWorkspaceSymbol(options.query, tsFilePath, 0, 13)],
+              });
+            }
+
+            return Promise.resolve({
+              operation: "workspace_symbols" as const,
+              symbols: [],
+            });
+          }),
+          close: mock(() => Promise.resolve(undefined)),
+        });
+      }
+    );
+
+    const manager = new LspManager({
+      registry: [...createRegistry(), goDescriptor],
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    try {
+      return await withGoExactMatchWorkspaceSymbolsEnv(
+        options.envValue,
+        async () =>
+          await manager.query({
+            workspaceId: "ws-mixed-go-ts",
+            runtime,
+            workspacePath,
+            filePath: ".",
+            policyContext: TEST_LSP_POLICY_CONTEXT,
+            operation: "workspace_symbols",
+            query: options.query,
+          })
+      );
+    } finally {
+      await manager.dispose();
+    }
+  }
+
   test("reuses clients for the same workspace root and forwards normalized positions", async () => {
     const ensureFile = mock(() => Promise.resolve(1));
     let lastQueryRequest: Parameters<LspClientInstance["query"]>[0] | undefined;
@@ -808,6 +903,92 @@ describe("LspManager", () => {
       serverId: "go",
       rootUri: pathToFileURL(workspacePath).href,
       symbols: [{ name: "useAttemptHelper" }, { name: "useAttempt" }, { name: "attemptUse" }],
+    });
+  });
+
+  test("suppresses fuzzy Go workspace_symbols groups when another root has an exact match", async () => {
+    const defaultResults = requireDirectoryWorkspaceSymbolsResults(
+      await queryMixedTypeScriptAndGoWorkspaceSymbols({
+        query: "useAttempt",
+        goSymbols: ["useAttemptHelper", "attemptUse"],
+      })
+    );
+    expect(defaultResults).toHaveLength(1);
+    expect(defaultResults[0]).toMatchObject({
+      serverId: "typescript",
+      rootUri: pathToFileURL(path.join(workspacePath, "web", "packages", "teleport")).href,
+      symbols: [
+        {
+          name: "useAttempt",
+          path: path.join(workspacePath, "web", "packages", "teleport", "src", "useAttempt.ts"),
+        },
+      ],
+    });
+
+    const disabledResults = requireDirectoryWorkspaceSymbolsResults(
+      await queryMixedTypeScriptAndGoWorkspaceSymbols({
+        query: "useAttempt",
+        goSymbols: ["useAttemptHelper", "attemptUse"],
+        envValue: "false",
+      })
+    );
+    expect(disabledResults).toHaveLength(2);
+    const disabledGoResult = disabledResults.find((result) => result.serverId === "go");
+    if (!disabledGoResult) {
+      throw new Error("Expected Go workspace_symbols results when the experiment is disabled");
+    }
+    expect(disabledGoResult).toMatchObject({
+      rootUri: pathToFileURL(workspacePath).href,
+      symbols: [{ name: "useAttemptHelper" }, { name: "attemptUse" }],
+    });
+    const disabledTypeScriptResult = disabledResults.find(
+      (result) => result.serverId === "typescript"
+    );
+    if (!disabledTypeScriptResult) {
+      throw new Error("Expected TypeScript workspace_symbols results for the nested root");
+    }
+    expect(disabledTypeScriptResult).toMatchObject({
+      rootUri: pathToFileURL(path.join(workspacePath, "web", "packages", "teleport")).href,
+      symbols: [{ name: "useAttempt" }],
+    });
+  });
+
+  test("keeps exact Go workspace_symbols groups when Go also has an exact match", async () => {
+    const results = requireDirectoryWorkspaceSymbolsResults(
+      await queryMixedTypeScriptAndGoWorkspaceSymbols({
+        query: "ResourceService",
+        goSymbols: ["ResourceService", "ResourceServiceHelper"],
+      })
+    );
+
+    expect(results).toHaveLength(2);
+    const goResult = results.find((result) => result.serverId === "go");
+    if (!goResult) {
+      throw new Error("Expected Go workspace_symbols results when Go has an exact match");
+    }
+    expect(goResult).toMatchObject({
+      rootUri: pathToFileURL(workspacePath).href,
+      symbols: [{ name: "ResourceService" }],
+    });
+    const typeScriptResult = results.find((result) => result.serverId === "typescript");
+    if (!typeScriptResult) {
+      throw new Error("Expected TypeScript workspace_symbols results for the nested root");
+    }
+    expect(typeScriptResult).toMatchObject({
+      rootUri: pathToFileURL(path.join(workspacePath, "web", "packages", "teleport")).href,
+      symbols: [
+        {
+          name: "ResourceService",
+          path: path.join(
+            workspacePath,
+            "web",
+            "packages",
+            "teleport",
+            "src",
+            "ResourceService.ts"
+          ),
+        },
+      ],
     });
   });
 

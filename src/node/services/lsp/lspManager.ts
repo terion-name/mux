@@ -839,9 +839,11 @@ export class LspManager {
       throw new Error(buildWorkspaceSymbolsDirectoryInferenceError(options.filePath));
     }
 
+    const exactQuery = getExactWorkspaceSymbolsQuery(options.query);
     const results: LspManagerWorkspaceSymbolsResult[] = [];
     const queryFailures: WorkspaceSymbolsQueryFailure[] = [];
     let usableRootCount = 0;
+    let hasExactMatchInAnyRoot = false;
 
     for (const match of queryRootDiscovery.matches) {
       const rootUri = pathMapper.toUri(match.rootPath);
@@ -881,6 +883,9 @@ export class LspManager {
           options.query
         );
         usableRootCount += 1;
+        if (exactQuery && symbols.some((symbol) => symbol.name === exactQuery)) {
+          hasExactMatchInAnyRoot = true;
+        }
         const warning =
           symbols.length > LSP_MAX_SYMBOLS
             ? `Results truncated to the first ${LSP_MAX_SYMBOLS} symbols`
@@ -911,17 +916,22 @@ export class LspManager {
     }
 
     this.markActivity(options.workspaceId);
+    const filteredResults = suppressInexactGoWorkspaceSymbolsForDirectory(
+      results,
+      exactQuery,
+      hasExactMatchInAnyRoot
+    );
     const warning = queryRootDiscovery.truncated
       ? `Directory root scan was truncated to the first ${LSP_MAX_WORKSPACE_SYMBOL_QUERY_ROOTS} matching LSP roots`
       : undefined;
     const skippedRoots = queryFailures.map((failure) =>
       toWorkspaceSymbolsSkippedRoot(pathMapper, failure)
     );
-    const disambiguationHint = buildWorkspaceSymbolsDisambiguationHint(results);
+    const disambiguationHint = buildWorkspaceSymbolsDisambiguationHint(filteredResults);
 
     return {
       operation: "workspace_symbols",
-      results,
+      results: filteredResults,
       ...(skippedRoots.length > 0 ? { skippedRoots } : {}),
       ...(disambiguationHint ? { disambiguationHint } : {}),
       ...(warning ? { warning } : {}),
@@ -2354,7 +2364,7 @@ function postprocessWorkspaceSymbols(
     return [...symbols];
   }
 
-  const exactQuery = query?.trim();
+  const exactQuery = getExactWorkspaceSymbolsQuery(query);
   if (!exactQuery) {
     return [...symbols];
   }
@@ -2365,11 +2375,34 @@ function postprocessWorkspaceSymbols(
   return exactMatches.length > 0 ? exactMatches : [...symbols];
 }
 
-function shouldPreferGoExactMatchWorkspaceSymbols(serverId: string): boolean {
-  return (
-    serverId === "go" &&
-    process.env.EXPERIMENT_LSP_GO_EXACT_MATCH_SYMBOLS?.trim().toLowerCase() !== "false"
+// When any root finds the exact symbol name, drop Go-only fuzzy groups so cross-root
+// directory queries keep the exact hit instead of gopls noise from unrelated Go roots.
+function suppressInexactGoWorkspaceSymbolsForDirectory(
+  results: readonly LspManagerWorkspaceSymbolsResult[],
+  exactQuery: string | undefined,
+  hasExactMatchInAnyRoot: boolean
+): LspManagerWorkspaceSymbolsResult[] {
+  if (!isGoExactMatchWorkspaceSymbolsEnabled() || !exactQuery || !hasExactMatchInAnyRoot) {
+    return [...results];
+  }
+
+  return results.filter(
+    (result) =>
+      result.serverId !== "go" || result.symbols.some((symbol) => symbol.name === exactQuery)
   );
+}
+
+function getExactWorkspaceSymbolsQuery(query: string | undefined): string | undefined {
+  const exactQuery = query?.trim();
+  return exactQuery && exactQuery.length > 0 ? exactQuery : undefined;
+}
+
+function shouldPreferGoExactMatchWorkspaceSymbols(serverId: string): boolean {
+  return serverId === "go" && isGoExactMatchWorkspaceSymbolsEnabled();
+}
+
+function isGoExactMatchWorkspaceSymbolsEnabled(): boolean {
+  return process.env.EXPERIMENT_LSP_GO_EXACT_MATCH_SYMBOLS?.trim().toLowerCase() !== "false";
 }
 
 function summarizeWorkspaceSymbolsQueryFailures(
