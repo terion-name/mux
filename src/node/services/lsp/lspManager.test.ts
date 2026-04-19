@@ -9,6 +9,7 @@ import type { ExecOptions, ExecStream } from "@/node/runtime/Runtime";
 import type {
   CreateLspClientOptions,
   LspClientInstance,
+  LspClientQueryResult,
   LspDiagnostic,
   LspServerDescriptor,
 } from "./types";
@@ -352,6 +353,199 @@ describe("LspManager", () => {
       await manager.dispose();
     }
   }
+
+  async function queryTypeScriptFileBackedOperation(options: {
+    operation: "references" | "document_symbols";
+    buildRawResult(paths: { hookPath: string; usagePath: string }): LspClientQueryResult;
+    line?: number;
+    column?: number;
+    includeDeclaration?: boolean;
+  }): Promise<{
+    result: Awaited<ReturnType<LspManager["query"]>>;
+    clientFactoryOptions: CreateLspClientOptions;
+    ensurePaths: string[];
+    queryRequest: Parameters<LspClientInstance["query"]>[0];
+    hookPath: string;
+    usagePath: string;
+  }> {
+    const hookPath = path.join(
+      workspacePath,
+      "web",
+      "packages",
+      "shared",
+      "hooks",
+      "useAttempt.ts"
+    );
+    const usagePath = path.join(workspacePath, "web", "packages", "app", "src", "consumer.ts");
+    await fs.mkdir(path.dirname(hookPath), { recursive: true });
+    await fs.mkdir(path.dirname(usagePath), { recursive: true });
+    await fs.writeFile(
+      path.join(workspacePath, "tsconfig.json"),
+      JSON.stringify({ include: ["web/**/*.ts"] }, null, 2) + "\n"
+    );
+    await fs.writeFile(
+      path.join(workspacePath, "web", "packages", "shared", "package.json"),
+      "{}\n"
+    );
+    await fs.writeFile(path.join(workspacePath, "web", "packages", "app", "package.json"), "{}\n");
+    await fs.writeFile(hookPath, "export function useAttempt() { return 1; }\n");
+    await fs.writeFile(
+      usagePath,
+      'import { useAttempt } from "../../shared/hooks/useAttempt";\nexport const value = useAttempt();\n'
+    );
+
+    const ensurePaths: string[] = [];
+    let clientFactoryOptions: CreateLspClientOptions | undefined;
+    let queryRequest: Parameters<LspClientInstance["query"]>[0] | undefined;
+    const clientFactory = mock(
+      (resolvedOptions: CreateLspClientOptions): Promise<LspClientInstance> => {
+        clientFactoryOptions = resolvedOptions;
+        return Promise.resolve({
+          isClosed: false,
+          ensureFile: mock((file: Parameters<LspClientInstance["ensureFile"]>[0]) => {
+            ensurePaths.push(file.readablePath);
+            return Promise.resolve(1);
+          }),
+          query: mock((request: Parameters<LspClientInstance["query"]>[0]) => {
+            queryRequest = request;
+            return Promise.resolve(options.buildRawResult({ hookPath, usagePath }));
+          }),
+          close: mock(() => Promise.resolve(undefined)),
+        });
+      }
+    );
+
+    const manager = new LspManager({
+      registry: createRegistry(),
+      clientFactory,
+    });
+    const runtime = new LocalRuntime(workspacePath);
+
+    try {
+      const result = await manager.query({
+        workspaceId: `ws-${options.operation}`,
+        runtime,
+        workspacePath,
+        filePath: "web/packages/shared/hooks/useAttempt.ts",
+        policyContext: TEST_LSP_POLICY_CONTEXT,
+        operation: options.operation,
+        line: options.line,
+        column: options.column,
+        includeDeclaration: options.includeDeclaration,
+      });
+
+      if (!clientFactoryOptions) {
+        throw new Error("Expected the LSP client factory to receive a call");
+      }
+      if (!queryRequest) {
+        throw new Error("Expected the LSP client to receive a query");
+      }
+
+      return {
+        result,
+        clientFactoryOptions,
+        ensurePaths,
+        queryRequest,
+        hookPath,
+        usagePath,
+      };
+    } finally {
+      await manager.dispose();
+    }
+  }
+
+  test("prefers config-backed TypeScript roots for file-backed references queries", async () => {
+    const { result, clientFactoryOptions, ensurePaths, queryRequest, usagePath, hookPath } =
+      await queryTypeScriptFileBackedOperation({
+        operation: "references",
+        line: 1,
+        column: 1,
+        includeDeclaration: false,
+        buildRawResult: ({ usagePath }) => ({
+          operation: "references",
+          locations: [
+            {
+              uri: pathToFileURL(usagePath).href,
+              range: {
+                start: { line: 1, character: 21 },
+                end: { line: 1, character: 31 },
+              },
+            },
+          ],
+        }),
+      });
+
+    expect(clientFactoryOptions.rootPath).toBe(workspacePath);
+    expect(ensurePaths).toEqual([hookPath]);
+    expect(queryRequest).toMatchObject({
+      operation: "references",
+      line: 0,
+      character: 0,
+      includeDeclaration: false,
+      file: {
+        readablePath: hookPath,
+      },
+    });
+    expect(requireSingleRootQueryResult(result)).toMatchObject({
+      operation: "references",
+      serverId: "typescript",
+      rootUri: pathToFileURL(workspacePath).href,
+      locations: [
+        {
+          path: usagePath,
+          uri: pathToFileURL(usagePath).href,
+        },
+      ],
+    });
+  });
+
+  test("prefers config-backed TypeScript roots for file-backed document_symbols queries", async () => {
+    const { result, clientFactoryOptions, ensurePaths, queryRequest, hookPath } =
+      await queryTypeScriptFileBackedOperation({
+        operation: "document_symbols",
+        buildRawResult: ({ hookPath }) => ({
+          operation: "document_symbols",
+          symbols: [
+            {
+              name: "useAttempt",
+              kind: 12,
+              range: {
+                start: { line: 0, character: 0 },
+                end: { line: 0, character: 40 },
+              },
+              selectionRange: {
+                start: { line: 0, character: 16 },
+                end: { line: 0, character: 26 },
+              },
+              uri: pathToFileURL(hookPath).href,
+            },
+          ],
+        }),
+      });
+
+    expect(clientFactoryOptions.rootPath).toBe(workspacePath);
+    expect(ensurePaths).toEqual([hookPath]);
+    expect(queryRequest).toMatchObject({
+      operation: "document_symbols",
+      file: {
+        readablePath: hookPath,
+      },
+    });
+    expect(queryRequest.line).toBeUndefined();
+    expect(queryRequest.character).toBeUndefined();
+    expect(requireSingleRootQueryResult(result)).toMatchObject({
+      operation: "document_symbols",
+      serverId: "typescript",
+      rootUri: pathToFileURL(workspacePath).href,
+      symbols: [
+        {
+          name: "useAttempt",
+          path: hookPath,
+          uri: pathToFileURL(hookPath).href,
+        },
+      ],
+    });
+  });
 
   test("reuses clients for the same workspace root and forwards normalized positions", async () => {
     const ensureFile = mock(() => Promise.resolve(1));

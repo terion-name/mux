@@ -1294,16 +1294,14 @@ export class LspManager {
     descriptor: LspServerDescriptor,
     operation?: LspQueryOperation
   ): Promise<string> {
-    if (operation === "workspace_symbols" && isTypeScriptLspDescriptor(descriptor)) {
-      // workspace/symbol on TypeScript needs the owning tsconfig/jsconfig project when one exists,
-      // otherwise tsserver can bind an explicit file query to a nearer package.json-only subpackage.
+    if (operation != null && isTypeScriptLspDescriptor(descriptor)) {
+      // File-backed TypeScript queries should prefer the owning tsconfig/jsconfig project when one
+      // exists; otherwise tsserver can bind nested monorepo files to a nearer package.json root.
       const configRootMatch = await this.resolveRootMatch(
         runtime,
         filePath,
         workspaceRuntimePath,
-        descriptor.rootMarkers.filter((marker) =>
-          TYPESCRIPT_WORKSPACE_SYMBOL_PROJECT_MARKERS.has(marker)
-        ),
+        descriptor.rootMarkers.filter((marker) => TYPESCRIPT_PROJECT_ROOT_MARKERS.has(marker)),
         false
       );
       if (configRootMatch.matchedMarker != null) {
@@ -2044,7 +2042,7 @@ const WORKSPACE_SYMBOLS_WARMUP_IGNORED_DIRECTORY_NAMES = [
   "node_modules",
   "out",
 ] as const;
-const TYPESCRIPT_WORKSPACE_SYMBOL_PROJECT_MARKERS = new Set(["tsconfig.json", "jsconfig.json"]);
+const TYPESCRIPT_PROJECT_ROOT_MARKERS = new Set(["tsconfig.json", "jsconfig.json"]);
 const MAX_WORKSPACE_SYMBOL_FAILURE_DETAILS = 2;
 
 function buildWorkspaceSymbolsDirectoryInferenceError(outputPath: string): string {
@@ -2119,9 +2117,7 @@ function getWorkspaceSymbolsDescendantRootMarkers(
     return specificRootMarkers;
   }
 
-  return specificRootMarkers.filter((marker) =>
-    TYPESCRIPT_WORKSPACE_SYMBOL_PROJECT_MARKERS.has(marker)
-  );
+  return specificRootMarkers.filter((marker) => TYPESCRIPT_PROJECT_ROOT_MARKERS.has(marker));
 }
 
 function getWorkspaceSymbolsRepresentativeSearchPaths(
